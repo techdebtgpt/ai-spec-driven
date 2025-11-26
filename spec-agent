@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Unified launcher for Spec-Agent. Supports setup + CLI passthrough.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$SCRIPT_DIR/.venv"
+INIT_SCRIPT="$SCRIPT_DIR/init.py"
+STATE_DIR="${HOME}/.spec_agent"
+ENV_FILE="${STATE_DIR}/env"
+
+if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
+  VENV_BIN="$VENV_DIR/Scripts"
+else
+  VENV_BIN="$VENV_DIR/bin"
+fi
+
+VENV_SPEC_AGENT="$VENV_BIN/spec-agent"
+
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
+usage() {
+  cat <<EOF
+Usage:
+  ./spec-agent --setup          # Bootstrap the project (create venv + install deps)
+  ./spec-agent <command> [args] # Run a spec-agent CLI command (after setup)
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+  if [[ -x "$VENV_SPEC_AGENT" ]]; then
+    exec "$VENV_SPEC_AGENT"
+  else
+    usage
+    exit 1
+  fi
+fi
+
+case "$1" in
+  --setup|--init|-setup|-init|setup|init)
+    shift
+    if ! command -v python3 >/dev/null 2>&1; then
+      echo "Error: python3 is not installed or not in PATH." >&2
+      exit 1
+    fi
+    exec python3 "$INIT_SCRIPT" "$@"
+    ;;
+  *)
+    if [[ ! -x "$VENV_SPEC_AGENT" ]]; then
+      echo "Error: spec-agent is not set up yet. Run './spec-agent --setup' first." >&2
+      exit 1
+    fi
+    exec "$VENV_SPEC_AGENT" "$@"
+    ;;
+esac
+

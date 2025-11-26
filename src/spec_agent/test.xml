@@ -1,0 +1,60 @@
+<mxfile host="app.diagrams.net">
+  <diagram id="MVPDemoFlow" name="MVP Demo Flow">
+    <mxGraphModel dx="995" dy="666" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- Step 1: User Input -->
+        <mxCell id="Step1" value="1. User Input&#10;- Enters GitHub URL&#10;- Describes change request&#10;e.g. &quot;Modify instant booking flow to skip Epyx wait step&quot;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="120" y="40" width="360" height="110" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrow: Step1 -> Step2 -->
+        <mxCell id="a1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;" edge="1" parent="1" source="Step1" target="Step2">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Step 2: System generates context -->
+        <mxCell id="Step2" value="2. System: Generate Context&#10;- Finds relevant files&#10;- Builds dependency graph&#10;- Identifies existing tests" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="120" y="190" width="360" height="120" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrow: Step2 -> Step3 -->
+        <mxCell id="a2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;" edge="1" parent="1" source="Step2" target="Step3">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Step 3: Clarifying questions -->
+        <mxCell id="Step3" value="3. System: Clarifying Questions&#10;- Asks 4–6 focused questions&#10;- Resolves ambiguities&#10;- Surfaces edge cases" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="120" y="340" width="360" height="120" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrow: Step3 -> Step4 -->
+        <mxCell id="a3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;" edge="1" parent="1" source="Step3" target="Step4">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Step 4: Design strategies -->
+        <mxCell id="Step4" value="4. System: Design Proposals&#10;- 2–3 design strategies&#10;- Tradeoffs explained&#10;- Code refactor plan" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#e0a93b;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="120" y="490" width="360" height="120" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrow: Step4 -> Step5 -->
+        <mxCell id="a4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;" edge="1" parent="1" source="Step4" target="Step5">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Step 5: Small diffs + tests -->
+        <mxCell id="Step5" value="5. System: Implementation Suggestions&#10;- Small, focused diffs&#10;- Suggested test updates&#10;- Notes on risks/impacts" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="120" y="640" width="360" height="130" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrow: Step5 -> Step6 -->
+        <mxCell id="a5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;" edge="1" parent="1" source="Step5" target="Step6">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Step 6: User applies changes -->
+        <mxCell id="Step6" value="6. Developer Applies Changes&#10;- Reviews proposals&#10;- Edits code manually&#10;- Runs/extends tests&#10;- Keeps full ownership" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry
