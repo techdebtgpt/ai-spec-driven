@@ -1,0 +1,15 @@
+#
+# Copy or append these entries into ~/.spec_agent/env after filling in the placeholders.
+# The CLI automatically reads that file on every run.
+#
+
+# Serena patch generation (optional)
+SPEC_AGENT_SERENA_ENABLED=1
+SPEC_AGENT_SERENA_COMMAND="</absolute/path/to/python> </absolute/path/to/repo>/scripts/serena_patch_wrapper.py"
+
+# Native OpenAI integration (optional)
+SPEC_AGENT_OPENAI_API_KEY=replace-with-your-key
+SPEC_AGENT_OPENAI_MODEL=gpt-4.1-mini
+SPEC_AGENT_OPENAI_BASE_URL=https://api.openai.com/v1
+SPEC_AGENT_OPENAI_TIMEOUT=60
+

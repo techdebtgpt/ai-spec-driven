@@ -94,6 +94,38 @@ source .venv/bin/activate
 spec-agent --help
 ```
 
+## LLM-Ready Configuration
+
+We now ship the plumbing needed to talk to OpenAI (or an API-compatible gateway) without
+enabling it in the CLI yet. This keeps the default CLI behavior deterministic while letting
+teammates wire native LLM calls inside their own agents or experiments.
+
+1. Environment variables recognized by `AgentSettings`:
+   - `SPEC_AGENT_OPENAI_API_KEY` (required for making calls)
+   - `SPEC_AGENT_OPENAI_MODEL` (defaults to `gpt-4.1-mini`)
+   - `SPEC_AGENT_OPENAI_BASE_URL` (optional override for Azure/OpenRouter/etc.)
+   - `SPEC_AGENT_OPENAI_TIMEOUT` (defaults to 60 seconds)
+2. Use `spec_agent.services.llm.openai_client.OpenAILLMClient` to obtain a reusable client.
+3. Pass that client into any service that accepts an optional `llm_client` parameter
+   (`Clarifier`, `PlanBuilder`, `BoundaryManager`, `TestSuggester`) to opt into LLM behavior.
+4. Quick-start checklist for teammates:
+   ```bash
+   # Copy the template and open it in an editor
+   cp spec_agent_env.example ~/.spec_agent/env
+   nano ~/.spec_agent/env   # or use VS Code, TextEdit, etc.
+
+   # Fill in your Serena + OpenAI values, then save
+
+   # Optional: rerun setup to verify everything is wired
+   ./spec-agent --setup
+   ```
+   The CLI reads `~/.spec_agent/env` automatically. Alternatively, export `SPEC_AGENT_OPENAI_*` before
+   running `./spec-agent --setup` and the bootstrapper will write them for you.
+
+By default, the orchestrator still instantiates these services without an LLM, so the CLI
+remains fully offline. Future PRs can enable the integration by constructing the client and
+injecting it where needed.
+
 ## Optional: Serena-backed LLM Integration
 
 If you plan to plug an LLM into the workflow, you can delegate semantic retrieval and editing to [Serena](https://github.com/oraios/serena). The orchestrator now supports an opt-in mode that shells out to a Serena command for patch generation:

@@ -4,9 +4,44 @@ Spec-Agent Initialization Script
 This script sets up the development environment for the spec-driven-development-agent
 """
 
+import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Dict, Optional
+
+
+def _upsert_env_entries(entries: Dict[str, str]) -> Optional[Path]:
+    """
+    Persist key/value pairs to ~/.spec_agent/env, replacing existing lines when necessary.
+    """
+
+    entries = {key: value for key, value in entries.items() if value is not None}
+    if not entries:
+        return None
+
+    state_dir = Path.home() / ".spec_agent"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    env_path = state_dir / "env"
+
+    lines = []
+    if env_path.exists():
+        lines = env_path.read_text().splitlines()
+
+    def upsert(key: str, value: str) -> None:
+        entry = f"{key}={value}"
+        for idx, line in enumerate(lines):
+            if line.startswith(f"{key}="):
+                lines[idx] = entry
+                break
+        else:
+            lines.append(entry)
+
+    for key, value in entries.items():
+        upsert(key, value)
+
+    env_path.write_text("\n".join(lines) + "\n")
+    return env_path
 
 
 def ensure_serena_env(venv_path: Path, project_root: Path) -> None:
@@ -27,28 +62,31 @@ def ensure_serena_env(venv_path: Path, project_root: Path) -> None:
     raw_command = f'{python_bin} {wrapper_script}'
     escaped_command = raw_command.replace('"', '\\"')
 
-    state_dir = Path.home() / ".spec_agent"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    env_path = state_dir / "env"
+    env_path = _upsert_env_entries(
+        {
+            "SPEC_AGENT_SERENA_ENABLED": "1",
+            "SPEC_AGENT_SERENA_COMMAND": f'"{escaped_command}"',
+        }
+    )
+    if env_path:
+        print(f"Configured Serena wrapper env at {env_path}")
 
-    lines = []
-    if env_path.exists():
-        lines = env_path.read_text().splitlines()
 
-    def upsert(key: str, value: str) -> None:
-        entry = f'{key}={value}'
-        for idx, line in enumerate(lines):
-            if line.startswith(f"{key}="):
-                lines[idx] = entry
-                break
-        else:
-            lines.append(entry)
+def ensure_openai_env_from_envvars() -> None:
+    """
+    If SPEC_AGENT_OPENAI_* vars are present in the current environment, persist them so
+    teammates don't need to re-export keys for every CLI run.
+    """
 
-    upsert("SPEC_AGENT_SERENA_ENABLED", "1")
-    upsert("SPEC_AGENT_SERENA_COMMAND", f'"{escaped_command}"')
-
-    env_path.write_text("\n".join(lines) + "\n")
-    print(f"Configured Serena wrapper env at {env_path}")
+    entries = {
+        "SPEC_AGENT_OPENAI_API_KEY": os.getenv("SPEC_AGENT_OPENAI_API_KEY"),
+        "SPEC_AGENT_OPENAI_MODEL": os.getenv("SPEC_AGENT_OPENAI_MODEL"),
+        "SPEC_AGENT_OPENAI_BASE_URL": os.getenv("SPEC_AGENT_OPENAI_BASE_URL"),
+        "SPEC_AGENT_OPENAI_TIMEOUT": os.getenv("SPEC_AGENT_OPENAI_TIMEOUT"),
+    }
+    env_path = _upsert_env_entries(entries)
+    if env_path:
+        print(f"Captured OpenAI defaults from environment at {env_path}")
 
 
 def main():
@@ -116,6 +154,7 @@ def main():
     if spec_agent_path.exists():
         print("spec-agent command is available")
         ensure_serena_env(venv_path, project_root)
+        ensure_openai_env_from_envvars()
         print()
         print("Setup complete! You can now use spec-agent.")
         print()
