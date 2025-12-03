@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import os
 import shlex
 from pathlib import Path
-from typing import ClassVar, Dict, Tuple
+from typing import ClassVar, Dict, Optional, Tuple
 
 
 @dataclass
@@ -23,6 +23,10 @@ class AgentSettings:
     serena_enabled: bool = False
     serena_command: Tuple[str, ...] = ()
     serena_timeout_seconds: int = 120
+    openai_api_key: Optional[str] = None
+    openai_model: str = "gpt-4.1-mini"
+    openai_base_url: Optional[str] = None
+    openai_timeout_seconds: int = 60
 
     DEFAULT_LANGUAGES: ClassVar[Dict[str, tuple[str, ...]]] = {
         "python": (".py",),
@@ -49,6 +53,25 @@ def get_settings() -> AgentSettings:
     if timeout:
         try:
             settings.serena_timeout_seconds = int(timeout)
+        except ValueError:
+            pass
+
+    openai_api_key = os.getenv("SPEC_AGENT_OPENAI_API_KEY")
+    if openai_api_key:
+        settings.openai_api_key = openai_api_key
+
+    openai_model = os.getenv("SPEC_AGENT_OPENAI_MODEL")
+    if openai_model:
+        settings.openai_model = openai_model
+
+    openai_base = os.getenv("SPEC_AGENT_OPENAI_BASE_URL")
+    if openai_base:
+        settings.openai_base_url = openai_base
+
+    openai_timeout = os.getenv("SPEC_AGENT_OPENAI_TIMEOUT")
+    if openai_timeout:
+        try:
+            settings.openai_timeout_seconds = int(openai_timeout)
         except ValueError:
             pass
 
