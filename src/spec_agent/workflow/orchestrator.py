@@ -13,6 +13,7 @@ from ..persistence.store import JsonStore
 from ..services.context.indexer import ContextIndexer
 from ..services.context.retriever import ContextRetriever
 from ..services.integrations.serena_client import SerenaToolClient
+from ..services.llm.openai_client import OpenAILLMClient
 from ..services.planning.clarifier import Clarifier
 from ..services.planning.plan_builder import PlanBuilder
 from ..services.patches.engine import PatchEngine
@@ -37,7 +38,8 @@ class TaskOrchestrator:
         self.context_indexer = ContextIndexer(self.settings)
         self.context_retriever = ContextRetriever()
         self.clarifier = Clarifier()
-        self.plan_builder = PlanBuilder()
+        self.llm_client = self._maybe_create_llm_client()
+        self.plan_builder = PlanBuilder(llm_client=self.llm_client)
         self.boundary_manager = BoundaryManager()
         self.serena_client = self._maybe_create_serena_client()
         self.patch_engine = PatchEngine(serena_client=self.serena_client)
@@ -125,6 +127,26 @@ class TaskOrchestrator:
             if task.id == task_id:
                 return task
         raise ValueError(f"Task not found: {task_id}")
+
+    def _maybe_create_llm_client(self) -> Optional[OpenAILLMClient]:
+        """
+        Initialize OpenAI LLM client if API key is configured.
+        """
+        api_key = self.settings.openai_api_key
+        if not api_key:
+            LOG.debug("OpenAI API key not configured, LLM features will be unavailable")
+            return None
+
+        try:
+            return OpenAILLMClient(
+                api_key=api_key,
+                model=self.settings.openai_model,
+                base_url=self.settings.openai_base_url,
+                timeout_seconds=self.settings.openai_timeout_seconds,
+            )
+        except ValueError as exc:
+            LOG.warning("Failed to initialize OpenAI client: %s", exc)
+            return None
 
     def _maybe_create_serena_client(self) -> Optional[SerenaToolClient]:
         repo_root = Path(__file__).resolve().parents[3]
