@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 import networkx as nx
+import pathspec
 
 from ...config.settings import AgentSettings
 
@@ -22,9 +23,31 @@ class ContextIndexer:
     def __init__(self, settings: AgentSettings) -> None:
         self.settings = settings
 
+    def _load_gitignore(self, repo_path: Path) -> Optional[pathspec.PathSpec]:
+        """
+        Load and parse .gitignore file if it exists.
+
+        Returns a PathSpec matcher for filtering paths, or None if no .gitignore.
+        """
+        gitignore_path = repo_path / ".gitignore"
+        if not gitignore_path.exists():
+            return None
+
+        try:
+            with gitignore_path.open("r", encoding="utf-8", errors="ignore") as f:
+                patterns = f.read().splitlines()
+            # Filter out empty lines and comments
+            patterns = [p.strip() for p in patterns if p.strip() and not p.strip().startswith("#")]
+            return pathspec.PathSpec.from_lines("gitwildmatch", patterns)
+        except OSError:
+            return None
+
     def summarize_repository(self, repo_path: Path) -> Dict[str, any]:
         if not repo_path.exists():
             raise FileNotFoundError(f"Repository not found: {repo_path}")
+
+        # Load gitignore patterns
+        gitignore_spec = self._load_gitignore(repo_path)
 
         file_counter = 0
         directory_counter = 0
@@ -33,6 +56,17 @@ class ContextIndexer:
         import_edges: Dict[str, List[str]] = defaultdict(list)
 
         for path in repo_path.rglob("*"):
+            # Get relative path for gitignore matching
+            relative_path = path.relative_to(repo_path)
+
+            # Skip if matches gitignore patterns
+            if gitignore_spec and gitignore_spec.match_file(str(relative_path)):
+                continue
+
+            # Always skip .git directory
+            if ".git" in path.parts:
+                continue
+
             if path.is_dir():
                 directory_counter += 1
                 continue
@@ -45,13 +79,13 @@ class ContextIndexer:
             line_count = self._count_lines(path)
             if line_count >= self.settings.hotspot_loc_threshold:
                 hotspots.append(
-                    {"path": str(path.relative_to(repo_path)), "reason": f"{line_count} LOC"}
+                    {"path": str(relative_path), "reason": f"{line_count} LOC"}
                 )
 
             if language in {"python", "typescript"}:
                 imports = self._extract_imports(path)
                 if imports:
-                    import_edges[str(path.relative_to(repo_path))].extend(imports)
+                    import_edges[str(relative_path)].extend(imports)
 
         graph = self._build_graph(import_edges)
         top_modules = [
