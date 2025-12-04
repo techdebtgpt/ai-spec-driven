@@ -45,14 +45,14 @@ class OpenAILLMClient:
         """
 
         try:
-            response = self._client.responses.create(
+            response = self._client.chat.completions.create(
                 model=self._model,
-                input=[
+                messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=0.2,
-                max_output_tokens=max_output_tokens,
+                max_tokens=max_output_tokens,
             )
         except OpenAIError as exc:
             raise LLMClientError(f"OpenAI request failed: {exc}") from exc
@@ -65,21 +65,20 @@ class OpenAILLMClient:
     @staticmethod
     def _extract_text(response: object) -> str:
         """
-        Pull the human-readable text content out of the Responses API payload.
+        Pull the human-readable text content out of the Chat Completions API response.
         """
 
-        chunks: List[str] = []
-        for item in getattr(response, "output", []) or []:
-            content = getattr(item, "content", None)
-            if not content:
-                continue
-            for block in content:
-                if getattr(block, "type", None) == "text":
-                    value = getattr(getattr(block, "text", None), "value", "")
-                    if value:
-                        chunks.append(value)
-        extracted = "\n".join(chunk for chunk in chunks if chunk).strip()
-        if not extracted:
-            LOG.debug("OpenAI response missing text content: %s", response)
-        return extracted
+        try:
+            # Standard OpenAI chat completions response structure
+            if hasattr(response, "choices") and response.choices:
+                first_choice = response.choices[0]
+                if hasattr(first_choice, "message") and hasattr(first_choice.message, "content"):
+                    return first_choice.message.content or ""
+
+            LOG.debug("OpenAI response missing expected structure: %s", response)
+            return ""
+
+        except Exception as exc:
+            LOG.error("Failed to extract text from OpenAI response: %s", exc)
+            return ""
 
