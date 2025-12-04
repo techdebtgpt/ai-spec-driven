@@ -16,7 +16,8 @@ dependencies = [
     "pydantic>=2.9",
     "networkx>=3.4",
     "pyyaml>=6.0.2",
-    "openai>=1.50.2"
+    "openai>=1.50.2",
+    "pathspec>=0.12.1"
 ]
 
 [project.optional-dependencies]
