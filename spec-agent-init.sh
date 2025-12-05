@@ -44,10 +44,21 @@ pip install --upgrade pip --quiet
 echo "pip upgraded"
 echo ""
 
-# Install the package with dev dependencies
-echo "Installing spec-agent with dev dependencies..."
-pip install -e ".[dev]"
+# Install the package with dev and serena dependencies
+echo "Installing spec-agent with dev and serena dependencies..."
+pip install -e ".[dev,serena]"
 echo "Installation complete"
+echo ""
+
+# Verify MCP library is installed (should be via serena dependencies)
+echo "Verifying Serena dependencies..."
+if pip show mcp > /dev/null 2>&1; then
+    echo "✓ MCP library verified (required for Serena integration)"
+else
+    echo "MCP library not found, installing..."
+    pip install "mcp>=1.12.3" || echo "Warning: Could not install MCP library. Serena integration will not be available."
+    echo "✓ MCP library installed"
+fi
 echo ""
 
 # Verify installation

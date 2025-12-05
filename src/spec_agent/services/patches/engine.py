@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4
 
-from ...domain.models import Patch, Plan
+from ...domain.models import BoundarySpec, Patch, PatchKind, Plan
 from ..integrations.serena_client import SerenaToolClient, SerenaToolError
 
 
@@ -20,23 +20,65 @@ class PatchEngine:
     def __init__(self, serena_client: Optional[SerenaToolClient] = None) -> None:
         self.serena_client = serena_client
 
-    def draft_patches(self, plan: Plan, repo_path: Path | None = None) -> List[Patch]:
+    def draft_patches(
+        self, 
+        plan: Plan, 
+        repo_path: Path | None = None, 
+        *,
+        kind: PatchKind = PatchKind.IMPLEMENTATION,
+        boundary_specs: List[BoundarySpec] | None = None
+    ) -> List[Patch]:
         if self.serena_client:
             if repo_path is None:
                 raise ValueError("repo_path is required when Serena integration is enabled.")
-            return self._draft_with_serena(plan, repo_path)
+            return self._draft_with_serena(plan, repo_path, kind=kind, boundary_specs=boundary_specs or [])
 
-        return [self._placeholder_patch(plan, index, step.description) for index, step in enumerate(plan.steps, start=1)]
+        return [
+            self._placeholder_patch(plan, index, step.description, kind=kind)
+            for index, step in enumerate(plan.steps, start=1)
+        ]
 
-    def _draft_with_serena(self, plan: Plan, repo_path: Path) -> List[Patch]:
+    def _draft_with_serena(
+        self, 
+        plan: Plan, 
+        repo_path: Path, 
+        *, 
+        kind: PatchKind,
+        boundary_specs: List[BoundarySpec]
+    ) -> List[Patch]:
         patches: List[Patch] = []
         for index, step in enumerate(plan.steps, start=1):
             try:
-                proposal = self.serena_client.request_patch(repo_path, step.description, plan.id)
+                # Find relevant boundary specs for this step
+                relevant_specs = [
+                    spec for spec in boundary_specs
+                    if spec.status.value == "APPROVED"  # Only use approved specs
+                ]
+                proposal = self.serena_client.request_patch(
+                    repo_path, 
+                    step.description, 
+                    plan.id,
+                    boundary_specs=relevant_specs
+                )
+                
+                # Validate that we got a real diff (not empty or error)
+                if not proposal.diff or proposal.diff.strip() == "":
+                    raise SerenaToolError(
+                        f"Serena returned empty diff for step '{step.description}'. "
+                        f"Rationale: {proposal.rationale}"
+                    )
+                
+                # Check if rationale indicates an error (but allow connection success messages)
+                rationale_lower = proposal.rationale.lower()
+                if (proposal.rationale.startswith(("Error", "Failed", "Serena integration failed", "Serena MCP integration failed")) 
+                    and "connected successfully" not in rationale_lower):
+                    raise SerenaToolError(
+                        f"Serena integration error for step '{step.description}': {proposal.rationale}"
+                    )
+                
             except SerenaToolError as exc:
-                LOG.warning("Serena patch generation failed for '%s'. Falling back to placeholder. (%s)", step.description, exc)
-                patches.append(self._placeholder_patch(plan, index, step.description))
-                continue
+                LOG.error("Serena patch generation failed for '%s': %s", step.description, exc)
+                raise  # Fail fast - no fallback to placeholder
 
             patches.append(
                 Patch(
@@ -46,14 +88,15 @@ class PatchEngine:
                     diff=proposal.diff,
                     rationale=proposal.rationale,
                     alternatives=proposal.alternatives,
+                    kind=kind,
                 )
             )
         return patches
 
     @staticmethod
-    def _placeholder_patch(plan: Plan, index: int, description: str) -> Patch:
+    def _placeholder_patch(plan: Plan, index: int, description: str, *, kind: PatchKind) -> Patch:
         diff = f"--- step-{index}.txt\n+++ step-{index}.txt\n@@\n- placeholder\n+ implementation details TBD\n"
-        rationale = f"Implements plan step {index}: {description}"
+        rationale = f"{kind.value.title()} patch {index}: {description}"
         alternatives = [
             "Manual refactor before applying patch.",
             "Defer change until boundary spec is approved.",
@@ -65,6 +108,7 @@ class PatchEngine:
             diff=diff,
             rationale=rationale,
             alternatives=alternatives,
+            kind=kind,
         )
 
 

@@ -51,6 +51,8 @@ def ensure_serena_env(venv_path: Path, project_root: Path) -> None:
     """
 
     wrapper_script = project_root / "scripts" / "serena_patch_wrapper.py"
+    mcp_integration = project_root / "scripts" / "serena_mcp_integration.py"
+    
     if not wrapper_script.exists():
         return
 
@@ -61,15 +63,25 @@ def ensure_serena_env(venv_path: Path, project_root: Path) -> None:
 
     raw_command = f'{python_bin} {wrapper_script}'
     escaped_command = raw_command.replace('"', '\\"')
+    
+    # Set up delegate to MCP integration if it exists
+    delegate_command = None
+    if mcp_integration.exists():
+        delegate_raw = f'{python_bin} {mcp_integration}'
+        delegate_command = delegate_raw.replace('"', '\\"')
 
-    env_path = _upsert_env_entries(
-        {
-            "SPEC_AGENT_SERENA_ENABLED": "1",
-            "SPEC_AGENT_SERENA_COMMAND": f'"{escaped_command}"',
-        }
-    )
+    env_entries = {
+        "SPEC_AGENT_SERENA_ENABLED": "1",
+        "SPEC_AGENT_SERENA_COMMAND": f'"{escaped_command}"',
+        "SPEC_AGENT_SERENA_TIMEOUT": "120",
+    }
+    
+    if delegate_command:
+        env_entries["SERENA_PATCH_DELEGATE"] = f'"{delegate_command}"'
+
+    env_path = _upsert_env_entries(env_entries)
     if env_path:
-        print(f"Configured Serena wrapper env at {env_path}")
+        print(f"Configured Serena integration at {env_path}")
 
 
 def ensure_openai_env_from_envvars() -> None:
@@ -137,14 +149,36 @@ def main():
         print(f"Warning: Could not upgrade pip: {e}")
     print()
     
-    # Install the package with dev dependencies
-    print("Installing spec-agent with dev dependencies...")
+    # Install the package with dev and serena dependencies
+    print("Installing spec-agent with dev and serena dependencies...")
     try:
-        subprocess.run([str(pip_path), "install", "-e", f"{project_root}[dev]"], check=True, cwd=project_root)
+        subprocess.run([str(pip_path), "install", "-e", f"{project_root}[dev,serena]"], check=True, cwd=project_root)
         print("Installation complete")
     except subprocess.CalledProcessError as e:
         print(f"Error installing package: {e}")
         sys.exit(1)
+    print()
+    
+    # Verify MCP library is installed (should be via serena dependencies, but double-check)
+    print("Verifying Serena dependencies...")
+    try:
+        result = subprocess.run(
+            [str(pip_path), "show", "mcp"],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=project_root,
+        )
+        print("✓ MCP library verified (required for Serena integration)")
+    except subprocess.CalledProcessError:
+        # MCP not found, try to install it
+        print("MCP library not found, installing...")
+        try:
+            subprocess.run([str(pip_path), "install", "mcp>=1.12.3"], check=True, cwd=project_root)
+            print("✓ MCP library installed")
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: Could not install MCP library: {e}")
+            print("Serena integration will not be available without MCP")
     print()
     
     # Verify installation
@@ -157,6 +191,13 @@ def main():
         ensure_openai_env_from_envvars()
         print()
         print("Setup complete! You can now use spec-agent.")
+        print()
+        print("Serena Integration:")
+        print("  ✓ MCP library installed (required for Serena)")
+        print("  ✓ Serena environment configured")
+        print("  Note: To use Serena, you also need 'uv' installed:")
+        print("    curl -LsSf https://astral.sh/uv/install.sh | sh")
+        print("    Or: brew install uv")
         print()
         print("To activate the virtual environment in your current shell, run:")
         print(f"  {activate_cmd}")
