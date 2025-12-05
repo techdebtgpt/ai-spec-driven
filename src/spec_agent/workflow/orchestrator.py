@@ -94,6 +94,19 @@ class TaskOrchestrator:
             "risks": plan.risks,
             "refactors": plan.refactor_suggestions,
         }
+        # Store full boundary spec objects for approval workflow
+        task.metadata["boundary_specs"] = [
+            {
+                "id": spec.id,
+                "boundary_name": spec.boundary_name,
+                "human_description": spec.human_description,
+                "diagram_text": spec.diagram_text,
+                "machine_spec": spec.machine_spec,
+                "status": spec.status.value,
+            }
+            for spec in specs
+        ]
+        # Also store just names for backward compatibility with CLI display
         task.metadata["pending_specs"] = [spec.boundary_name for spec in specs]
         task.metadata["patch_queue"] = [patch.step_reference for patch in patches]
         task.metadata["serena_patches"] = [
@@ -127,6 +140,72 @@ class TaskOrchestrator:
             "patch_queue": task.metadata["patch_queue"],
             "test_suggestions": task.metadata["test_suggestions"],
         }
+
+    # ------------------------------------------------------------------ Boundary Specs
+    def get_boundary_specs(self, task_id: str) -> List[Dict]:
+        """
+        Get all boundary specs for a task.
+        """
+        task = self._get_task(task_id)
+        return task.metadata.get("boundary_specs", [])
+
+    def approve_spec(self, task_id: str, spec_id: str) -> Dict:
+        """
+        Approve a boundary specification.
+        """
+        task = self._get_task(task_id)
+        specs = task.metadata.get("boundary_specs", [])
+
+        spec_found = False
+        for spec in specs:
+            if spec["id"] == spec_id:
+                spec["status"] = "APPROVED"
+                spec_found = True
+                break
+
+        if not spec_found:
+            raise ValueError(f"Boundary spec not found: {spec_id}")
+
+        task.metadata["boundary_specs"] = specs
+        task.touch()
+        self.store.upsert_task(task)
+
+        self.logger.record(
+            task.id,
+            "SPEC_APPROVED",
+            {"spec_id": spec_id, "boundary_name": spec.get("boundary_name")}
+        )
+
+        return {"spec_id": spec_id, "status": "APPROVED"}
+
+    def skip_spec(self, task_id: str, spec_id: str) -> Dict:
+        """
+        Skip (override) a boundary specification.
+        """
+        task = self._get_task(task_id)
+        specs = task.metadata.get("boundary_specs", [])
+
+        spec_found = False
+        for spec in specs:
+            if spec["id"] == spec_id:
+                spec["status"] = "SKIPPED"
+                spec_found = True
+                break
+
+        if not spec_found:
+            raise ValueError(f"Boundary spec not found: {spec_id}")
+
+        task.metadata["boundary_specs"] = specs
+        task.touch()
+        self.store.upsert_task(task)
+
+        self.logger.record(
+            task.id,
+            "SPEC_SKIPPED",
+            {"spec_id": spec_id, "boundary_name": spec.get("boundary_name")}
+        )
+
+        return {"spec_id": spec_id, "status": "SKIPPED"}
 
     # ------------------------------------------------------------------ Helpers
     def _get_task(self, task_id: str) -> Task:
