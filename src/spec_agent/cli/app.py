@@ -139,11 +139,11 @@ def specs(task_id: str = typer.Argument(..., help="UUID of the task.")) -> None:
         console.print(f"[bold]Boundary Spec #{i}: {spec.get('boundary_name')} [[{status_color}]{spec.get('status', 'PENDING')}[/]]")
         console.print(f"[bold]{'='*70}[/]\n")
         console.print(f"[bold]ID:[/] {spec.get('id')}\n")
-        console.print(f"[bold cyan]📝 Description:[/]")
+        console.print(f"[bold cyan]Description:[/]")
         console.print(f"{spec.get('human_description', 'No description provided.')}\n")
-        console.print(f"[bold cyan]📊 Mermaid Diagram:[/]")
+        console.print(f"[bold cyan]Mermaid Diagram:[/]")
         console.print(f"[dim]{spec.get('diagram_text', 'No diagram provided.')}[/]\n")
-        console.print(f"[bold cyan]⚙️  Machine Spec:[/]")
+        console.print(f"[bold cyan]Machine Spec:[/]")
 
         machine_spec = spec.get('machine_spec', {})
         console.print(f"[bold]Actors:[/] {', '.join(machine_spec.get('actors', []))}")
@@ -158,11 +158,11 @@ def specs(task_id: str = typer.Argument(..., help="UUID of the task.")) -> None:
     console.print(f"\n[bold]{'='*70}[/]")
     pending = [s for s in specs if s.get("status") == "PENDING"]
     if pending:
-        console.print(f"\n[yellow]⚠️  {len(pending)} spec(s) require approval.[/]")
+        console.print(f"\n[yellow]{len(pending)} spec(s) require approval.[/]")
         console.print(f"[dim]Approve: ./spec-agent approve-spec {task_id} <spec-id>[/]")
         console.print(f"[dim]Skip: ./spec-agent skip-spec {task_id} <spec-id>[/]")
     else:
-        console.print(f"\n[green]✅ All specs resolved.[/]")
+        console.print(f"\n[green]All specs resolved.[/]")
 
 
 @app.command()
@@ -177,7 +177,7 @@ def approve_spec(
 
     try:
         result = orchestrator.approve_spec(task_id, spec_id)
-        console.print(f"[green]✅ Approved boundary spec: {result['spec_id']}[/]")
+        console.print(f"[green]Approved boundary spec: {result['spec_id']}[/]")
 
         # Check if all specs are resolved
         specs = orchestrator.get_boundary_specs(task_id)
@@ -203,7 +203,7 @@ def skip_spec(
 
     try:
         result = orchestrator.skip_spec(task_id, spec_id)
-        console.print(f"[blue]⏭️  Skipped boundary spec: {result['spec_id']}[/]")
+        console.print(f"[blue]Skipped boundary spec: {result['spec_id']}[/]")
 
         # Check if all specs are resolved
         specs = orchestrator.get_boundary_specs(task_id)
