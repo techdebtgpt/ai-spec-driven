@@ -123,6 +123,11 @@ class PatchStatus(str, Enum):
     REJECTED = "REJECTED"
 
 
+class PatchKind(str, Enum):
+    IMPLEMENTATION = "IMPLEMENTATION"
+    REFACTOR = "REFACTOR"
+
+
 @dataclass
 class Patch:
     id: str
@@ -132,6 +137,32 @@ class Patch:
     rationale: str
     alternatives: List[str] = field(default_factory=list)
     status: PatchStatus = PatchStatus.PENDING
+    kind: PatchKind = PatchKind.IMPLEMENTATION
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "step_reference": self.step_reference,
+            "diff": self.diff,
+            "rationale": self.rationale,
+            "alternatives": self.alternatives,
+            "status": self.status.value,
+            "kind": self.kind.value,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Dict[str, Any]) -> Patch:
+        return cls(
+            id=raw["id"],
+            task_id=raw["task_id"],
+            step_reference=raw["step_reference"],
+            diff=raw["diff"],
+            rationale=raw["rationale"],
+            alternatives=raw.get("alternatives", []),
+            status=PatchStatus(raw.get("status", PatchStatus.PENDING.value)),
+            kind=PatchKind(raw.get("kind", PatchKind.IMPLEMENTATION.value)),
+        )
 
 
 class TestSuggestionStatus(str, Enum):
@@ -158,5 +189,42 @@ class LogEntry:
     timestamp: datetime
     entry_type: str
     payload: Dict[str, Any]
+
+
+class RefactorSuggestionStatus(str, Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+
+
+@dataclass
+class RefactorSuggestion:
+    id: str
+    task_id: str
+    description: str
+    rationale: str
+    scope: List[str] = field(default_factory=list)
+    status: RefactorSuggestionStatus = RefactorSuggestionStatus.PENDING
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "description": self.description,
+            "rationale": self.rationale,
+            "scope": self.scope,
+            "status": self.status.value,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Dict[str, Any]) -> "RefactorSuggestion":
+        return cls(
+            id=raw["id"],
+            task_id=raw["task_id"],
+            description=raw["description"],
+            rationale=raw["rationale"],
+            scope=raw.get("scope", []),
+            status=RefactorSuggestionStatus(raw.get("status", RefactorSuggestionStatus.PENDING.value)),
+        )
 
 

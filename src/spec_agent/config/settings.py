@@ -29,12 +29,30 @@ class AgentSettings:
     openai_timeout_seconds: int = 60
 
     DEFAULT_LANGUAGES: ClassVar[Dict[str, tuple[str, ...]]] = {
-        "python": (".py",),
+        "python": (".py", ".pyw", ".pyi"),
         "typescript": (".ts", ".tsx"),
-        "javascript": (".js", ".jsx"),
-        "shell": (".sh",),
-        "markdown": (".md",),
+        "javascript": (".js", ".jsx", ".mjs", ".cjs"),
+        "csharp": (".cs", ".csx"),
+        "java": (".java",),
         "go": (".go",),
+        "rust": (".rs",),
+        "cpp": (".cpp", ".cc", ".cxx", ".hpp", ".h"),
+        "c": (".c", ".h"),
+        "shell": (".sh", ".bash", ".zsh"),
+        "powershell": (".ps1", ".psm1", ".psd1"),
+        "ruby": (".rb",),
+        "php": (".php",),
+        "swift": (".swift",),
+        "kotlin": (".kt", ".kts"),
+        "scala": (".scala",),
+        "markdown": (".md", ".markdown"),
+        "yaml": (".yaml", ".yml"),
+        "json": (".json",),
+        "xml": (".xml",),
+        "html": (".html", ".htm"),
+        "css": (".css", ".scss", ".sass"),
+        "terraform": (".tf", ".tfvars"),
+        "dockerfile": (".dockerfile",),
     }
 
 

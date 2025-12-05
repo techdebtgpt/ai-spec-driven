@@ -51,12 +51,30 @@ class SerenaToolClient:
         self.command = list(command)
         self.timeout_seconds = timeout_seconds
 
-    def request_patch(self, repo_path: Path, step_description: str, plan_id: str) -> SerenaPatchProposal:
+    def request_patch(
+        self, 
+        repo_path: Path, 
+        step_description: str, 
+        plan_id: str,
+        boundary_specs: List | None = None
+    ) -> SerenaPatchProposal:
         payload = {
             "repo_path": str(repo_path),
             "plan_id": plan_id,
             "step_description": step_description,
         }
+        
+        # Add boundary specs if provided
+        if boundary_specs:
+            payload["boundary_specs"] = [
+                {
+                    "boundary_name": spec.boundary_name,
+                    "human_description": spec.human_description,
+                    "diagram_text": spec.diagram_text,
+                    "machine_spec": spec.machine_spec,
+                }
+                for spec in boundary_specs
+            ]
 
         try:
             completed = subprocess.run(

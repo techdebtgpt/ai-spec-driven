@@ -11,5 +11,7 @@ dist/
 build/
 *.egg-info/
 .idea/
+.serena/
+assets/
 
 
