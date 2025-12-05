@@ -40,7 +40,7 @@ class TaskOrchestrator:
         self.clarifier = Clarifier()
         self.llm_client = self._maybe_create_llm_client()
         self.plan_builder = PlanBuilder(llm_client=self.llm_client)
-        self.boundary_manager = BoundaryManager()
+        # Note: BoundaryManager created per-use in generate_plan with context
         self.serena_client = self._maybe_create_serena_client()
         self.patch_engine = PatchEngine(serena_client=self.serena_client)
         self.test_suggester = TestSuggester()
@@ -78,7 +78,14 @@ class TaskOrchestrator:
         task = self._get_task(task_id)
         context_summary = task.metadata.get("repository_summary", {})
         plan = self.plan_builder.build_plan(task.id, task.description, context_summary)
-        specs = self.boundary_manager.required_specs(plan)
+
+        # Create BoundaryManager with LLM client and context for this plan
+        boundary_manager = BoundaryManager(
+            llm_client=self.llm_client,
+            context_summary=context_summary
+        )
+        specs = boundary_manager.required_specs(plan)
+
         patches = self.patch_engine.draft_patches(plan, repo_path=task.repo_path)
         tests = self.test_suggester.suggest(plan)
 
