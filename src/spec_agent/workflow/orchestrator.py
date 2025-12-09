@@ -72,17 +72,25 @@ class TaskOrchestrator:
 
         summary = self.context_indexer.summarize_repository(repo_path.resolve())
         
-        # Get git commit info
+        # Get comprehensive git information
+        git_info = {}
         try:
-            starting_commit = self._current_commit(repo_path.resolve())
-        except Exception:
-            starting_commit = None
+            git_info["current_commit"] = self._current_commit(repo_path.resolve())
+            git_info["current_branch"] = self._get_current_branch(repo_path.resolve())
+            git_info["remote_url"] = self._get_remote_url(repo_path.resolve())
+            git_info["commit_author"] = self._get_commit_author(repo_path.resolve())
+            git_info["commit_message"] = self._get_commit_message(repo_path.resolve())
+            git_info["commit_date"] = self._get_commit_date(repo_path.resolve())
+        except Exception as e:
+            self.logger.record("WARNING", "GIT_INFO_FAILED", {"error": str(e)})
+            git_info["error"] = str(e)
 
         index_data = {
             "repo_path": str(repo_path.resolve()),
+            "repo_name": repo_path.name,
             "branch": branch,
             "repository_summary": summary,
-            "starting_commit": starting_commit,
+            "git_info": git_info,
             "indexed_at": datetime.now().isoformat(),
         }
 
@@ -985,6 +993,76 @@ class TaskOrchestrator:
         except subprocess.CalledProcessError as exc:  # pragma: no cover
             raise RuntimeError(f"Unable to determine current commit: {exc.stderr}") from exc
         return result.stdout.strip()
+
+    def _get_current_branch(self, repo_path: Path) -> str:
+        """Get the current git branch name."""
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=repo_path,
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return "unknown"
+
+    def _get_remote_url(self, repo_path: Path) -> str:
+        """Get the git remote URL (origin)."""
+        try:
+            result = subprocess.run(
+                ["git", "config", "--get", "remote.origin.url"],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=repo_path,
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return "unknown"
+
+    def _get_commit_author(self, repo_path: Path) -> str:
+        """Get the author of the latest commit."""
+        try:
+            result = subprocess.run(
+                ["git", "log", "-1", "--pretty=format:%an <%ae>"],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=repo_path,
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return "unknown"
+
+    def _get_commit_message(self, repo_path: Path) -> str:
+        """Get the message of the latest commit."""
+        try:
+            result = subprocess.run(
+                ["git", "log", "-1", "--pretty=format:%s"],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=repo_path,
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return "unknown"
+
+    def _get_commit_date(self, repo_path: Path) -> str:
+        """Get the date of the latest commit."""
+        try:
+            result = subprocess.run(
+                ["git", "log", "-1", "--pretty=format:%ci"],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=repo_path,
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return "unknown"
 
     def get_task_status(self, task_id: str) -> Dict[str, str]:
         task = self._get_task(task_id)

@@ -3,9 +3,6 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
-import os
-import subprocess
-import json
 import sys
 
 import networkx as nx
@@ -56,6 +53,8 @@ class ContextIndexer:
         serena_modules = serena_info.get("modules", []) if serena_info else []
         serena_namespaces = serena_info.get("namespaces", []) if serena_info else []
         serena_directories = serena_info.get("top_directories", []) if serena_info else []
+        serena_project_type = serena_info.get("project_type") if serena_info else None
+        serena_file_extensions = serena_info.get("file_extensions", {}) if serena_info else {}
         
         # Load gitignore patterns
         gitignore_spec = self._load_gitignore(repo_path)
@@ -63,12 +62,13 @@ class ContextIndexer:
         file_counter = 0
         directory_counter = 0
         language_hits: Counter[str] = Counter()
+        extension_hits: Counter[str] = Counter()
         hotspots: List[Dict[str, any]] = []
         import_edges: Dict[str, List[str]] = defaultdict(list)
         
-        # If Serena detected languages, we'll use them to enhance detection
-        # The extension-based detection below will still work, but Serena helps
-        # identify languages that might be missed or confirm project types
+        # Track file sizes for statistics
+        total_size_bytes = 0
+        largest_files = []  # Track top 5 largest files
 
         for path in repo_path.rglob("*"):
             # Get relative path for gitignore matching
@@ -87,6 +87,19 @@ class ContextIndexer:
                 continue
 
             file_counter += 1
+            
+            # Track file extension
+            if path.suffix:
+                extension_hits[path.suffix.lower()] += 1
+            
+            # Track file size
+            try:
+                file_size = path.stat().st_size
+                total_size_bytes += file_size
+                largest_files.append((str(relative_path), file_size))
+            except OSError:
+                pass
+            
             language = self._detect_language(path)
             if language:
                 language_hits[language] += 1
@@ -94,13 +107,17 @@ class ContextIndexer:
             line_count = self._count_lines(path)
             if line_count >= self.settings.hotspot_loc_threshold:
                 hotspots.append(
-                    {"path": str(relative_path), "reason": f"{line_count} LOC"}
+                    {"path": str(relative_path), "reason": f"{line_count} LOC", "lines": line_count}
                 )
 
             if language in {"python", "typescript"}:
                 imports = self._extract_imports(path)
                 if imports:
                     import_edges[str(relative_path)].extend(imports)
+
+        # Sort and limit largest files
+        largest_files.sort(key=lambda x: x[1], reverse=True)
+        largest_files = largest_files[:5]
 
         graph = self._build_graph(import_edges)
         top_modules = [
@@ -161,12 +178,51 @@ class ContextIndexer:
             for lang in serena_languages[:3]:
                 top_languages_list.append(f"{lang} (detected by Serena)")
         
+        # Build detailed language breakdown with file counts
+        language_details = []
+        for lang, count in language_hits.most_common(10):
+            language_details.append({"language": lang, "file_count": count})
+        
+        # Add Serena-detected languages that might not have been counted by extension
+        if serena_languages:
+            existing_langs = {detail["language"].lower() for detail in language_details}
+            for lang in serena_languages:
+                if lang.lower() not in existing_langs:
+                    language_details.append({"language": lang, "file_count": 0, "detected_by": "serena"})
+        
+        # Detect frameworks based on common patterns
+        frameworks = self._detect_frameworks(repo_path)
+        
+        # Build comprehensive response with enhanced data
         return {
+            # Basic counts
             "file_count": file_counter,
             "directory_count": directory_counter,
+            "total_size_bytes": total_size_bytes,
+            "total_size_mb": round(total_size_bytes / (1024 * 1024), 2),
+            
+            # Language information
             "top_languages": top_languages_list if top_languages_list else [],
-            "hotspots": hotspots,
+            "language_details": language_details,
+            "all_languages": list(language_hits.keys()),
+            
+            # Project type and structure
+            "project_type": serena_project_type,
+            "frameworks": frameworks,
+            "top_file_extensions": [f"{ext} ({count})" for ext, count in extension_hits.most_common(10)],
+            
+            # Modules and namespaces
             "top_modules": top_modules if top_modules else [],
+            "namespaces": serena_namespaces[:10] if serena_namespaces else [],
+            "top_directories": serena_directories[:10] if serena_directories else [],
+            
+            # Code quality indicators
+            "hotspots": hotspots,
+            "largest_files": [{"path": path, "size_bytes": size, "size_kb": round(size / 1024, 2)} for path, size in largest_files],
+            
+            # Serena-specific data
+            "serena_enabled": bool(serena_info),
+            "serena_file_extensions": serena_file_extensions,
         }
 
     def _detect_language(self, path: Path) -> str | None:
@@ -175,6 +231,117 @@ class ContextIndexer:
             if suffix in extensions:
                 return language
         return None
+
+    def _detect_frameworks(self, repo_path: Path) -> List[str]:
+        """
+        Detect common frameworks based on project files and directory structure.
+        """
+        frameworks = []
+        
+        # Check for common framework indicator files
+        framework_indicators = {
+            # Python frameworks
+            "requirements.txt": ["Python"],
+            "pyproject.toml": ["Python"],
+            "setup.py": ["Python"],
+            "Pipfile": ["Python"],
+            "poetry.lock": ["Poetry"],
+            "manage.py": ["Django"],
+            "flask": ["Flask"],  # Directory
+            "fastapi": ["FastAPI"],  # Directory or imports
+            
+            # JavaScript/TypeScript frameworks
+            "package.json": [],  # Will check contents
+            "package-lock.json": ["npm"],
+            "yarn.lock": ["Yarn"],
+            "pnpm-lock.yaml": ["pnpm"],
+            "next.config.js": ["Next.js"],
+            "nuxt.config.js": ["Nuxt.js"],
+            "angular.json": ["Angular"],
+            "vue.config.js": ["Vue.js"],
+            "svelte.config.js": ["Svelte"],
+            
+            # .NET frameworks
+            "*.csproj": [".NET"],
+            "*.sln": [".NET"],
+            "Program.cs": ["C#"],
+            
+            # Java frameworks
+            "pom.xml": ["Maven", "Java"],
+            "build.gradle": ["Gradle", "Java"],
+            "build.gradle.kts": ["Gradle", "Kotlin"],
+            
+            # Ruby frameworks
+            "Gemfile": ["Ruby"],
+            "Rakefile": ["Ruby", "Rake"],
+            "config.ru": ["Rack"],
+            
+            # Go
+            "go.mod": ["Go"],
+            "go.sum": ["Go"],
+            
+            # Rust
+            "Cargo.toml": ["Rust"],
+            "Cargo.lock": ["Rust"],
+            
+            # PHP
+            "composer.json": ["PHP", "Composer"],
+            
+            # Mobile
+            "*.xcodeproj": ["iOS", "Swift"],
+            "*.xcworkspace": ["iOS", "Swift"],
+            "Podfile": ["CocoaPods", "iOS"],
+            
+            # DevOps/Infrastructure
+            "Dockerfile": ["Docker"],
+            "docker-compose.yml": ["Docker Compose"],
+            "terraform": ["Terraform"],  # Directory
+            "*.tf": ["Terraform"],
+            "kubernetes": ["Kubernetes"],  # Directory
+            "*.yaml": [],  # Will check for k8s manifests
+        }
+        
+        for pattern, fw_list in framework_indicators.items():
+            if "*" in pattern:
+                # Glob pattern
+                matches = list(repo_path.glob(f"**/{pattern}"))[:3]  # Limit to avoid too many
+                if matches:
+                    frameworks.extend(fw_list)
+            else:
+                # Exact filename or directory
+                if (repo_path / pattern).exists():
+                    frameworks.extend(fw_list)
+        
+        # Check package.json for specific frameworks
+        package_json = repo_path / "package.json"
+        if package_json.exists():
+            try:
+                import json
+                with package_json.open() as f:
+                    pkg_data = json.load(f)
+                    deps = {**pkg_data.get("dependencies", {}), **pkg_data.get("devDependencies", {})}
+                    
+                    if "react" in deps or "react-dom" in deps:
+                        frameworks.append("React")
+                    if "vue" in deps:
+                        frameworks.append("Vue.js")
+                    if "angular" in deps or "@angular/core" in deps:
+                        frameworks.append("Angular")
+                    if "svelte" in deps:
+                        frameworks.append("Svelte")
+                    if "next" in deps:
+                        frameworks.append("Next.js")
+                    if "express" in deps:
+                        frameworks.append("Express.js")
+                    if "nestjs" in deps or "@nestjs/core" in deps:
+                        frameworks.append("NestJS")
+                    if "typescript" in deps:
+                        frameworks.append("TypeScript")
+            except (json.JSONDecodeError, OSError):
+                pass
+        
+        # Remove duplicates and return
+        return sorted(list(set(frameworks)))
 
     def _detect_languages_with_serena(self, repo_path: Path) -> Optional[Dict[str, any]]:
         """

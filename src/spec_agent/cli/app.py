@@ -33,24 +33,137 @@ def index(
     index_data = orchestrator.index_repository(repo_path=repo, branch=branch)
 
     summary = index_data.get("repository_summary", {})
+    git_info = index_data.get("git_info", {})
 
-    console.print(f"[bold green]Repository indexed successfully[/]")
-    console.print(
-        Panel.fit(
-            "\n".join(
-                [
-                    f"Repository: {repo}",
-                    f"Branch: {branch}",
-                    f"Files: {summary.get('file_count', 0)}",
-                    f"Directories: {summary.get('directory_count', 0)}",
-                    f"Top languages: {', '.join(summary.get('top_languages', [])) or 'n/a'}",
-                    f"Top modules: {', '.join(summary.get('top_modules', [])) or 'n/a'}",
-                ]
-            ),
-            title="Repository Index",
-        )
-    )
-    console.print(f"\n[cyan]Index saved. You can now run:[/] ./spec-agent start --description \"Your task\"")
+    console.print(f"[bold green]Repository indexed successfully[/]\n")
+    
+    # Repository Overview Panel
+    repo_info_lines = [
+        f"[bold]Repository:[/] {index_data.get('repo_name', repo.name)}",
+        f"[bold]Path:[/] {repo}",
+        f"[bold]Branch:[/] {branch}",
+    ]
+    
+    # Add git info if available
+    if git_info.get("current_commit"):
+        repo_info_lines.append(f"[bold]Commit:[/] {git_info['current_commit'][:12]}")
+    if git_info.get("commit_message"):
+        repo_info_lines.append(f"[bold]Message:[/] {git_info['commit_message'][:60]}...")
+    if git_info.get("commit_author"):
+        repo_info_lines.append(f"[bold]Author:[/] {git_info['commit_author']}")
+    if git_info.get("remote_url"):
+        remote_url = git_info['remote_url']
+        if len(remote_url) > 60:
+            remote_url = remote_url[:57] + "..."
+        repo_info_lines.append(f"[bold]Remote:[/] {remote_url}")
+    
+    console.print(Panel.fit("\n".join(repo_info_lines), title="Repository Info", border_style="blue"))
+    
+    # Statistics Panel
+    stats_lines = [
+        f"[bold]Files:[/] {summary.get('file_count', 0):,}",
+        f"[bold]Directories:[/] {summary.get('directory_count', 0):,}",
+    ]
+    
+    if summary.get('total_size_mb'):
+        stats_lines.append(f"[bold]Total Size:[/] {summary['total_size_mb']:,.2f} MB")
+    
+    # Show hotspots count if any
+    hotspots = summary.get('hotspots', [])
+    if hotspots:
+        stats_lines.append(f"[bold]Large Files:[/] {len(hotspots)} (>{orchestrator.settings.hotspot_loc_threshold} LOC)")
+    
+    console.print(Panel.fit("\n".join(stats_lines), title="Statistics", border_style="cyan"))
+    
+    # Languages & Frameworks Panel
+    lang_lines = []
+    
+    # Project type
+    if summary.get('project_type'):
+        lang_lines.append(f"[bold]Project Type:[/] {summary['project_type']}")
+    
+    # Top languages
+    top_langs = summary.get('top_languages', [])
+    if top_langs:
+        lang_lines.append(f"[bold]Languages:[/] {', '.join(top_langs)}")
+    
+    # Frameworks
+    frameworks = summary.get('frameworks', [])
+    if frameworks:
+        lang_lines.append(f"[bold]Frameworks:[/] {', '.join(frameworks[:5])}")
+    
+    # Language details
+    lang_details = summary.get('language_details', [])
+    if lang_details and len(lang_details) > 0:
+        lang_lines.append("")
+        lang_lines.append("[bold]Language Breakdown:[/]")
+        for detail in lang_details[:5]:
+            lang_name = detail.get('language', 'unknown')
+            file_count = detail.get('file_count', 0)
+            detected_by = detail.get('detected_by', '')
+            if detected_by:
+                lang_lines.append(f"  • {lang_name}: {file_count} files (via {detected_by})")
+            else:
+                lang_lines.append(f"  • {lang_name}: {file_count} files")
+    
+    if lang_lines:
+        console.print(Panel.fit("\n".join(lang_lines), title="Languages & Frameworks", border_style="green"))
+    
+    # Structure Panel (Modules, Namespaces, Directories)
+    structure_lines = []
+    
+    # Top modules
+    top_modules = summary.get('top_modules', [])
+    if top_modules:
+        structure_lines.append("[bold]Top Modules:[/]")
+        for mod in top_modules[:5]:
+            structure_lines.append(f"  • {mod}")
+    
+    # Namespaces (for .NET projects)
+    namespaces = summary.get('namespaces', [])
+    if namespaces:
+        if structure_lines:
+            structure_lines.append("")
+        structure_lines.append("[bold]Namespaces:[/]")
+        for ns in namespaces[:5]:
+            structure_lines.append(f"  • {ns}")
+    
+    # Top directories
+    top_dirs = summary.get('top_directories', [])
+    if top_dirs:
+        if structure_lines:
+            structure_lines.append("")
+        structure_lines.append("[bold]Top Directories:[/]")
+        for d in top_dirs[:5]:
+            structure_lines.append(f"  • {d}")
+    
+    if structure_lines:
+        console.print(Panel.fit("\n".join(structure_lines), title="Project Structure", border_style="magenta"))
+    
+    # File Extensions Panel
+    top_extensions = summary.get('top_file_extensions', [])
+    if top_extensions:
+        ext_table = Table(title="Top File Extensions", show_header=True, header_style="bold yellow")
+        ext_table.add_column("Extension", style="cyan")
+        ext_table.add_column("Count", justify="right", style="green")
+        
+        for ext in top_extensions[:10]:
+            parts = ext.rsplit(' (', 1)
+            if len(parts) == 2:
+                extension = parts[0]
+                count = parts[1].rstrip(')')
+                ext_table.add_row(extension, count)
+        
+        console.print(ext_table)
+    
+    # Serena Status
+    if summary.get('serena_enabled'):
+        console.print("[dim]✓ Enhanced with Serena language detection[/]")
+    else:
+        console.print("[dim]Basic language detection (Serena not enabled)[/]")
+    
+    console.print(f"\n[cyan]Index saved. You can now run:[/] [bold]./spec-agent start --description \"Your task\"[/]")
+
 
 
 @app.command()
