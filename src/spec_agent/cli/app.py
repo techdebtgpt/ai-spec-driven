@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 from uuid import UUID
 
 import typer
@@ -18,6 +18,82 @@ console = Console()
 
 def _get_orchestrator() -> TaskOrchestrator:
     return TaskOrchestrator()
+
+
+def _render_directory_tree(node: Dict, prefix: str = "", is_last: bool = True, max_items: int = 10) -> List[str]:
+    """
+    Render a directory tree structure as a list of formatted strings.
+    
+    Args:
+        node: Directory node with children
+        prefix: Current line prefix for indentation
+        is_last: Whether this is the last item in the current level
+        max_items: Maximum items to show per directory level
+    
+    Returns:
+        List of formatted tree lines
+    """
+    lines = []
+    
+    if not node:
+        return lines
+    
+    # Choose the right tree characters
+    current_prefix = "└── " if is_last else "├── "
+    next_prefix = "    " if is_last else "│   "
+    
+    # Format the node name with metadata
+    name = node.get("name", "")
+    node_type = node.get("type", "directory")
+    
+    if node_type == "directory":
+        file_count = node.get("file_count", 0)
+        dir_count = node.get("dir_count", 0)
+        total_size_kb = node.get("total_size", 0) / 1024
+        
+        if node.get("depth", 0) == 0:
+            # Root level
+            meta = f"[bold cyan]{name}[/] [dim]({file_count} files, {dir_count} dirs, {total_size_kb:.1f} KB)[/]"
+        else:
+            meta = f"[cyan]{name}/[/] [dim]({file_count} files)[/]"
+        
+        lines.append(f"{prefix}{current_prefix}{meta}")
+        
+        # Render children
+        children = node.get("children", [])
+        # Limit children to avoid overwhelming output
+        shown_children = children[:max_items]
+        remaining = len(children) - len(shown_children)
+        
+        for i, child in enumerate(shown_children):
+            is_last_child = (i == len(shown_children) - 1) and (remaining == 0)
+            child_lines = _render_directory_tree(
+                child, 
+                prefix + next_prefix, 
+                is_last_child,
+                max_items
+            )
+            lines.extend(child_lines)
+        
+        if remaining > 0:
+            lines.append(f"{prefix}{next_prefix}[dim]... and {remaining} more items[/]")
+    else:
+        # File
+        size = node.get("size", 0)
+        size_kb = size / 1024
+        ext = node.get("extension", "")
+        
+        if size_kb > 1024:
+            size_str = f"{size_kb/1024:.1f} MB"
+        elif size_kb > 1:
+            size_str = f"{size_kb:.1f} KB"
+        else:
+            size_str = f"{size} B"
+        
+        meta = f"{name} [dim]({size_str})[/]"
+        lines.append(f"{prefix}{current_prefix}{meta}")
+    
+    return lines
 
 
 @app.command()
@@ -138,7 +214,24 @@ def index(
             structure_lines.append(f"  • {d}")
     
     if structure_lines:
-        console.print(Panel.fit("\n".join(structure_lines), title="Project Structure", border_style="magenta"))
+        console.print(Panel.fit("\n".join(structure_lines), title="🗂️  Project Structure", border_style="magenta"))
+    
+    # Directory Tree Panel
+    directory_structure = summary.get('directory_structure')
+    if directory_structure:
+        tree_lines = _render_directory_tree(directory_structure, max_items=8)
+        if tree_lines:
+            # Limit total lines to avoid overwhelming output
+            max_tree_lines = 30
+            if len(tree_lines) > max_tree_lines:
+                tree_lines = tree_lines[:max_tree_lines]
+                tree_lines.append("[dim]... (tree truncated for display)[/]")
+            
+            console.print(Panel.fit(
+                "\n".join(tree_lines), 
+                title="Directory Tree", 
+                border_style="yellow"
+            ))
     
     # File Extensions Panel
     top_extensions = summary.get('top_file_extensions', [])
@@ -158,7 +251,7 @@ def index(
     
     # Serena Status
     if summary.get('serena_enabled'):
-        console.print("[dim]✓ Enhanced with Serena language detection[/]")
+        console.print("[dim]Enhanced with Serena language detection[/]")
     else:
         console.print("[dim]Basic language detection (Serena not enabled)[/]")
     
