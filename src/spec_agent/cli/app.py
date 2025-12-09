@@ -21,35 +21,52 @@ def _get_orchestrator() -> TaskOrchestrator:
 
 
 @app.command()
-def start(
+def index(
     repo: Path = typer.Argument(..., exists=True, file_okay=False, readable=True, resolve_path=True),
     branch: str = typer.Option("main", "--branch", "-b"),
-    description: str = typer.Option(..., "--description", "-d", prompt=True),
 ) -> None:
     """
-    Create a new task and kick off contextual analysis + clarification.
+    Index a repository and save the context for later use.
     """
 
     orchestrator = _get_orchestrator()
-    task = orchestrator.create_task(repo_path=repo, branch=branch, description=description)
+    index_data = orchestrator.index_repository(repo_path=repo, branch=branch)
 
-    summary = task.metadata.get("repository_summary", {})
-    clarifications = task.metadata.get("clarifications", [])
+    summary = index_data.get("repository_summary", {})
 
-    console.print(f"[bold green]Created task[/] {task.id}")
+    console.print(f"[bold green]Repository indexed successfully[/]")
     console.print(
         Panel.fit(
             "\n".join(
                 [
+                    f"Repository: {repo}",
+                    f"Branch: {branch}",
                     f"Files: {summary.get('file_count', 0)}",
                     f"Directories: {summary.get('directory_count', 0)}",
                     f"Top languages: {', '.join(summary.get('top_languages', [])) or 'n/a'}",
                     f"Top modules: {', '.join(summary.get('top_modules', [])) or 'n/a'}",
                 ]
             ),
-            title="Repository Summary",
+            title="Repository Index",
         )
     )
+    console.print(f"\n[cyan]Index saved. You can now run:[/] ./spec-agent start --description \"Your task\"")
+
+
+@app.command()
+def start(
+    description: str = typer.Option(..., "--description", "-d", prompt=True),
+) -> None:
+    """
+    Create a new task using the previously indexed repository.
+    """
+
+    orchestrator = _get_orchestrator()
+    task = orchestrator.create_task_from_index(description=description)
+
+    clarifications = task.metadata.get("clarifications", [])
+
+    console.print(f"[bold green]Created task[/] {task.id}")
 
     if clarifications:
         table = Table(title="Clarification Questions")
