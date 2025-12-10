@@ -59,8 +59,11 @@ class TaskOrchestrator:
         self.boundary_manager = BoundaryManager()
         self.refactor_advisor = RefactorAdvisor()
         self.serena_client = self._maybe_create_serena_client()
-        self.patch_engine = PatchEngine(serena_client=self.serena_client)
-        self.test_suggester = TestSuggester()
+        self.patch_engine = PatchEngine(
+            serena_client=self.serena_client,
+            llm_client=self.llm_client,
+        )
+        self.test_suggester = TestSuggester(llm_client=self.llm_client)
 
     # ------------------------------------------------------------------ Tasks
     def index_repository(self, repo_path: Path, branch: str) -> Dict:
@@ -173,25 +176,61 @@ class TaskOrchestrator:
         return tasks
 
     # ------------------------------------------------------------------ Planning
-    def generate_plan(self, task_id: str) -> Dict[str, List[str]]:
+    def generate_plan(self, task_id: str, skip_rationale_enhancement: bool = False) -> Dict[str, List[str]]:
+        import sys
+        
         task = self._get_task(task_id)
         context_summary = task.metadata.get("repository_summary", {})
+        
+        # Show progress
+        sys.stderr.write("Building plan...\n")
         plan = self.plan_builder.build_plan(task.id, task.description, context_summary)
+        sys.stderr.write(f"Plan created with {len(plan.steps)} steps\n")
 
         # Create BoundaryManager with LLM client and context for this plan
+        sys.stderr.write("Detecting boundaries...\n")
         boundary_manager = BoundaryManager(
             llm_client=self.llm_client,
             context_summary=context_summary
         )
         specs = boundary_manager.required_specs(plan)
+        sys.stderr.write(f"Found {len(specs)} boundary specs\n")
 
+        sys.stderr.write("Generating patches...\n")
         patches = self.patch_engine.draft_patches(
             plan, 
             repo_path=task.repo_path,
-            boundary_specs=specs
+            boundary_specs=specs,
+            skip_rationale_enhancement=skip_rationale_enhancement,
         )
-        tests = self.test_suggester.suggest(plan)
+        sys.stderr.write(f"Generated {len(patches)} patches\n")
+        
+        # Store rationale history for each patch (Epic 4.1)
+        rationale_history = task.metadata.get("rationale_history", [])
+        for patch in patches:
+            rationale_history.append({
+                "patch_id": patch.id,
+                "step_reference": patch.step_reference,
+                "rationale": patch.rationale,
+                "alternatives": patch.alternatives,
+                "timestamp": patch.id,  # Using patch ID as timestamp proxy for now
+            })
+        task.metadata["rationale_history"] = rationale_history
+        
+        # Pass patches and boundary specs to test suggester for better suggestions (Epic 4.2)
+        sys.stderr.write("Generating test suggestions...\n")
+        tests = self.test_suggester.suggest(
+            plan=plan,
+            patches=patches,
+            boundary_specs=specs,
+            repo_context=context_summary,
+            repo_path=task.repo_path,
+        )
+        sys.stderr.write(f"Generated {len(tests)} test suggestions\n")
+        
+        sys.stderr.write("Generating refactor suggestions...\n")
         refactors = self.refactor_advisor.suggest(plan)
+        sys.stderr.write("Plan generation complete!\n")
 
         task.metadata["plan_preview"] = {
             "steps": [step.description for step in plan.steps],
