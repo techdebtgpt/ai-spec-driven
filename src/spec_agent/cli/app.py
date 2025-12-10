@@ -96,13 +96,24 @@ def list_tasks(
 
 
 @app.command()
-def plan(task_id: str = typer.Argument(..., help="UUID of the task to plan.")) -> None:
+def plan(
+    task_id: str = typer.Argument(..., help="UUID of the task to plan."),
+    fast: bool = typer.Option(False, "--fast", help="Skip rationale enhancement for faster execution"),
+) -> None:
     """
     Generate a plan, boundary specs, patch queue, and test suggestions for a task.
+    
+    Use --fast to skip rationale enhancement (Epic 4.1) for faster execution.
     """
 
     orchestrator = _get_orchestrator()
-    payload = orchestrator.generate_plan(task_id)
+    
+    # Show progress
+    console.print("[cyan]Generating plan...[/]")
+    if fast:
+        console.print("[yellow]Fast mode: Skipping rationale enhancement[/]")
+    
+    payload = orchestrator.generate_plan(task_id, skip_rationale_enhancement=fast)
 
     console.print(Panel.fit("\n".join(payload["plan"]["steps"]), title="Plan Steps"))
     console.print(Panel.fit("\n".join(payload["plan"]["risks"]), title="Risks"))
@@ -272,11 +283,22 @@ def review_patches(
             ))
             console.print("[cyan]Note: Patches are only applied to your repository when you approve them.[/]\n")
 
+    # Track progress through patches
+    patch_index = 0
+    total_pending = len(pending_patches)
+    
     while True:
         patch = orchestrator.get_next_pending_patch(task_id)
         if not patch:
             console.print("[green]No pending patches remain.[/]")
             break
+
+        patch_index += 1
+        
+        # Show progress indicator
+        console.print(f"\n[bold cyan]{'='*70}[/]")
+        console.print(f"[bold cyan]Patch {patch_index} of {total_pending}[/]")
+        console.print(f"[bold cyan]{'='*70}[/]\n")
 
         # Extract files changed in this specific patch
         patch_files = set()
@@ -319,16 +341,30 @@ def review_patches(
         console.print(Panel.fit(patch.rationale, title="Rationale"))
         console.print("[yellow]⚠️  This patch will be applied to your repository only if you approve it.[/]")
         console.print("[dim]Currently, nothing has changed in your repo. Approve to apply the changes above.[/]\n")
-        choice = typer.prompt("Approve (a), Reject (r), or Skip (s)", default="s").strip().lower()
+        
+        # Improved prompt that accepts 'a', 'A', 'approve', etc.
+        choice = typer.prompt(
+            f"[bold]Patch {patch_index}/{total_pending}:[/] Approve (a), Reject (r), or Skip (s)",
+            default="s"
+        ).strip().lower()
 
-        if choice.startswith("a"):
+        # More lenient matching - accept 'a', 'approve', 'y', 'yes'
+        if choice in ['a', 'approve', 'y', 'yes', 'ok']:
             try:
                 orchestrator.approve_patch(task_id, patch.id)
-                console.print("[green]Patch applied to working tree.[/]")
+                console.print(f"[green]✓ Patch {patch_index}/{total_pending} applied to working tree.[/]")
+                if patch_index < total_pending:
+                    console.print(f"[dim]Continuing to next patch...[/]\n")
             except Exception as exc:  # pragma: no cover - CLI guardrail
                 console.print(f"[red]Failed to apply patch:[/] {exc}")
-                break
-        elif choice.startswith("r"):
+                # Ask if they want to continue or stop
+                continue_choice = typer.prompt(
+                    "Continue with remaining patches? (y/n)",
+                    default="n"
+                ).strip().lower()
+                if continue_choice not in ['y', 'yes']:
+                    break
+        elif choice in ['r', 'reject', 'n', 'no']:
             try:
                 orchestrator.reject_patch(task_id, patch.id)
                 console.print("[yellow]Patch rejected. Plan regenerated; review new queue when ready.[/]")
@@ -338,6 +374,93 @@ def review_patches(
         else:
             console.print("[cyan]Leaving remaining patches pending.[/]")
             break
+
+
+@app.command("ask-patch")
+def ask_patch_question(
+    task_id: str = typer.Argument(..., help="UUID of the task."),
+    patch_id: str = typer.Argument(..., help="UUID of the patch to ask about."),
+    question: Optional[str] = typer.Option(None, "--question", "-q", help="Question to ask. If not provided, will prompt."),
+) -> None:
+    """
+    Ask a follow-up question about a patch's rationale.
+    
+    Epic 4.1: Rationale-Based Code Review - Support for follow-up questions.
+    """
+    orchestrator = _get_orchestrator()
+    
+    # Get the patch
+    patches = orchestrator.list_patches(task_id)
+    patch = next((p for p in patches if p.id == patch_id), None)
+    
+    if not patch:
+        console.print(f"[red]Patch {patch_id} not found for task {task_id}.[/]")
+        raise typer.Exit(code=1)
+    
+    # Get the plan step
+    task = orchestrator._get_task(task_id)
+    plan_preview = task.metadata.get("plan_preview", {})
+    plan_steps = plan_preview.get("steps", [])
+    
+    # Find the step that matches this patch
+    plan_step = None
+    for step_desc in plan_steps:
+        if step_desc == patch.step_reference:
+            # Create a minimal PlanStep for the rationale enhancer
+            from ..domain.models import PlanStep, Plan
+            plan_step = PlanStep(description=step_desc)
+            break
+    
+    if not plan_step:
+        plan_step = PlanStep(description=patch.step_reference)
+    
+    # Create a minimal Plan for context
+    from ..domain.models import Plan
+    plan = Plan(
+        id=task.id,
+        task_id=task.id,
+        steps=[plan_step],
+        risks=plan_preview.get("risks", []),
+    )
+    
+    # Prompt for question if not provided
+    if not question:
+        console.print(Panel.fit(patch.rationale, title=f"Patch {patch_id[:8]} Rationale"))
+        console.print("\n[cyan]Ask a follow-up question about this patch's rationale.[/]")
+        question = typer.prompt("Question")
+    
+    if not question.strip():
+        console.print("[yellow]No question provided.[/]")
+        return
+    
+    # Get answer from rationale enhancer
+    try:
+        from ..services.review.rationale_enhancer import RationaleEnhancer
+        enhancer = RationaleEnhancer(llm_client=orchestrator.llm_client)
+        answer = enhancer.answer_followup_question(
+            patch=patch,
+            question=question,
+            plan_step=plan_step,
+            plan=plan,
+        )
+        
+        console.print(Panel.fit(answer, title="Answer"))
+        
+        # Store the question and answer in task history
+        orchestrator.logger.record(
+            task_id,
+            "PATCH_QUESTION_ASKED",
+            {
+                "patch_id": patch_id,
+                "question": question,
+                "answer": answer,
+            },
+        )
+        
+    except Exception as exc:
+        console.print(f"[red]Error generating answer:[/] {exc}")
+        console.print("[yellow]LLM client may not be configured. Set SPEC_AGENT_OPENAI_API_KEY.[/]")
+        raise typer.Exit(code=1)
 
 
 @app.command("refactors")
@@ -409,6 +532,83 @@ def show_status(task_id: str = typer.Argument(..., help="UUID of the task to ins
         )
     )
     console.print(Panel.fit(summary["git_status"], title="git status --short"))
+
+
+@app.command("clean-logs")
+def clean_logs(
+    confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    tasks: bool = typer.Option(False, "--tasks", help="Also delete all tasks (not just logs)"),
+) -> None:
+    """
+    Clear all reasoning logs. Optionally clear tasks as well.
+    
+    Logs are stored in ~/.spec_agent/logs.json
+    Tasks are stored in ~/.spec_agent/tasks.json
+    """
+    from ..config.settings import get_settings
+    from ..persistence.store import JsonStore
+    
+    settings = get_settings()
+    store = JsonStore(settings.state_dir)
+    
+    logs_file = store.logs_file
+    tasks_file = store.tasks_file
+    
+    # Count existing logs/tasks
+    existing_logs = store.load_logs()
+    existing_tasks = store.load_tasks()
+    
+    if not existing_logs and not (tasks and existing_tasks):
+        console.print("[yellow]No logs to clean.[/]")
+        return
+    
+    # Show what will be deleted
+    if existing_logs:
+        console.print(f"[yellow]Found {len(existing_logs)} log entries[/]")
+    if tasks and existing_tasks:
+        console.print(f"[yellow]Found {len(existing_tasks)} tasks[/]")
+    
+    # Confirm deletion
+    if not confirm:
+        if tasks:
+            response = typer.prompt(
+                f"Delete all logs ({len(existing_logs)} entries) and tasks ({len(existing_tasks)} tasks)? [y/N]",
+                default="n"
+            )
+        else:
+            response = typer.prompt(
+                f"Delete all logs ({len(existing_logs)} entries)? [y/N]",
+                default="n"
+            )
+        
+        if response.lower() not in {"y", "yes"}:
+            console.print("[cyan]Cancelled.[/]")
+            return
+    
+    # Delete logs
+    try:
+        if logs_file.exists():
+            logs_file.unlink()
+            console.print("[green]✓ Cleared all reasoning logs[/]")
+        else:
+            console.print("[yellow]No logs file found.[/]")
+    except Exception as exc:
+        console.print(f"[red]Error deleting logs: {exc}[/]")
+        raise typer.Exit(code=1)
+    
+    # Delete tasks if requested
+    if tasks:
+        try:
+            if tasks_file.exists():
+                tasks_file.unlink()
+                console.print("[green]✓ Cleared all tasks[/]")
+            else:
+                console.print("[yellow]No tasks file found.[/]")
+        except Exception as exc:
+            console.print(f"[red]Error deleting tasks: {exc}[/]")
+            raise typer.Exit(code=1)
+    
+    console.print("[bold green]Cleanup complete![/]")
 
 
 def main() -> None:

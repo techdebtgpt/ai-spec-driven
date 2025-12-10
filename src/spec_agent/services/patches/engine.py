@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from ...domain.models import BoundarySpec, Patch, PatchKind, Plan
 from ..integrations.serena_client import SerenaToolClient, SerenaToolError
+from ..review.rationale_enhancer import RationaleEnhancer
 
 
 LOG = logging.getLogger(__name__)
@@ -17,8 +18,13 @@ class PatchEngine:
     Breaks implementation work into incremental patch steps.
     """
 
-    def __init__(self, serena_client: Optional[SerenaToolClient] = None) -> None:
+    def __init__(
+        self, 
+        serena_client: Optional[SerenaToolClient] = None,
+        llm_client: Optional[object] = None,
+    ) -> None:
         self.serena_client = serena_client
+        self.rationale_enhancer = RationaleEnhancer(llm_client=llm_client)
 
     def draft_patches(
         self, 
@@ -26,12 +32,19 @@ class PatchEngine:
         repo_path: Path | None = None, 
         *,
         kind: PatchKind = PatchKind.IMPLEMENTATION,
-        boundary_specs: List[BoundarySpec] | None = None
+        boundary_specs: List[BoundarySpec] | None = None,
+        skip_rationale_enhancement: bool = False,
     ) -> List[Patch]:
         if self.serena_client:
             if repo_path is None:
                 raise ValueError("repo_path is required when Serena integration is enabled.")
-            return self._draft_with_serena(plan, repo_path, kind=kind, boundary_specs=boundary_specs or [])
+            return self._draft_with_serena(
+                plan, 
+                repo_path, 
+                kind=kind, 
+                boundary_specs=boundary_specs or [],
+                skip_rationale_enhancement=skip_rationale_enhancement,
+            )
 
         return [
             self._placeholder_patch(plan, index, step.description, kind=kind)
@@ -44,10 +57,14 @@ class PatchEngine:
         repo_path: Path, 
         *, 
         kind: PatchKind,
-        boundary_specs: List[BoundarySpec]
+        boundary_specs: List[BoundarySpec],
+        skip_rationale_enhancement: bool = False,
     ) -> List[Patch]:
+        import sys
         patches: List[Patch] = []
+        total_steps = len(plan.steps)
         for index, step in enumerate(plan.steps, start=1):
+            sys.stderr.write(f"Generating patch {index}/{total_steps}: {step.description[:50]}...\n")
             try:
                 # Find relevant boundary specs for this step
                 relevant_specs = [
@@ -80,17 +97,33 @@ class PatchEngine:
                 LOG.error("Serena patch generation failed for '%s': %s", step.description, exc)
                 raise  # Fail fast - no fallback to placeholder
 
-            patches.append(
-                Patch(
-                    id=str(uuid4()),
-                    task_id=plan.task_id,
-                    step_reference=step.description,
-                    diff=proposal.diff,
-                    rationale=proposal.rationale,
-                    alternatives=proposal.alternatives,
-                    kind=kind,
-                )
+            # Create initial patch
+            patch = Patch(
+                id=str(uuid4()),
+                task_id=plan.task_id,
+                step_reference=step.description,
+                diff=proposal.diff,
+                rationale=proposal.rationale,
+                alternatives=proposal.alternatives,
+                kind=kind,
             )
+            
+            # Enhance rationale with design decisions, trade-offs, and constraints (Epic 4.1)
+            if not skip_rationale_enhancement:
+                try:
+                    import sys
+                    sys.stderr.write(f"  Enhancing rationale for patch {index}...\n")
+                    patch = self.rationale_enhancer.enhance_rationale(
+                        patch=patch,
+                        plan_step=step,
+                        plan=plan,
+                        boundary_specs=relevant_specs,
+                    )
+                except Exception as exc:
+                    LOG.warning("Rationale enhancement failed for patch %s: %s", patch.id, exc)
+                    # Continue with original rationale if enhancement fails
+            
+            patches.append(patch)
         return patches
 
     @staticmethod
