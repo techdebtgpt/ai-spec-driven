@@ -70,15 +70,35 @@ This unified launcher will:
 
 After setup, the same launcher proxies every CLI command. Example:
 ```bash
-./spec-agent start /path/to/repo --branch main --description "Investigate auth bug"
+./spec-agent index /path/to/repo --branch main
+./spec-agent start --description "Investigate auth bug"
 ```
 
 ### Command Reference
+
+**Setup & General:**
 - `./spec-agent --setup`: bootstrap the environment (venv + dependencies) and verify the CLI command.
 - `./spec-agent --help`: show available subcommands and options.
-- `./spec-agent start <repo> --branch <branch> --description "<text>"`: create a new task and capture contextual data.
+
+**Core Workflow:**
+- `./spec-agent index <repo> [--branch <branch>]`: index a repository and save the context for later use.
+- `./spec-agent start --description "<text>"`: create a new task using the previously indexed repository.
 - `./spec-agent tasks [--status <status>]`: list recorded tasks, optionally filtered by status.
 - `./spec-agent plan <task_id>`: generate the plan, boundary specs, patch queue, and suggested tests for an existing task.
+
+**Boundary Specs:**
+- `./spec-agent specs <task_id>`: view detailed boundary specifications for a task.
+- `./spec-agent approve-spec <task_id> <spec_id>`: approve a boundary specification.
+- `./spec-agent skip-spec <task_id> <spec_id>`: skip (override) a boundary specification.
+
+**Patch Management:**
+- `./spec-agent patches <task_id> [--list]`: inspect and approve/reject incremental patches for a task.
+
+**Refactoring:**
+- `./spec-agent refactors <task_id> [--list]`: inspect and accept/reject refactor suggestions.
+
+**Status:**
+- `./spec-agent status <task_id>`: display branch/commit alignment and uncommitted changes for a task's working tree.
 
 ### Alternative: Python Script
 ```bash

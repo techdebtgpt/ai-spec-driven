@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 from uuid import UUID
 
 import typer
@@ -20,36 +20,259 @@ def _get_orchestrator() -> TaskOrchestrator:
     return TaskOrchestrator()
 
 
+def _render_directory_tree(node: Dict, prefix: str = "", is_last: bool = True, max_items: int = 10) -> List[str]:
+    """
+    Render a directory tree structure as a list of formatted strings.
+    
+    Args:
+        node: Directory node with children
+        prefix: Current line prefix for indentation
+        is_last: Whether this is the last item in the current level
+        max_items: Maximum items to show per directory level
+    
+    Returns:
+        List of formatted tree lines
+    """
+    lines = []
+    
+    if not node:
+        return lines
+    
+    # Choose the right tree characters
+    current_prefix = "└── " if is_last else "├── "
+    next_prefix = "    " if is_last else "│   "
+    
+    # Format the node name with metadata
+    name = node.get("name", "")
+    node_type = node.get("type", "directory")
+    
+    if node_type == "directory":
+        file_count = node.get("file_count", 0)
+        dir_count = node.get("dir_count", 0)
+        total_size_kb = node.get("total_size", 0) / 1024
+        
+        if node.get("depth", 0) == 0:
+            # Root level
+            meta = f"[bold cyan]{name}[/] [dim]({file_count} files, {dir_count} dirs, {total_size_kb:.1f} KB)[/]"
+        else:
+            meta = f"[cyan]{name}/[/] [dim]({file_count} files)[/]"
+        
+        lines.append(f"{prefix}{current_prefix}{meta}")
+        
+        # Render children
+        children = node.get("children", [])
+        # Limit children to avoid overwhelming output
+        shown_children = children[:max_items]
+        remaining = len(children) - len(shown_children)
+        
+        for i, child in enumerate(shown_children):
+            is_last_child = (i == len(shown_children) - 1) and (remaining == 0)
+            child_lines = _render_directory_tree(
+                child, 
+                prefix + next_prefix, 
+                is_last_child,
+                max_items
+            )
+            lines.extend(child_lines)
+        
+        if remaining > 0:
+            lines.append(f"{prefix}{next_prefix}[dim]... and {remaining} more items[/]")
+    else:
+        # File
+        size = node.get("size", 0)
+        size_kb = size / 1024
+        ext = node.get("extension", "")
+        
+        if size_kb > 1024:
+            size_str = f"{size_kb/1024:.1f} MB"
+        elif size_kb > 1:
+            size_str = f"{size_kb:.1f} KB"
+        else:
+            size_str = f"{size} B"
+        
+        meta = f"{name} [dim]({size_str})[/]"
+        lines.append(f"{prefix}{current_prefix}{meta}")
+    
+    return lines
+
+
 @app.command()
-def start(
+def index(
     repo: Path = typer.Argument(..., exists=True, file_okay=False, readable=True, resolve_path=True),
     branch: str = typer.Option("main", "--branch", "-b"),
-    description: str = typer.Option(..., "--description", "-d", prompt=True),
 ) -> None:
     """
-    Create a new task and kick off contextual analysis + clarification.
+    Index a repository and save the context for later use.
     """
 
     orchestrator = _get_orchestrator()
-    task = orchestrator.create_task(repo_path=repo, branch=branch, description=description)
+    index_data = orchestrator.index_repository(repo_path=repo, branch=branch)
 
-    summary = task.metadata.get("repository_summary", {})
+    summary = index_data.get("repository_summary", {})
+    git_info = index_data.get("git_info", {})
+
+    console.print(f"[bold green]Repository indexed successfully[/]\n")
+    
+    # Repository Overview Panel
+    repo_info_lines = [
+        f"[bold]Repository:[/] {index_data.get('repo_name', repo.name)}",
+        f"[bold]Path:[/] {repo}",
+        f"[bold]Branch:[/] {branch}",
+    ]
+    
+    # Add git info if available
+    if git_info.get("current_commit"):
+        repo_info_lines.append(f"[bold]Commit:[/] {git_info['current_commit'][:12]}")
+    if git_info.get("commit_message"):
+        repo_info_lines.append(f"[bold]Message:[/] {git_info['commit_message'][:60]}...")
+    if git_info.get("commit_author"):
+        repo_info_lines.append(f"[bold]Author:[/] {git_info['commit_author']}")
+    if git_info.get("remote_url"):
+        remote_url = git_info['remote_url']
+        if len(remote_url) > 60:
+            remote_url = remote_url[:57] + "..."
+        repo_info_lines.append(f"[bold]Remote:[/] {remote_url}")
+    
+    console.print(Panel.fit("\n".join(repo_info_lines), title="Repository Info", border_style="blue"))
+    
+    # Statistics Panel
+    stats_lines = [
+        f"[bold]Files:[/] {summary.get('file_count', 0):,}",
+        f"[bold]Directories:[/] {summary.get('directory_count', 0):,}",
+    ]
+    
+    if summary.get('total_size_mb'):
+        stats_lines.append(f"[bold]Total Size:[/] {summary['total_size_mb']:,.2f} MB")
+    
+    # Show hotspots count if any
+    hotspots = summary.get('hotspots', [])
+    if hotspots:
+        stats_lines.append(f"[bold]Large Files:[/] {len(hotspots)} (>{orchestrator.settings.hotspot_loc_threshold} LOC)")
+    
+    console.print(Panel.fit("\n".join(stats_lines), title="Statistics", border_style="cyan"))
+    
+    # Languages & Frameworks Panel
+    lang_lines = []
+    
+    # Project type
+    if summary.get('project_type'):
+        lang_lines.append(f"[bold]Project Type:[/] {summary['project_type']}")
+    
+    # Top languages
+    top_langs = summary.get('top_languages', [])
+    if top_langs:
+        lang_lines.append(f"[bold]Languages:[/] {', '.join(top_langs)}")
+    
+    # Frameworks
+    frameworks = summary.get('frameworks', [])
+    if frameworks:
+        lang_lines.append(f"[bold]Frameworks:[/] {', '.join(frameworks[:5])}")
+    
+    # Language details
+    lang_details = summary.get('language_details', [])
+    if lang_details and len(lang_details) > 0:
+        lang_lines.append("")
+        lang_lines.append("[bold]Language Breakdown:[/]")
+        for detail in lang_details[:5]:
+            lang_name = detail.get('language', 'unknown')
+            file_count = detail.get('file_count', 0)
+            detected_by = detail.get('detected_by', '')
+            if detected_by:
+                lang_lines.append(f"  • {lang_name}: {file_count} files (via {detected_by})")
+            else:
+                lang_lines.append(f"  • {lang_name}: {file_count} files")
+    
+    if lang_lines:
+        console.print(Panel.fit("\n".join(lang_lines), title="Languages & Frameworks", border_style="green"))
+    
+    # Structure Panel (Modules, Namespaces, Directories)
+    structure_lines = []
+    
+    # Top modules
+    top_modules = summary.get('top_modules', [])
+    if top_modules:
+        structure_lines.append("[bold]Top Modules:[/]")
+        for mod in top_modules[:5]:
+            structure_lines.append(f"  • {mod}")
+    
+    # Namespaces (for .NET projects)
+    namespaces = summary.get('namespaces', [])
+    if namespaces:
+        if structure_lines:
+            structure_lines.append("")
+        structure_lines.append("[bold]Namespaces:[/]")
+        for ns in namespaces[:5]:
+            structure_lines.append(f"  • {ns}")
+    
+    # Top directories
+    top_dirs = summary.get('top_directories', [])
+    if top_dirs:
+        if structure_lines:
+            structure_lines.append("")
+        structure_lines.append("[bold]Top Directories:[/]")
+        for d in top_dirs[:5]:
+            structure_lines.append(f"  • {d}")
+    
+    if structure_lines:
+        console.print(Panel.fit("\n".join(structure_lines), title="🗂️  Project Structure", border_style="magenta"))
+    
+    # Directory Tree Panel
+    directory_structure = summary.get('directory_structure')
+    if directory_structure:
+        tree_lines = _render_directory_tree(directory_structure, max_items=8)
+        if tree_lines:
+            # Limit total lines to avoid overwhelming output
+            max_tree_lines = 30
+            if len(tree_lines) > max_tree_lines:
+                tree_lines = tree_lines[:max_tree_lines]
+                tree_lines.append("[dim]... (tree truncated for display)[/]")
+            
+            console.print(Panel.fit(
+                "\n".join(tree_lines), 
+                title="Directory Tree", 
+                border_style="yellow"
+            ))
+    
+    # File Extensions Panel
+    top_extensions = summary.get('top_file_extensions', [])
+    if top_extensions:
+        ext_table = Table(title="Top File Extensions", show_header=True, header_style="bold yellow")
+        ext_table.add_column("Extension", style="cyan")
+        ext_table.add_column("Count", justify="right", style="green")
+        
+        for ext in top_extensions[:10]:
+            parts = ext.rsplit(' (', 1)
+            if len(parts) == 2:
+                extension = parts[0]
+                count = parts[1].rstrip(')')
+                ext_table.add_row(extension, count)
+        
+        console.print(ext_table)
+    
+    # Serena Status
+    if summary.get('serena_enabled'):
+        console.print("[dim]Enhanced with Serena language detection[/]")
+    else:
+        console.print("[dim]Basic language detection (Serena not enabled)[/]")
+    
+    console.print(f"\n[cyan]Index saved. You can now run:[/] [bold]./spec-agent start --description \"Your task\"[/]")
+
+
+
+@app.command()
+def start(
+    description: str = typer.Option(..., "--description", "-d", prompt=True),
+) -> None:
+    """
+    Create a new task using the previously indexed repository.
+    """
+
+    orchestrator = _get_orchestrator()
+    task = orchestrator.create_task_from_index(description=description)
+
     clarifications = task.metadata.get("clarifications", [])
 
     console.print(f"[bold green]Created task[/] {task.id}")
-    console.print(
-        Panel.fit(
-            "\n".join(
-                [
-                    f"Files: {summary.get('file_count', 0)}",
-                    f"Directories: {summary.get('directory_count', 0)}",
-                    f"Top languages: {', '.join(summary.get('top_languages', [])) or 'n/a'}",
-                    f"Top modules: {', '.join(summary.get('top_modules', [])) or 'n/a'}",
-                ]
-            ),
-            title="Repository Summary",
-        )
-    )
 
     if clarifications:
         table = Table(title="Clarification Questions")

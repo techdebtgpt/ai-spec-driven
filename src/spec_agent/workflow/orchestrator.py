@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
 from uuid import uuid4
+from datetime import datetime
 
 from ..config.settings import AgentSettings, get_settings
 from ..domain.models import (
@@ -65,6 +66,86 @@ class TaskOrchestrator:
         self.test_suggester = TestSuggester(llm_client=self.llm_client)
 
     # ------------------------------------------------------------------ Tasks
+    def index_repository(self, repo_path: Path, branch: str) -> Dict:
+        """
+        Index a repository and save the context for later use.
+        """
+        if not repo_path.exists():
+            raise FileNotFoundError(f"Repository not found: {repo_path}")
+
+        summary = self.context_indexer.summarize_repository(repo_path.resolve())
+        
+        # Get comprehensive git information
+        git_info = {}
+        try:
+            git_info["current_commit"] = self._current_commit(repo_path.resolve())
+            git_info["current_branch"] = self._get_current_branch(repo_path.resolve())
+            git_info["remote_url"] = self._get_remote_url(repo_path.resolve())
+            git_info["commit_author"] = self._get_commit_author(repo_path.resolve())
+            git_info["commit_message"] = self._get_commit_message(repo_path.resolve())
+            git_info["commit_date"] = self._get_commit_date(repo_path.resolve())
+        except Exception as e:
+            self.logger.record("WARNING", "GIT_INFO_FAILED", {"error": str(e)})
+            git_info["error"] = str(e)
+
+        index_data = {
+            "repo_path": str(repo_path.resolve()),
+            "repo_name": repo_path.name,
+            "branch": branch,
+            "repository_summary": summary,
+            "git_info": git_info,
+            "indexed_at": datetime.now().isoformat(),
+        }
+
+        self.store.save_repository_index(index_data)
+        self.logger.record(
+            "SYSTEM",
+            "REPOSITORY_INDEXED",
+            {"repo_path": str(repo_path), "branch": branch, "summary": summary}
+        )
+
+        return index_data
+
+    def create_task_from_index(self, description: str) -> Task:
+        """
+        Create a task using a previously indexed repository.
+        """
+        index_data = self.store.load_repository_index()
+
+        repo_path = Path(index_data["repo_path"])
+        branch = index_data["branch"]
+        
+        task = Task(
+            id=str(uuid4()),
+            repo_path=repo_path,
+            branch=branch,
+            description=description,
+            status=TaskStatus.CLARIFYING,
+        )
+
+        # Use the pre-computed summary from the index
+        task.metadata["repository_summary"] = index_data["repository_summary"]
+        task.metadata["starting_commit"] = index_data.get("starting_commit")
+        
+        # Generate clarifications based on the task description
+        clarifications = self.clarifier.generate_questions(task.id, description)
+        task.metadata["clarifications"] = [asdict(item) for item in clarifications]
+        
+        # Snapshot the current worktree status
+        self._snapshot_worktree_status(task)
+
+        self.store.upsert_task(task)
+        self.logger.record(
+            task.id,
+            "TASK_CREATED_FROM_INDEX",
+            {
+                "summary": task.metadata["repository_summary"],
+                "clarifications": task.metadata["clarifications"]
+            }
+        )
+
+        return task
+
     def create_task(self, repo_path: Path, branch: str, description: str) -> Task:
         task = Task(
             id=str(uuid4()),
@@ -214,14 +295,14 @@ class TaskOrchestrator:
         task = self._get_task(task_id)
         specs = task.metadata.get("boundary_specs", [])
 
-        spec_found = False
+        found_spec = None
         for spec in specs:
             if spec["id"] == spec_id:
                 spec["status"] = "APPROVED"
-                spec_found = True
+                found_spec = spec
                 break
 
-        if not spec_found:
+        if not found_spec:
             raise ValueError(f"Boundary spec not found: {spec_id}")
 
         task.metadata["boundary_specs"] = specs
@@ -231,7 +312,7 @@ class TaskOrchestrator:
         self.logger.record(
             task.id,
             "SPEC_APPROVED",
-            {"spec_id": spec_id, "boundary_name": spec.get("boundary_name")}
+            {"spec_id": spec_id, "boundary_name": found_spec.get("boundary_name")}
         )
 
         return {"spec_id": spec_id, "status": "APPROVED"}
@@ -243,14 +324,14 @@ class TaskOrchestrator:
         task = self._get_task(task_id)
         specs = task.metadata.get("boundary_specs", [])
 
-        spec_found = False
+        found_spec = None
         for spec in specs:
             if spec["id"] == spec_id:
                 spec["status"] = "SKIPPED"
-                spec_found = True
+                found_spec = spec
                 break
 
-        if not spec_found:
+        if not found_spec:
             raise ValueError(f"Boundary spec not found: {spec_id}")
 
         task.metadata["boundary_specs"] = specs
@@ -260,7 +341,7 @@ class TaskOrchestrator:
         self.logger.record(
             task.id,
             "SPEC_SKIPPED",
-            {"spec_id": spec_id, "boundary_name": spec.get("boundary_name")}
+            {"spec_id": spec_id, "boundary_name": found_spec.get("boundary_name")}
         )
 
         return {"spec_id": spec_id, "status": "SKIPPED"}
@@ -951,6 +1032,76 @@ class TaskOrchestrator:
         except subprocess.CalledProcessError as exc:  # pragma: no cover
             raise RuntimeError(f"Unable to determine current commit: {exc.stderr}") from exc
         return result.stdout.strip()
+
+    def _get_current_branch(self, repo_path: Path) -> str:
+        """Get the current git branch name."""
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=repo_path,
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return "unknown"
+
+    def _get_remote_url(self, repo_path: Path) -> str:
+        """Get the git remote URL (origin)."""
+        try:
+            result = subprocess.run(
+                ["git", "config", "--get", "remote.origin.url"],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=repo_path,
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return "unknown"
+
+    def _get_commit_author(self, repo_path: Path) -> str:
+        """Get the author of the latest commit."""
+        try:
+            result = subprocess.run(
+                ["git", "log", "-1", "--pretty=format:%an <%ae>"],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=repo_path,
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return "unknown"
+
+    def _get_commit_message(self, repo_path: Path) -> str:
+        """Get the message of the latest commit."""
+        try:
+            result = subprocess.run(
+                ["git", "log", "-1", "--pretty=format:%s"],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=repo_path,
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return "unknown"
+
+    def _get_commit_date(self, repo_path: Path) -> str:
+        """Get the date of the latest commit."""
+        try:
+            result = subprocess.run(
+                ["git", "log", "-1", "--pretty=format:%ci"],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=repo_path,
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return "unknown"
 
     def get_task_status(self, task_id: str) -> Dict[str, str]:
         task = self._get_task(task_id)

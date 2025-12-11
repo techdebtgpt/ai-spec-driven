@@ -22,6 +22,7 @@ class JsonStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.tasks_file = self.root / "tasks.json"
         self.logs_file = self.root / "logs.json"
+        self.index_file = self.root / "repository_index.json"
         self._lock = Lock()
 
     # --- Task persistence -------------------------------------------------
@@ -76,4 +77,15 @@ class JsonStore:
             for item in raw
         ]
 
+    # --- Repository index persistence ------------------------------------
+    def save_repository_index(self, index_data: Dict) -> None:
+        """Save repository index data for later use."""
+        with self._lock:
+            self.index_file.write_text(json.dumps(index_data, indent=2, default=str))
 
+    def load_repository_index(self) -> Dict:
+        """Load the most recent repository index data."""
+        if not self.index_file.exists():
+            raise ValueError("No repository index found. Please run 'index' command first.")
+        with self._lock:
+            return json.loads(self.index_file.read_text())
