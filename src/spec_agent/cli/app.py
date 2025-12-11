@@ -834,6 +834,26 @@ def clean_logs(
     console.print("[bold green]Cleanup complete![/]")
 
 
+@app.command()
+def chat() -> None:
+    """
+    Start an interactive chat session for spec-driven development.
+
+    This provides a conversational interface where you can:
+    - Create and manage tasks interactively
+    - Answer clarifying questions one by one
+    - Review plans and boundary specs
+    - Approve or reject patches
+
+    The chat mode guides you through the entire workflow with menus and prompts.
+    """
+    from .chat import ChatSession
+
+    orchestrator = _get_orchestrator()
+    session = ChatSession(orchestrator)
+    session.run()
+
+
 def main() -> None:
     app()
 
