@@ -344,10 +344,13 @@ def plan(
 
     if payload["pending_specs"]:
         console.print(Panel.fit("\n".join(payload["pending_specs"]), title="Pending Boundary Specs"))
-    if payload["patch_queue"]:
+    if payload.get("patch_queue"):
         console.print(Panel.fit("\n".join(payload["patch_queue"]), title="Patch Queue"))
-    if payload["test_suggestions"]:
+    if payload.get("test_suggestions"):
         console.print(Panel.fit("\n".join(payload["test_suggestions"]), title="Test Suggestions"))
+
+    console.print()
+    console.print("[dim]Note: Patches and test suggestions will be generated after plan approval.[/]")
 
 
 @app.command()

@@ -112,7 +112,13 @@ class ChatSession:
 
         if choice == "1":
             self.index_only = False
-            self.state = ConversationState.INDEXING
+            # If we already have an indexed repo, skip indexing and go straight to task setup
+            if self.indexed_repo and self.indexed_repo.exists():
+                console.print()
+                console.print(f"[cyan]Using indexed repository: {self.indexed_repo}[/]")
+                self.state = ConversationState.TASK_SETUP
+            else:
+                self.state = ConversationState.INDEXING
         elif choice == "2":
             self._continue_task()
         elif choice == "3":
@@ -369,6 +375,18 @@ class ChatSession:
             try:
                 self.orchestrator.approve_plan(self.current_task.id)
                 console.print("[green]✓[/] Plan approved!")
+
+                # Generate patches and test suggestions after plan approval
+                console.print()
+                console.print("[cyan]Generating patches and test suggestions...[/]")
+                patch_result = self.orchestrator.generate_patches(self.current_task.id)
+                patch_count = patch_result.get("patch_count", 0)
+                test_count = patch_result.get("test_count", 0)
+                console.print(f"[green]✓[/] Generated {patch_count} patch(es) and {test_count} test suggestion(s)")
+
+                # Reload task to get updated metadata with patches
+                self.current_task = self.orchestrator._get_task(self.current_task.id)
+
                 self.state = ConversationState.REVIEWING_PATCHES
             except Exception as exc:
                 console.print(f"[red]Error approving plan: {exc}[/]")
