@@ -52,8 +52,8 @@ class TaskOrchestrator:
 
         self.context_indexer = ContextIndexer(self.settings)
         self.context_retriever = ContextRetriever()
-        self.clarifier = Clarifier()
         self.llm_client = self._maybe_create_llm_client()
+        self.clarifier = Clarifier(llm_client=self.llm_client)
         self.plan_builder = PlanBuilder(llm_client=self.llm_client)
         # Note: BoundaryManager created per-use in generate_plan with context
         self.boundary_manager = BoundaryManager()
@@ -126,9 +126,13 @@ class TaskOrchestrator:
         # Use the pre-computed summary from the index
         task.metadata["repository_summary"] = index_data["repository_summary"]
         task.metadata["starting_commit"] = index_data.get("starting_commit")
-        
+
         # Generate clarifications based on the task description
-        clarifications = self.clarifier.generate_questions(task.id, description)
+        clarifications = self.clarifier.generate_questions(
+            task.id,
+            description,
+            context_summary=index_data["repository_summary"]
+        )
         task.metadata["clarifications"] = [asdict(item) for item in clarifications]
         
         # Snapshot the current worktree status
@@ -156,7 +160,11 @@ class TaskOrchestrator:
         )
 
         summary = self.context_indexer.summarize_repository(task.repo_path)
-        clarifications = self.clarifier.generate_questions(task.id, description)
+        clarifications = self.clarifier.generate_questions(
+            task.id,
+            description,
+            context_summary=summary
+        )
 
         task.metadata["repository_summary"] = summary
         task.metadata["clarifications"] = [asdict(item) for item in clarifications]
@@ -196,38 +204,6 @@ class TaskOrchestrator:
         specs = boundary_manager.required_specs(plan)
         sys.stderr.write(f"Found {len(specs)} boundary specs\n")
 
-        sys.stderr.write("Generating patches...\n")
-        patches = self.patch_engine.draft_patches(
-            plan, 
-            repo_path=task.repo_path,
-            boundary_specs=specs,
-            skip_rationale_enhancement=skip_rationale_enhancement,
-        )
-        sys.stderr.write(f"Generated {len(patches)} patches\n")
-        
-        # Store rationale history for each patch (Epic 4.1)
-        rationale_history = task.metadata.get("rationale_history", [])
-        for patch in patches:
-            rationale_history.append({
-                "patch_id": patch.id,
-                "step_reference": patch.step_reference,
-                "rationale": patch.rationale,
-                "alternatives": patch.alternatives,
-                "timestamp": patch.id,  # Using patch ID as timestamp proxy for now
-            })
-        task.metadata["rationale_history"] = rationale_history
-        
-        # Pass patches and boundary specs to test suggester for better suggestions (Epic 4.2)
-        sys.stderr.write("Generating test suggestions...\n")
-        tests = self.test_suggester.suggest(
-            plan=plan,
-            patches=patches,
-            boundary_specs=specs,
-            repo_context=context_summary,
-            repo_path=task.repo_path,
-        )
-        sys.stderr.write(f"Generated {len(tests)} test suggestions\n")
-        
         sys.stderr.write("Generating refactor suggestions...\n")
         refactors = self.refactor_advisor.suggest(plan)
         sys.stderr.write("Plan generation complete!\n")
@@ -251,10 +227,7 @@ class TaskOrchestrator:
         ]
         # Also store just names for backward compatibility with CLI display
         task.metadata["pending_specs"] = [spec.boundary_name for spec in specs]
-        task.metadata["patch_queue"] = [patch.step_reference for patch in patches]
-        task.metadata["patch_queue_state"] = [patch.to_dict() for patch in patches]
         task.metadata["refactor_suggestions"] = [item.to_dict() for item in refactors]
-        task.metadata["test_suggestions"] = [suggestion.description for suggestion in tests]
         task.status = TaskStatus.SPEC_PENDING if specs else TaskStatus.PLANNING
         self._snapshot_worktree_status(task)
         task.touch()
@@ -266,18 +239,14 @@ class TaskOrchestrator:
             {
                 "plan": task.metadata["plan_preview"],
                 "pending_specs": task.metadata["pending_specs"],
-                "patch_queue": task.metadata["patch_queue"],
                 "refactor_suggestions": task.metadata["refactor_suggestions"],
-                "test_suggestions": task.metadata["test_suggestions"],
             },
         )
 
         return {
             "plan": task.metadata["plan_preview"],
             "pending_specs": task.metadata["pending_specs"],
-            "patch_queue": task.metadata["patch_queue"],
             "refactor_suggestions": task.metadata["refactor_suggestions"],
-            "test_suggestions": task.metadata["test_suggestions"],
         }
 
     # ------------------------------------------------------------------ Boundary Specs
@@ -345,6 +314,138 @@ class TaskOrchestrator:
         )
 
         return {"spec_id": spec_id, "status": "SKIPPED"}
+
+    def approve_plan(self, task_id: str) -> Dict:
+        """
+        Approve the entire implementation plan.
+
+        This approves the plan at a high level rather than requiring
+        approval of individual boundary specifications.
+        """
+        task = self._get_task(task_id)
+
+        # Mark plan as approved
+        task.metadata["plan_approved"] = True
+        task.metadata["plan_approved_at"] = task.updated_at.isoformat()
+
+        # Update task status
+        task.status = TaskStatus.IMPLEMENTING
+        task.touch()
+        self.store.upsert_task(task)
+
+        self.logger.record(
+            task.id,
+            "PLAN_APPROVED",
+            {
+                "plan_steps": len(task.metadata.get("plan_preview", {}).get("steps", [])),
+                "boundary_specs": len(task.metadata.get("boundary_specs", []))
+            }
+        )
+
+        return {"status": "APPROVED", "task_id": task_id}
+
+    def generate_patches(self, task_id: str, skip_rationale_enhancement: bool = False) -> Dict:
+        """
+        Generate patches for an approved plan.
+
+        This should be called after plan approval.
+        """
+        import sys
+
+        task = self._get_task(task_id)
+
+        # Check if plan is approved
+        if not task.metadata.get("plan_approved", False):
+            raise ValueError("Plan must be approved before generating patches")
+
+        # Retrieve plan and boundary specs from metadata
+        context_summary = task.metadata.get("repository_summary", {})
+        plan_preview = task.metadata.get("plan_preview", {})
+        boundary_specs_data = task.metadata.get("boundary_specs", [])
+
+        # Reconstruct plan object from stored data
+        from ..domain.models import Plan, PlanStep
+        plan = Plan(
+            task_id=task_id,
+            steps=[PlanStep(description=step) for step in plan_preview.get("steps", [])],
+            risks=plan_preview.get("risks", []),
+            refactor_suggestions=plan_preview.get("refactors", [])
+        )
+
+        # Reconstruct boundary specs from stored data
+        from ..domain.models import BoundarySpec, SpecStatus
+        specs = [
+            BoundarySpec(
+                id=spec_data["id"],
+                boundary_name=spec_data["boundary_name"],
+                human_description=spec_data["human_description"],
+                diagram_text=spec_data["diagram_text"],
+                machine_spec=spec_data["machine_spec"],
+                status=SpecStatus(spec_data["status"])
+            )
+            for spec_data in boundary_specs_data
+        ]
+
+        sys.stderr.write("Generating patches...\n")
+        try:
+            patches = self.patch_engine.draft_patches(
+                plan,
+                repo_path=task.repo_path,
+                boundary_specs=specs,
+                skip_rationale_enhancement=skip_rationale_enhancement,
+            )
+            sys.stderr.write(f"Generated {len(patches)} patches\n")
+        except Exception as exc:
+            sys.stderr.write(f"Warning: Patch generation failed: {exc}\n")
+            sys.stderr.write("Continuing without patches.\n")
+            patches = []  # Continue without patches
+
+        # Generate test suggestions with patches (Epic 4.2)
+        sys.stderr.write("Generating test suggestions...\n")
+        tests = self.test_suggester.suggest(
+            plan=plan,
+            patches=patches,
+            boundary_specs=specs,
+            repo_context=context_summary,
+            repo_path=task.repo_path,
+        )
+        sys.stderr.write(f"Generated {len(tests)} test suggestions\n")
+
+        # Store rationale history for each patch (Epic 4.1)
+        rationale_history = task.metadata.get("rationale_history", [])
+        for patch in patches:
+            rationale_history.append({
+                "patch_id": patch.id,
+                "step_reference": patch.step_reference,
+                "rationale": patch.rationale,
+                "alternatives": patch.alternatives,
+                "timestamp": patch.id,  # Using patch ID as timestamp proxy for now
+            })
+        task.metadata["rationale_history"] = rationale_history
+
+        # Store patches and test suggestions in task metadata
+        task.metadata["patch_queue"] = [patch.step_reference for patch in patches]
+        task.metadata["patch_queue_state"] = [patch.to_dict() for patch in patches]
+        task.metadata["test_suggestions"] = [suggestion.description for suggestion in tests]
+        task.touch()
+        self.store.upsert_task(task)
+
+        self.logger.record(
+            task.id,
+            "PATCHES_GENERATED",
+            {
+                "patch_count": len(patches),
+                "patch_queue": task.metadata["patch_queue"],
+                "test_suggestions": task.metadata["test_suggestions"]
+            }
+        )
+
+        return {
+            "patch_count": len(patches),
+            "patches": task.metadata["patch_queue"],
+            "test_count": len(tests),
+            "test_suggestions": task.metadata["test_suggestions"]
+        }
 
     # ------------------------------------------------------------------ Helpers
     def _get_task(self, task_id: str) -> Task:
