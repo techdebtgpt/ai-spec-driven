@@ -222,10 +222,13 @@ def plan(
 
     if payload["pending_specs"]:
         console.print(Panel.fit("\n".join(payload["pending_specs"]), title="Pending Boundary Specs"))
-    if payload["patch_queue"]:
+    if payload.get("patch_queue"):
         console.print(Panel.fit("\n".join(payload["patch_queue"]), title="Patch Queue"))
-    if payload["test_suggestions"]:
+    if payload.get("test_suggestions"):
         console.print(Panel.fit("\n".join(payload["test_suggestions"]), title="Test Suggestions"))
+
+    console.print()
+    console.print("[dim]Note: Patches and test suggestions will be generated after plan approval.[/]")
 
 
 @app.command()
@@ -710,6 +713,26 @@ def clean_logs(
             raise typer.Exit(code=1)
     
     console.print("[bold green]Cleanup complete![/]")
+
+
+@app.command()
+def chat() -> None:
+    """
+    Start an interactive chat session for spec-driven development.
+
+    This provides a conversational interface where you can:
+    - Create and manage tasks interactively
+    - Answer clarifying questions one by one
+    - Review plans and boundary specs
+    - Approve or reject patches
+
+    The chat mode guides you through the entire workflow with menus and prompts.
+    """
+    from .chat import ChatSession
+
+    orchestrator = _get_orchestrator()
+    session = ChatSession(orchestrator)
+    session.run()
 
 
 def main() -> None:
