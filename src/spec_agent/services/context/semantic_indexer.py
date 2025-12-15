@@ -298,10 +298,6 @@ Do NOT wrap the JSON in code blocks."""
             for module in basic_summary['top_modules'][:10]:
                 prompt_parts.append(f"  - {module}")
         
-        if basic_summary.get('directory_structure'):
-            prompt_parts.append(f"\n## Directory Structure:")
-            prompt_parts.append(self._format_directory_tree(basic_summary['directory_structure']))
-        
         prompt_parts.append("\n## Representative Files:\n")
         
         for file_path, content in list(representative_files.items())[:25]:
@@ -318,26 +314,4 @@ Do NOT wrap the JSON in code blocks."""
         
         return '\n'.join(prompt_parts)
 
-    def _format_directory_tree(self, tree: Dict[str, Any], indent: int = 0) -> str:
-        """Format directory structure for display."""
-        lines = []
-        name = tree.get('name', 'root')
-        if indent == 0:
-            lines.append(f"{name}/")
-        
-        children = tree.get('children', [])
-        for child in children[:20]:  # Limit to prevent overwhelming output
-            child_name = child.get('name', '')
-            is_dir = child.get('is_directory', False)
-            prefix = "  " * (indent + 1)
-            
-            if is_dir:
-                lines.append(f"{prefix}{child_name}/")
-                # Recursively format children (limited depth)
-                if indent < 2 and child.get('children'):
-                    lines.append(self._format_directory_tree(child, indent + 1))
-            else:
-                lines.append(f"{prefix}{child_name}")
-        
-        return '\n'.join(lines)
 
