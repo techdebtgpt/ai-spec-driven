@@ -25,6 +25,7 @@ from ..domain.models import (
 )
 from ..persistence.store import JsonStore
 from ..services.context.indexer import ContextIndexer
+from ..services.context.semantic_indexer import SemanticIndexer
 from ..services.context.retriever import ContextRetriever
 from ..services.integrations.serena_client import SerenaToolClient
 from ..services.llm.openai_client import OpenAILLMClient
@@ -54,6 +55,7 @@ class TaskOrchestrator:
         self.context_retriever = ContextRetriever()
         self.clarifier = Clarifier()
         self.llm_client = self._maybe_create_llm_client()
+        self.semantic_indexer = SemanticIndexer(llm_client=self.llm_client, settings=self.settings)
         self.plan_builder = PlanBuilder(llm_client=self.llm_client)
         # Note: BoundaryManager created per-use in generate_plan with context
         self.boundary_manager = BoundaryManager()
@@ -69,10 +71,15 @@ class TaskOrchestrator:
     def index_repository(self, repo_path: Path, branch: str) -> Dict:
         """
         Index a repository and save the context for later use.
+        
+        This generates both:
+        1. Basic summary (file counts, languages, etc.)
+        2. Semantic index (architecture, boundaries, domains, etc.)
         """
         if not repo_path.exists():
             raise FileNotFoundError(f"Repository not found: {repo_path}")
 
+        sys.stderr.write(f"Analyzing repository structure...\n")
         summary = self.context_indexer.summarize_repository(repo_path.resolve())
         
         # Get comprehensive git information
@@ -88,11 +95,25 @@ class TaskOrchestrator:
             self.logger.record("WARNING", "GIT_INFO_FAILED", {"error": str(e)})
             git_info["error"] = str(e)
 
+        # Generate semantic index using LLM
+        sys.stderr.write(f"Generating semantic index (this may take a minute)...\n")
+        semantic_index = None
+        try:
+            semantic_index = self.semantic_indexer.generate_semantic_index(
+                repo_path=repo_path.resolve(),
+                basic_summary=summary
+            )
+            sys.stderr.write(f"✓ Semantic index generated successfully\n")
+        except Exception as e:
+            sys.stderr.write(f"Warning: Failed to generate semantic index: {e}\n")
+            self.logger.record("WARNING", "SEMANTIC_INDEX_FAILED", {"error": str(e)})
+
         index_data = {
             "repo_path": str(repo_path.resolve()),
             "repo_name": repo_path.name,
             "branch": branch,
             "repository_summary": summary,
+            "semantic_index": semantic_index,
             "git_info": git_info,
             "indexed_at": datetime.now().isoformat(),
         }
@@ -101,7 +122,7 @@ class TaskOrchestrator:
         self.logger.record(
             "SYSTEM",
             "REPOSITORY_INDEXED",
-            {"repo_path": str(repo_path), "branch": branch, "summary": summary}
+            {"repo_path": str(repo_path), "branch": branch, "has_semantic_index": semantic_index is not None}
         )
 
         return index_data

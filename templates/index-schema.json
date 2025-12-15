@@ -1,0 +1,121 @@
+{
+  "schemaVersion": "1.0",
+  "generatedAt": "ISO-8601 timestamp",
+
+  "repository": {
+    "name": "string",
+    "rootPath": "string",
+    "primaryLanguages": ["string"],
+    "frameworks": ["string"],
+    "buildTools": ["string"],
+    "architectureStyle": "string",
+    "entryPoints": ["string"],
+    "testFrameworks": ["string"],
+    "packageManagers": ["string"]
+  },
+
+  "structure": {
+    "modules": [
+      {
+        "name": "string",
+        "path": "string",
+        "type": "api | service | library | cli | worker | test | infra | unknown",
+        "responsibility": "string",
+        "dependsOn": ["string"]
+      }
+    ]
+  },
+
+  "domains": [
+    {
+      "name": "string",
+      "description": "string",
+      "entities": ["string"],
+      "valueObjects": ["string"],
+      "commands": ["string"],
+      "events": ["string"],
+      "services": ["string"],
+      "relatedModules": ["string"]
+    }
+  ],
+
+  "publicInterfaces": {
+    "httpApis": [
+      {
+        "method": "GET | POST | PUT | DELETE | PATCH",
+        "route": "string",
+        "handler": "string",
+        "requestModel": "string",
+        "responseModel": "string",
+        "module": "string"
+      }
+    ],
+    "cliCommands": [
+      {
+        "command": "string",
+        "description": "string",
+        "handler": "string"
+      }
+    ],
+    "events": [
+      {
+        "name": "string",
+        "publisher": "string",
+        "consumers": ["string"]
+      }
+    ]
+  },
+
+  "keyComponents": [
+    {
+      "name": "string",
+      "type": "controller | service | domain | repository | integration | worker | utility",
+      "responsibility": "string",
+      "dependsOn": ["string"],
+      "usedBy": ["string"]
+    }
+  ],
+
+  "crossCuttingConcerns": {
+    "logging": "string",
+    "authentication": "string",
+    "authorization": "string",
+    "validation": "string",
+    "configuration": "string",
+    "observability": ["string"],
+    "errorHandling": "string"
+  },
+
+  "externalIntegrations": [
+    {
+      "name": "string",
+      "type": "http | message | database | sdk | other",
+      "usedBy": ["string"],
+      "purpose": "string"
+    }
+  ],
+
+  "rulesAndConstraints": [
+    {
+      "rule": "string",
+      "scope": "repository | module | domain",
+      "enforcedBy": "convention | framework | code"
+    }
+  ],
+
+  "testing": {
+    "testTypes": ["unit", "integration", "e2e"],
+    "coverageFocus": ["string"],
+    "testDataStrategies": ["string"]
+  },
+
+  "qualitySignals": {
+    "codeGeneration": "low | medium | high",
+    "legacyHotspots": ["string"],
+    "highRiskAreas": ["string"]
+  },
+
+  "notes": [
+    "Free-form observations useful for future feature implementation"
+  ]
+}

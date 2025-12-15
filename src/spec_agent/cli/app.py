@@ -249,6 +249,53 @@ def index(
         
         console.print(ext_table)
     
+    # Semantic Index Panel
+    semantic_index = index_data.get('semantic_index')
+    if semantic_index:
+        semantic_lines = []
+        
+        # Repository info
+        repo_info = semantic_index.get('repository', {})
+        if repo_info.get('architectureStyle'):
+            semantic_lines.append(f"[bold]Architecture:[/] {repo_info['architectureStyle']}")
+        
+        # Modules count
+        structure = semantic_index.get('structure', {})
+        modules = structure.get('modules', [])
+        if modules:
+            semantic_lines.append(f"[bold]Modules:[/] {len(modules)} detected")
+        
+        # Domains count
+        domains = semantic_index.get('domains', [])
+        if domains:
+            semantic_lines.append(f"[bold]Domains:[/] {len(domains)} identified")
+        
+        # Public interfaces
+        public_interfaces = semantic_index.get('publicInterfaces', {})
+        http_apis = public_interfaces.get('httpApis', [])
+        cli_commands = public_interfaces.get('cliCommands', [])
+        events = public_interfaces.get('events', [])
+        
+        if http_apis:
+            semantic_lines.append(f"[bold]HTTP APIs:[/] {len(http_apis)} endpoints")
+        if cli_commands:
+            semantic_lines.append(f"[bold]CLI Commands:[/] {len(cli_commands)} commands")
+        if events:
+            semantic_lines.append(f"[bold]Events:[/] {len(events)} event types")
+        
+        # Key components
+        key_components = semantic_index.get('keyComponents', [])
+        if key_components:
+            semantic_lines.append(f"[bold]Key Components:[/] {len(key_components)} identified")
+        
+        # External integrations
+        external_integrations = semantic_index.get('externalIntegrations', [])
+        if external_integrations:
+            semantic_lines.append(f"[bold]External Integrations:[/] {len(external_integrations)}")
+        
+        if semantic_lines:
+            console.print(Panel.fit("\n".join(semantic_lines), title="Semantic Analysis", border_style="bright_blue"))
+    
     # Serena Status
     if summary.get('serena_enabled'):
         console.print("[dim]Enhanced with Serena language detection[/]")
