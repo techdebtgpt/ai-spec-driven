@@ -48,25 +48,18 @@ def make_patch(kind: PatchKind = PatchKind.IMPLEMENTATION, status: PatchStatus =
 
 
 @patch.object(subprocess, "run")
-def test_list_patches_detects_manual_edits(mock_run: MagicMock, tmp_path: Path) -> None:
-    mock_run.return_value.stdout = "main"
+def test_has_manual_edits_detects_manual_changes(mock_run: MagicMock, tmp_path: Path) -> None:
+    mock_run.return_value.stdout = "M new_file.py"
     orch = TaskOrchestrator()
     task = make_task(tmp_path)
     task.metadata["patch_queue_state"] = [make_patch().to_dict()]
     task.metadata["worktree_status"] = "A test.py"
     orch.store.upsert_task(task)
 
-    mock_run.side_effect = [
-        MagicMock(stdout="main"),
-        MagicMock(stdout="deadbeef"),
-        MagicMock(stdout=""),
-        MagicMock(stdout="main"),
-        MagicMock(stdout="deadbeef"),
-        MagicMock(stdout=""),
-    ]
-
+    assert orch.has_manual_edits(task.id)
+    # Listing patches should still return the cached queue
     patches = orch.list_patches(task.id)
-    assert patches  # regenerate plan triggered, but queue reload still works
+    assert patches
 
 
 @patch.object(subprocess, "run")
@@ -86,7 +79,9 @@ def test_approve_patch_applies_diff(mock_run: MagicMock, tmp_path: Path) -> None
 
     mock_run.side_effect = [
         MagicMock(stdout="main"),  # ensure branch
-        MagicMock(stdout=""),  # git apply
+        MagicMock(stdout=""),  # git apply --3way
+        MagicMock(stdout=""),  # git apply --ignore-space-change
+        MagicMock(stdout=""),  # git apply fallback
         MagicMock(stdout=""),  # git status snapshot
         MagicMock(stdout="deadbeef"),  # commit snapshot
     ]
@@ -111,12 +106,10 @@ def test_reject_patch_marks_status_and_regenerates(mock_run: MagicMock, tmp_path
     orch.store.upsert_task(task)
 
     mock_run.side_effect = [
-        MagicMock(stdout="deadbeef"),
         MagicMock(stdout=""),
+        MagicMock(stdout="deadbeef"),
     ]
 
     orch.reject_patch(task.id, orch.list_patches(task.id)[0].id)
     task_after = orch._get_task(task.id)
-    patches = task_after.metadata["patch_queue_state"]
-    assert patches
-
+    assert "patch_queue_state" not in task_after.metadata

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 import typer
@@ -9,7 +10,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from ..domain.models import RefactorSuggestionStatus, TaskStatus
+from ..domain.models import ClarificationStatus, RefactorSuggestionStatus, TaskStatus
 from ..workflow.orchestrator import TaskOrchestrator
 
 app = typer.Typer(add_completion=False, help="Spec-driven development agent CLI.")
@@ -21,22 +22,129 @@ def _get_orchestrator() -> TaskOrchestrator:
 
 
 
+def _infer_step_scenario(description: str, notes: Optional[str] = None, *, has_tests: bool = True) -> List[str]:
+    """
+    Create a small, human-readable Given/When/Then scenario for a plan step.
+
+    This is intentionally heuristic: it converts high-level plan text into a
+    quick "what success looks like" summary for senior engineers skimming.
+    """
+    desc = (description or "").strip()
+    if not desc:
+        return []
+
+    desc_l = desc.lower()
+    notes_clean = (notes or "").strip()
+
+    given = "Given the codebase is indexed and the current behavior is understood"
+
+    if desc_l.startswith("implement"):
+        when = f"When we {desc_l}"
+        then = "Then the new component exists and is ready to be integrated"
+    elif desc_l.startswith("update") or desc_l.startswith("refactor"):
+        when = f"When we {desc_l}"
+        then = "Then the existing flow uses the updated configuration path"
+    elif "test" in desc_l and has_tests:
+        when = f"When we {desc_l}"
+        then = "Then automated tests validate both happy-path and failure cases"
+    elif desc_l.startswith("document"):
+        when = f"When we {desc_l}"
+        then = "Then the team can maintain the setup confidently without tribal knowledge"
+    else:
+        when = f"When we {desc_l}"
+        then = "Then the change is implemented with clear acceptance criteria"
+
+    lines = [
+        f"Given: {given}",
+        f"When:  {when}",
+        f"Then:  {then}",
+    ]
+    if notes_clean:
+        lines.append(f"And:   {notes_clean}")
+    return lines
+
+
+def _format_plan_steps_human(steps: List[Any], *, has_tests: bool = True) -> Dict[str, List[str]]:
+    """
+    Turn plan step payloads (dicts or strings) into:
+    - a readable step list
+    - a readable scenario list (Given/When/Then)
+    """
+    step_lines: List[str] = []
+    scenario_lines: List[str] = []
+
+    for idx, step in enumerate(steps or [], start=1):
+        if isinstance(step, dict):
+            description = (step.get("description") or "").strip()
+            target_files = step.get("target_files") or []
+            notes = step.get("notes")
+
+            step_lines.append(f"{idx}. {description or '(missing step description)'}")
+            if target_files:
+                step_lines.append(f"   Targets: {', '.join(str(t) for t in target_files)}")
+            if notes:
+                step_lines.append(f"   Notes: {notes}")
+
+            scenario = _infer_step_scenario(description, notes, has_tests=has_tests)
+            if scenario:
+                if scenario_lines:
+                    scenario_lines.append("")  # spacer between scenarios
+                scenario_lines.append(f"Step {idx}: {description or '(missing step description)'}")
+                for line in scenario:
+                    scenario_lines.append(f"- {line}")
+        else:
+            text = str(step)
+            step_lines.append(f"{idx}. {text}")
+            scenario = _infer_step_scenario(text, None, has_tests=has_tests)
+            if scenario:
+                if scenario_lines:
+                    scenario_lines.append("")
+                scenario_lines.append(f"Step {idx}: {text}")
+                for line in scenario:
+                    scenario_lines.append(f"- {line}")
+
+    return {"steps": step_lines, "scenarios": scenario_lines}
+
+
 @app.command()
 def index(
     repo: Path = typer.Argument(..., exists=True, file_okay=False, readable=True, resolve_path=True),
     branch: str = typer.Option("main", "--branch", "-b"),
+    json_output: bool = typer.Option(False, "--json", help="Emit repository summary as JSON after indexing."),
+    serena_semantic_tree: bool = typer.Option(
+        False,
+        "--serena-semantic-tree",
+        help="Export a full Serena semantic symbol tree (slow; requires Serena enabled).",
+    ),
 ) -> None:
     """
     Index a repository and save the context for later use.
     """
 
     orchestrator = _get_orchestrator()
-    index_data = orchestrator.index_repository(repo_path=repo, branch=branch)
+    index_data = orchestrator.index_repository(
+        repo_path=repo,
+        branch=branch,
+        include_serena_semantic_tree=serena_semantic_tree,
+    )
 
     summary = index_data.get("repository_summary", {})
     git_info = index_data.get("git_info", {})
 
     console.print(f"[bold green]Repository indexed successfully[/]\n")
+
+    if serena_semantic_tree:
+        tree_payload = summary.get("serena_semantic_tree") or {}
+        stats = tree_payload.get("stats") if isinstance(tree_payload, dict) else None
+        if isinstance(stats, dict) and stats:
+            console.print(
+                f"[dim]Serena semantic tree: indexed {stats.get('indexed_files', 0)} files "
+                f"(failed {stats.get('failed_files', 0)}) in {stats.get('elapsed_seconds', '?')}s[/]"
+            )
+        elif tree_payload:
+            console.print("[dim]Serena semantic tree: generated (details saved to repository index)[/]")
+        else:
+            console.print("[yellow]Serena semantic tree requested but not generated (Serena disabled or unavailable).[/]")
     
     # Merged Repository Info and Semantic Analysis Panel
     info_lines = []
@@ -126,6 +234,32 @@ def index(
             info_lines.append(f"[bold cyan]External Integrations:[/] {len(external_integrations)}")
     
     console.print(Panel.fit("\n".join(info_lines), title="Repository Overview", border_style="bright_blue"))
+
+    # Serena semantic modules panel
+    semantic_modules = summary.get('serena_semantic_modules') or []
+    if semantic_modules:
+        sem_table = Table(title="Serena Semantic Modules", show_header=True, header_style="bold magenta")
+        sem_table.add_column("Module / File", style="cyan")
+        sem_table.add_column("Key Symbols", style="green")
+        sem_table.add_column("Referenced By")
+        
+        for module in semantic_modules[:5]:
+            module_name = module.get('module', 'unknown')
+            file_path = module.get('file')
+            module_label = module_name
+            if file_path:
+                module_label = f"{module_name}\n[dim]{file_path}[/]"
+            
+            symbols = module.get('top_symbols') or []
+            symbol_names = [sym.get('symbol', '') for sym in symbols if sym.get('symbol')]
+            key_symbols = ", ".join(symbol_names[:4]) if symbol_names else "—"
+            
+            referenced_by = module.get('referenced_by_modules') or []
+            referenced_display = ", ".join(referenced_by[:4]) if referenced_by else "—"
+            
+            sem_table.add_row(module_label, key_symbols, referenced_display)
+        
+        console.print(sem_table)
     
     # Serena Status
     if summary.get('serena_enabled'):
@@ -135,6 +269,207 @@ def index(
     
     console.print(f"\n[cyan]Index saved. You can now run:[/] [bold]./spec-agent start --description \"Your task\"[/]")
 
+    if json_output:
+        console.print_json(data=json.dumps(index_data, default=str))
+
+
+@app.command("context-summary")
+def context_summary(
+    top: int = typer.Option(5, "--top", help="Number of entries to show for modules and hotspots."),
+    json_output: bool = typer.Option(False, "--json", help="Emit summary as JSON instead of tables."),
+) -> None:
+    """
+    Show the most recent indexed repository summary (modules, hotspots, dependency graph).
+    """
+    orchestrator = _get_orchestrator()
+
+    try:
+        index_data = orchestrator.get_cached_repository_index()
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1)
+
+    summary = index_data.get("repository_summary", {})
+    if not summary:
+        console.print("[yellow]No repository summary found. Run './spec-agent index' first.[/]")
+        raise typer.Exit(code=1)
+
+    if json_output:
+        payload = {
+            "top_modules": summary.get("top_modules", [])[:top],
+            "dependency_graph": summary.get("dependency_graph", {}),
+            "hotspots": summary.get("hotspots", [])[:top],
+            "languages": summary.get("top_languages", []),
+        }
+        console.print_json(data=json.dumps(payload, default=str))
+        return
+
+    modules = summary.get("top_modules", [])[:top]
+    if modules:
+        table = Table(title="Key Modules / Packages")
+        table.add_column("Module")
+        for module in modules:
+            table.add_row(module)
+        console.print(table)
+
+    dep_graph = summary.get("dependency_graph") or {}
+    fan_in = dep_graph.get("top_fan_in", [])[:top]
+    if fan_in:
+        table = Table(title="Most Referenced Modules (Fan-in)")
+        table.add_column("Module")
+        table.add_column("References", justify="right")
+        for item in fan_in:
+            table.add_row(item.get("module", ""), str(item.get("references", 0)))
+        console.print(table)
+
+    hotspots = summary.get("hotspots", [])[:top]
+    if hotspots:
+        table = Table(title="Legacy Hotspots")
+        table.add_column("Path")
+        table.add_column("Lines", justify="right")
+        for hotspot in hotspots:
+            table.add_row(hotspot.get("path", ""), str(hotspot.get("lines", "")))
+        console.print(table)
+
+    if not (modules or fan_in or hotspots):
+        console.print("[yellow]Summary exists but no enriched data available yet.[/]")
+
+
+@app.command("bounded-index")
+def bounded_index(
+    task_id: str = typer.Argument(..., help="UUID of the task to attach the bounded index to."),
+    targets: List[Path] = typer.Argument(..., help="Paths (files or directories) to scan relative to the repo."),
+    serena_semantic_tree: bool = typer.Option(
+        False,
+        "--serena-semantic-tree",
+        help="Also export a scoped Serena semantic symbol tree for these targets (slow).",
+    ),
+) -> None:
+    """
+    Run a scoped index for specific files/directories after clarifications.
+    """
+    orchestrator = _get_orchestrator()
+
+    if not targets:
+        console.print("[red]Provide at least one target path.[/]")
+        raise typer.Exit(code=1)
+
+    target_args = [str(path) for path in targets]
+    summary = orchestrator.bounded_index_task(
+        task_id,
+        target_args,
+        include_serena_semantic_tree=serena_semantic_tree,
+    )
+    aggregate = summary.get("aggregate", {})
+
+    console.print("[bold green]Bounded index completed[/]")
+    if aggregate:
+        console.print(
+            Panel.fit(
+                "\n".join(
+                    [
+                        f"Files: {aggregate.get('file_count', 0)}",
+                        f"Size: {aggregate.get('total_size_bytes', 0)} bytes",
+                        f"Languages: {', '.join(aggregate.get('top_languages', [])) or 'unknown'}",
+                    ]
+                ),
+                title="Aggregate",
+            )
+        )
+
+    targets_summary = summary.get("targets", {})
+    if targets_summary:
+        table = Table(title="Targets Indexed")
+        table.add_column("Path")
+        table.add_column("Files", justify="right")
+        table.add_column("Top Languages")
+        for path, stats in targets_summary.items():
+            table.add_row(
+                path,
+                str(stats.get("file_count", 0)),
+                ", ".join(stats.get("top_languages", [])) or "unknown",
+            )
+        console.print(table)
+
+    impact = summary.get("impact") or {}
+    if impact:
+        details = []
+        top_dirs = impact.get("top_directories") or []
+        namespaces = impact.get("namespaces") or []
+        if top_dirs:
+            details.append(f"Top directories: {', '.join(top_dirs[:10])}")
+        if namespaces:
+            details.append(f"Namespaces: {', '.join(namespaces[:10])}")
+        if details:
+            console.print(Panel.fit("\n".join(details), title="Impacted Modules (Bounded Scope)"))
+
+    if serena_semantic_tree:
+        tree_payload = summary.get("serena_semantic_tree") or {}
+        stats = tree_payload.get("stats") if isinstance(tree_payload, dict) else None
+        if isinstance(stats, dict) and stats:
+            console.print(
+                f"[dim]Scoped Serena semantic tree: indexed {stats.get('indexed_files', 0)} files "
+                f"(failed {stats.get('failed_files', 0)}) in {stats.get('elapsed_seconds', '?')}s[/]"
+            )
+    else:
+        console.print("[yellow]No matching files were indexed for the provided targets.[/]")
+
+
+@app.command("context")
+def manage_context(
+    task_id: str = typer.Argument(..., help="UUID of the task whose context should be managed."),
+    include: List[str] = typer.Option([], "--include", "-i", help="Paths to force-include in context."),
+    exclude: List[str] = typer.Option([], "--exclude", "-x", help="Paths to exclude from future expansions."),
+    reason: Optional[str] = typer.Option(None, "--reason", "-r", help="Why these paths are being adjusted."),
+    summarize: bool = typer.Option(True, "--summarize/--no-summarize", help="Show a scoped summary for included paths."),
+) -> None:
+    """
+    Inspect and modify the iterative context expansion history for a task.
+    """
+    orchestrator = _get_orchestrator()
+    performed_update = False
+
+    if include or exclude:
+        note = reason or "Manual context update"
+        result = orchestrator.update_context(
+            task_id,
+            include=include,
+            exclude=exclude,
+            trigger="engineer-adjustment",
+            note=note,
+            summarize=summarize,
+        )
+        performed_update = True
+        console.print("[green]Logged context update.[/]")
+        if result.get("summary"):
+            aggregate = result["summary"].get("aggregate", {})
+            if aggregate:
+                details = [
+                    f"Files: {aggregate.get('file_count', 0)}",
+                    f"Size: {aggregate.get('total_size_bytes', 0)} bytes",
+                    f"Languages: {', '.join(aggregate.get('top_languages', [])) or 'unknown'}",
+                ]
+                console.print(Panel.fit("\n".join(details), title="Scoped Summary"))
+
+    history = orchestrator.get_context_history(task_id)
+    if not history:
+        if not performed_update:
+            console.print("[yellow]No context history recorded yet.[/]")
+        return
+
+    table = Table(title="Context Expansion Steps", show_lines=True)
+    table.add_column("When")
+    table.add_column("Trigger")
+    table.add_column("Included")
+    table.add_column("Excluded")
+    for step in history[-15:]:
+        table.add_row(
+            step.get("timestamp", ""),
+            f"{step.get('trigger', '')}\n{step.get('note', '') or ''}",
+            "\n".join(step.get("included", []) or ["—"]),
+            "\n".join(step.get("excluded", []) or ["—"]),
+        )
+    console.print(table)
 
 
 @app.command()
@@ -159,8 +494,71 @@ def start(
         for item in clarifications:
             table.add_row(item["id"], item["question"])
         console.print(table)
+        console.print(f"[dim]Answer them via:[/] ./spec-agent clarifications {task.id}")
     else:
         console.print("[cyan]No clarification questions detected.[/]")
+
+
+@app.command("clarifications")
+def handle_clarifications(
+    task_id: str = typer.Argument(..., help="UUID of the task whose clarifications should be reviewed."),
+    list_only: bool = typer.Option(False, "--list", help="Only display questions without prompting for answers."),
+) -> None:
+    """
+    Review and answer clarification questions for a task.
+    """
+    orchestrator = _get_orchestrator()
+    clarifications = orchestrator.list_clarifications(task_id)
+
+    if not clarifications:
+        console.print("[cyan]No clarification questions recorded for this task.[/]")
+        return
+
+    if list_only:
+        table = Table(title="Clarification Questions")
+        table.add_column("ID", style="bold")
+        table.add_column("Status")
+        table.add_column("Question")
+        for item in clarifications:
+            table.add_row(item.get("id", ""), item.get("status", "PENDING"), item.get("question", ""))
+        console.print(table)
+        return
+
+    handled = False
+    for item in clarifications:
+        status = item.get("status") or ClarificationStatus.PENDING.value
+        console.print()
+        console.print(Panel.fit(item.get("question", "No question text provided."), title=f"Question {item.get('id','')} [{status}]"))
+        if status != ClarificationStatus.PENDING.value:
+            existing = item.get("answer") or "(no answer recorded)"
+            console.print(f"[dim]Already resolved: {existing}[/]")
+            continue
+
+        answer = typer.prompt("Your answer (leave blank to skip)", default="").strip()
+        if answer:
+            orchestrator.update_clarification(
+                task_id,
+                item.get("id"),
+                answer=answer,
+                status=ClarificationStatus.ANSWERED,
+            )
+            console.print("[green]Saved answer.[/]")
+            handled = True
+        else:
+            if typer.confirm("Override/skip this question?", default=True):
+                orchestrator.update_clarification(
+                    task_id,
+                    item.get("id"),
+                    answer="",
+                    status=ClarificationStatus.OVERRIDDEN,
+                )
+                console.print("[yellow]Question overridden.[/]")
+                handled = True
+
+    if handled:
+        console.print("\n[bold green]All clarifications processed![/]")
+    else:
+        console.print("\n[yellow]No changes made.[/]")
 
 
 @app.command("tasks")
@@ -196,18 +594,72 @@ def list_tasks(
     console.print(table)
 
 
+@app.command("task-edit")
+def edit_task(
+    task_id: str = typer.Argument(..., help="UUID of the task to edit."),
+    description: Optional[str] = typer.Option(
+        None,
+        "--description",
+        "-d",
+        help="New task description. If omitted, you will be prompted.",
+    ),
+    keep_metadata: bool = typer.Option(
+        False,
+        "--keep-metadata",
+        help="Only update description; do NOT reset clarifications/plan/specs/patches context.",
+    ),
+    reason: Optional[str] = typer.Option(None, "--reason", "-r", help="Why the description is changing."),
+) -> None:
+    """
+    Update a task description safely.
+
+    By default this treats the new description as a new intent: it regenerates
+    clarifications and clears stale metadata (plan/specs/patches/bounded context)
+    to avoid mismatched context.
+    """
+    orchestrator = _get_orchestrator()
+
+    if description is None:
+        description = typer.prompt("New description", default="").strip()
+
+    try:
+        task = orchestrator.update_task_description(
+            task_id,
+            description or "",
+            reason=reason,
+            reset_metadata=not keep_metadata,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1)
+
+    if keep_metadata:
+        console.print(f"[green]Updated description for task {task.id}.[/]")
+        return
+
+    console.print(f"[green]Updated task {task.id} and reset metadata for the new description.[/]")
+    clarifications = task.metadata.get("clarifications", []) or []
+    if clarifications:
+        console.print(f"[dim]Generated {len(clarifications)} clarifying question(s). Review with:[/] ./spec-agent clarifications {task.id}")
+
+
 @app.command()
 def plan(
     task_id: str = typer.Argument(..., help="UUID of the task to plan."),
     fast: bool = typer.Option(False, "--fast", help="Skip rationale enhancement for faster execution"),
 ) -> None:
     """
-    Generate a plan, boundary specs, patch queue, and test suggestions for a task.
+    Generate a plan, boundary specs, and refactor suggestions for a task.
     
     Use --fast to skip rationale enhancement (Epic 4.1) for faster execution.
     """
 
     orchestrator = _get_orchestrator()
+
+    if orchestrator.has_pending_clarifications(task_id):
+        console.print("[red]Clarification questions are still pending.[/]")
+        console.print(f"[dim]Resolve them via './spec-agent clarifications {task_id}' before planning.[/]")
+        raise typer.Exit(code=1)
     
     # Show progress
     console.print("[cyan]Generating plan...[/]")
@@ -216,19 +668,82 @@ def plan(
     
     payload = orchestrator.generate_plan(task_id, skip_rationale_enhancement=fast)
 
-    console.print(Panel.fit("\n".join(payload["plan"]["steps"]), title="Plan Steps"))
-    console.print(Panel.fit("\n".join(payload["plan"]["risks"]), title="Risks"))
-    console.print(Panel.fit("\n".join(payload["plan"]["refactors"]), title="Refactor Suggestions"))
+    plan_data = payload["plan"]
+    task = orchestrator._get_task(task_id)
+    has_tests = bool((task.metadata.get("repository_summary") or {}).get("has_tests", False))
+    formatted = _format_plan_steps_human(plan_data.get("steps", []), has_tests=has_tests)
+    step_lines = formatted.get("steps") or []
+    scenario_lines = formatted.get("scenarios") or []
+    if step_lines:
+        console.print(Panel.fit("\n".join(step_lines), title="Plan Steps"))
+    if scenario_lines:
+        console.print(Panel.fit("\n".join(scenario_lines), title="Scenarios (Given / When / Then)"))
+    if not has_tests:
+        console.print("[dim]No automated tests detected in this repository. Consider adding them later.[/]")
+    if plan_data.get("risks"):
+        console.print(Panel.fit("\n".join(plan_data["risks"]), title="Risks"))
+    if plan_data.get("refactors"):
+        console.print(Panel.fit("\n".join(plan_data["refactors"]), title="Refactor Suggestions"))
 
     if payload["pending_specs"]:
         console.print(Panel.fit("\n".join(payload["pending_specs"]), title="Pending Boundary Specs"))
-    if payload.get("patch_queue"):
-        console.print(Panel.fit("\n".join(payload["patch_queue"]), title="Patch Queue"))
-    if payload.get("test_suggestions"):
-        console.print(Panel.fit("\n".join(payload["test_suggestions"]), title="Test Suggestions"))
+
+    bounded = payload.get("bounded_context", {})
+    if bounded:
+        aggregate = bounded.get("aggregate", {})
+        details = [
+            f"Files: {aggregate.get('file_count', 0)}",
+            f"Size: {aggregate.get('total_size_bytes', 0)} bytes",
+            f"Languages: {', '.join(aggregate.get('top_languages', [])) or 'unknown'}",
+        ]
+        console.print(Panel.fit("\n".join(details), title="Scoped Context (Plan Targets)"))
+
+        # If the bounded context is empty, explain why (targets are logical module names).
+        resolution = bounded.get("plan_targets_resolution") if isinstance(bounded, dict) else None
+        if aggregate.get("file_count", 0) == 0 and isinstance(resolution, dict):
+            raw_targets = resolution.get("raw_targets") or []
+            resolved_targets = resolution.get("resolved_targets") or []
+            unresolved_targets = resolution.get("unresolved_targets") or []
+
+            explain_lines = [
+                "Scoped context is empty because plan targets are module labels (not filesystem paths).",
+                "Use a bounded index with real directories/files to scope context precisely.",
+            ]
+            if raw_targets:
+                explain_lines.append("")
+                explain_lines.append(f"Plan targets: {', '.join(str(t) for t in raw_targets[:12])}{' ...' if len(raw_targets) > 12 else ''}")
+            if resolved_targets:
+                explain_lines.append(f"Resolved to paths: {', '.join(str(t) for t in resolved_targets[:12])}{' ...' if len(resolved_targets) > 12 else ''}")
+            if unresolved_targets:
+                explain_lines.append(f"Unresolved: {', '.join(str(t) for t in unresolved_targets[:12])}{' ...' if len(unresolved_targets) > 12 else ''}")
+
+            console.print(Panel.fit("\n".join(explain_lines), title="Why Files=0", border_style="yellow"))
+
+        impact = bounded.get("impact") or {}
+        if impact:
+            impact_lines = []
+            top_dirs = impact.get("top_directories") or []
+            namespaces = impact.get("namespaces") or []
+            if top_dirs:
+                impact_lines.append(f"Top directories: {', '.join(top_dirs[:10])}")
+            if namespaces:
+                impact_lines.append(f"Namespaces: {', '.join(namespaces[:10])}")
+            if impact_lines:
+                console.print(Panel.fit("\n".join(impact_lines), title="Impacted Modules (Scoped Context)"))
+
+        tree_payload = bounded.get("serena_semantic_tree") or {}
+        stats = tree_payload.get("stats") if isinstance(tree_payload, dict) else None
+        if isinstance(stats, dict) and stats:
+            console.print(
+                f"[dim]Scoped Serena semantic tree: indexed {stats.get('indexed_files', 0)} files "
+                f"(failed {stats.get('failed_files', 0)}) in {stats.get('elapsed_seconds', '?')}s[/]"
+            )
 
     console.print()
-    console.print("[dim]Note: Patches and test suggestions will be generated after plan approval.[/]")
+    console.print("[dim]Next steps:[/]")
+    console.print(f"  1. Resolve boundary specs with ./spec-agent specs {task_id}")
+    console.print(f"  2. Approve the plan via ./spec-agent approve-plan {task_id}")
+    console.print(f"  3. Generate patches via ./spec-agent generate-patches {task_id}")
 
 
 @app.command()
@@ -332,6 +847,125 @@ def skip_spec(
         raise typer.Exit(code=1)
 
 
+@app.command("spec-edit")
+def edit_spec(
+    task_id: str = typer.Argument(..., help="UUID of the task."),
+    spec_id: str = typer.Argument(..., help="ID of the boundary spec to edit."),
+    description: Optional[str] = typer.Option(None, "--description", help="Override the human-readable description."),
+    diagram: Optional[str] = typer.Option(None, "--diagram", help="Override the Mermaid diagram text."),
+    machine: Optional[str] = typer.Option(
+        None,
+        "--machine",
+        help="JSON payload to replace the machine-readable spec (actors/interfaces/invariants).",
+    ),
+) -> None:
+    """
+    Edit an existing boundary specification. Leave options empty to be prompted interactively.
+    """
+    orchestrator = _get_orchestrator()
+    specs = orchestrator.get_boundary_specs(task_id)
+    spec = next((item for item in specs if item.get("id") == spec_id), None)
+
+    if not spec:
+        console.print(f"[red]Spec {spec_id} not found for task {task_id}.[/]")
+        raise typer.Exit(code=1)
+
+    if description is None and diagram is None and machine is None:
+        description = typer.prompt("Human description", default=spec.get("human_description", ""))
+        diagram = typer.prompt("Mermaid diagram", default=spec.get("diagram_text", ""))
+        machine = typer.prompt(
+            "Machine spec JSON",
+            default=json.dumps(spec.get("machine_spec", {}), indent=2),
+        )
+
+    machine_spec_data = None
+    if machine is not None:
+        try:
+            machine_spec_data = json.loads(machine)
+        except json.JSONDecodeError as exc:
+            console.print(f"[red]Invalid machine spec JSON: {exc}[/]")
+            raise typer.Exit(code=1)
+
+    try:
+        orchestrator.update_spec_fields(
+            task_id,
+            spec_id,
+            description=description,
+            diagram_text=diagram,
+            machine_spec=machine_spec_data,
+        )
+        console.print("[green]Spec updated. Approval reset to PENDING.[/]")
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1)
+
+
+@app.command("spec-regenerate")
+def regenerate_spec(
+    task_id: str = typer.Argument(..., help="UUID of the task."),
+    spec_id: str = typer.Argument(..., help="ID of the boundary spec to regenerate."),
+) -> None:
+    """
+    Regenerate a boundary specification from its original plan step.
+    """
+    orchestrator = _get_orchestrator()
+    try:
+        orchestrator.regenerate_spec(task_id, spec_id)
+        console.print("[green]Spec regenerated. Review before approval.[/]")
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1)
+    except Exception as exc:  # pragma: no cover
+        console.print(f"[red]Failed to regenerate spec: {exc}[/]")
+        raise typer.Exit(code=1)
+
+
+@app.command("approve-plan")
+def approve_plan_cmd(
+    task_id: str = typer.Argument(..., help="UUID of the task whose plan should be approved."),
+) -> None:
+    """
+    Approve the current implementation plan (all specs must be resolved first).
+    """
+    orchestrator = _get_orchestrator()
+    try:
+        orchestrator.approve_plan(task_id)
+        console.print("[bold green]Plan approved. You can now generate patches.[/]")
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        pending = [
+            spec for spec in orchestrator.get_boundary_specs(task_id)
+            if spec.get("status") == "PENDING"
+        ]
+        if pending:
+            console.print(f"[yellow]{len(pending)} pending spec(s) remain. Resolve them with './spec-agent specs {task_id}'.[/]")
+        raise typer.Exit(code=1)
+
+
+@app.command("generate-patches")
+def generate_patches_cmd(
+    task_id: str = typer.Argument(..., help="UUID of the task to generate patches for."),
+    fast: bool = typer.Option(False, "--fast", help="Skip rationale enhancement for faster execution"),
+) -> None:
+    """
+    Generate patches (and optionally test suggestions) for an approved plan.
+    """
+    orchestrator = _get_orchestrator()
+    try:
+        console.print("[cyan]Drafting patches...[/]")
+        result = orchestrator.generate_patches(task_id, skip_rationale_enhancement=fast)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1)
+
+    tests_skipped_reason = (result or {}).get("tests_skipped_reason")
+    if tests_skipped_reason:
+        body = f"Patches: {result['patch_count']}\nTest suggestions: skipped ({tests_skipped_reason})"
+    else:
+        body = f"Patches: {result['patch_count']}\nTest suggestions: {result['test_count']}"
+    console.print(Panel.fit(body, title="Generation Complete"))
+    console.print(f"[dim]Review patches with './spec-agent patches {task_id}'.[/]")
+
 @app.command("patches")
 def review_patches(
     task_id: str = typer.Argument(..., help="UUID of the task whose patches should be reviewed."),
@@ -342,6 +976,22 @@ def review_patches(
     """
 
     orchestrator = _get_orchestrator()
+    if orchestrator.has_manual_edits(task_id):
+        console.print("[yellow]Detected manual edits in the working tree.[/]")
+        console.print("[dim]Patches may no longer apply cleanly.[/]")
+        choice = typer.prompt("Regenerate plan (r), continue anyway (c), or abort (a)?", default="r").strip().lower()
+        if choice.startswith("r"):
+            console.print("[cyan]Regenerating plan to account for manual edits...[/]")
+            orchestrator.generate_plan(task_id)
+            console.print(f"[yellow]Plan regenerated. Review specs, run './spec-agent approve-plan {task_id}', then './spec-agent generate-patches {task_id}' before reviewing patches.[/]")
+            return
+        if choice.startswith("c"):
+            orchestrator.acknowledge_manual_edits(task_id)
+            console.print("[cyan]Continuing with existing patch queue.[/]")
+        else:
+            console.print("[cyan]Aborted patch review.[/]")
+            return
+
     patches = orchestrator.list_patches(task_id)
     if not patches:
         console.print("[yellow]No patches generated yet. Run 'spec-agent plan' first.[/]")
@@ -611,6 +1261,63 @@ def manage_refactors(
             console.print("[cyan]Skipping remaining suggestions.[/]")
             break
 
+@app.command("logs")
+def show_logs(
+    task_id: Optional[str] = typer.Option(None, "--task", help="Filter by task ID."),
+    entry_type: List[str] = typer.Option([], "--type", "-t", help="Filter by log entry type."),
+    limit: int = typer.Option(50, "--limit", help="Maximum number of entries to display."),
+    json_output: bool = typer.Option(False, "--json", help="Emit logs as JSON."),
+) -> None:
+    """
+    Display reasoning log entries, filtered by task or entry type.
+    """
+    orchestrator = _get_orchestrator()
+    entries = orchestrator.store.load_logs()
+
+    if task_id:
+        entries = [entry for entry in entries if entry.task_id == task_id]
+    if entry_type:
+        allowed = {item.upper() for item in entry_type}
+        entries = [entry for entry in entries if entry.entry_type.upper() in allowed]
+
+    if not entries:
+        console.print("[yellow]No matching log entries found.[/]")
+        return
+
+    entries.sort(key=lambda item: item.timestamp, reverse=True)
+    entries = entries[:limit]
+
+    if json_output:
+        payload = [
+            {
+                "id": entry.id,
+                "task_id": entry.task_id,
+                "timestamp": entry.timestamp.isoformat(),
+                "entry_type": entry.entry_type,
+                "payload": entry.payload,
+            }
+            for entry in entries
+        ]
+        console.print_json(data=json.dumps(payload, default=str))
+        return
+
+    table = Table(title="Reasoning Log")
+    table.add_column("Time")
+    table.add_column("Task")
+    table.add_column("Type")
+    table.add_column("Details")
+
+    for entry in entries:
+        payload_preview = entry.payload if isinstance(entry.payload, str) else json.dumps(entry.payload, default=str)
+        table.add_row(
+            entry.timestamp.isoformat(timespec="seconds"),
+            entry.task_id,
+            entry.entry_type,
+            payload_preview[:120] + ("…" if len(payload_preview) > 120 else ""),
+        )
+
+    console.print(table)
+
 
 @app.command("status")
 def show_status(task_id: str = typer.Argument(..., help="UUID of the task to inspect.")) -> None:
@@ -715,6 +1422,52 @@ def clean_logs(
     console.print("[bold green]Cleanup complete![/]")
 
 
+@app.command("clean-tasks")
+def clean_tasks(
+    confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """
+    Clear all tasks (but keep reasoning logs).
+
+    Tasks are stored in ~/.spec_agent/tasks.json
+    """
+    from ..config.settings import get_settings
+    from ..persistence.store import JsonStore
+
+    settings = get_settings()
+    store = JsonStore(settings.state_dir)
+
+    tasks_file = store.tasks_file
+    existing_tasks = store.load_tasks()
+
+    if not existing_tasks:
+        console.print("[yellow]No tasks to clean.[/]")
+        return
+
+    console.print(f"[yellow]Found {len(existing_tasks)} tasks[/]")
+
+    if not confirm:
+        response = typer.prompt(
+            f"Delete all tasks ({len(existing_tasks)} tasks)? [y/N]",
+            default="n",
+        )
+        if response.lower() not in {"y", "yes"}:
+            console.print("[cyan]Cancelled.[/]")
+            return
+
+    try:
+        if tasks_file.exists():
+            tasks_file.unlink()
+            console.print("[green]✓ Cleared all tasks[/]")
+        else:
+            console.print("[yellow]No tasks file found.[/]")
+    except Exception as exc:
+        console.print(f"[red]Error deleting tasks: {exc}[/]")
+        raise typer.Exit(code=1)
+
+    console.print("[bold green]Cleanup complete![/]")
+
+
 @app.command()
 def chat() -> None:
     """
@@ -737,5 +1490,3 @@ def chat() -> None:
 
 def main() -> None:
     app()
-
-

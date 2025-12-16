@@ -84,7 +84,10 @@ After setup, the same launcher proxies every CLI command. Example:
 - `./spec-agent index <repo> [--branch <branch>]`: index a repository and save the context for later use.
 - `./spec-agent start --description "<text>"`: create a new task using the previously indexed repository.
 - `./spec-agent tasks [--status <status>]`: list recorded tasks, optionally filtered by status.
-- `./spec-agent plan <task_id>`: generate the plan, boundary specs, patch queue, and suggested tests for an existing task.
+- `./spec-agent plan <task_id>`: generate the plan, boundary specs, and refactor suggestions for an existing task.
+- `./spec-agent bounded-index <task_id> <paths...>`: run a scoped index for specific files/directories after clarifications.
+- `./spec-agent approve-plan <task_id>`: lock and approve the current plan (all specs must be approved or skipped first).
+- `./spec-agent generate-patches <task_id> [--fast]`: produce incremental patches and accompanying test suggestions once the plan is approved.
 
 **Boundary Specs:**
 - `./spec-agent specs <task_id>`: view detailed boundary specifications for a task.
@@ -354,5 +357,3 @@ Serena is an **MCP server** that provides semantic code editing tools. It doesn'
 - Better conflict resolution for patches
 
 The project keeps all epic responsibilities visible from day one, making it easier to invest in the highest-risk components without re-architecting later. 
-
-

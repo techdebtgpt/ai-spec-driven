@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import os
 from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4
@@ -39,6 +40,7 @@ class TestSuggester:
             tuple: (has_tests, test_file_paths, test_framework)
         """
         test_file_paths: List[str] = []
+        seen_paths: set[str] = set()
         test_framework: Optional[str] = None
         
         if not repo_path or not repo_path.exists():
@@ -67,49 +69,73 @@ class TestSuggester:
         test_dirs = ["tests", "test", "__tests__", "spec", "specs", "Tests", "Test"]
         
         try:
-            # Search for test files
-            for path in repo_path.rglob("*"):
-                # Skip hidden directories and .git
-                if any(part.startswith('.') for part in path.parts):
+            max_results = 50
+            skip_dirs = {
+                ".git",
+                "node_modules",
+                "dist",
+                "build",
+                ".venv",
+                "venv",
+                "__pycache__",
+                ".tox",
+            }
+            
+            for root, dirs, files in os.walk(repo_path):
+                relative_parts = Path(root).relative_to(repo_path).parts
+                if any(part.startswith(".") for part in relative_parts if part):
                     continue
                 
-                if not path.is_file():
-                    continue
+                dirs[:] = [
+                    d for d in dirs
+                    if not d.startswith(".") and d not in skip_dirs
+                ]
                 
-                file_name = path.name
-                file_path = str(path.relative_to(repo_path))
-                
-                # Check for test file patterns
-                if any(file_name.startswith("test_") or file_name.endswith("_test.py") for ext in [".py"]):
-                    test_file_paths.append(file_path)
-                    if not test_framework:
-                        test_framework = "pytest"  # Default for Python
-                elif any(file_name.endswith(ext) for ext in [".test.js", ".test.ts", ".spec.js", ".spec.ts"]):
-                    test_file_paths.append(file_path)
-                    if not test_framework:
-                        test_framework = "jest"  # Default for JS/TS
-                elif file_name.endswith("_test.go"):
-                    test_file_paths.append(file_path)
-                    if not test_framework:
-                        test_framework = "go_test"
-                elif file_name.endswith("_test.rs"):
-                    test_file_paths.append(file_path)
-                    if not test_framework:
-                        test_framework = "rust_test"
-                elif any(file_name.endswith(ext) for ext in ["Test.java", "Tests.java"]):
-                    test_file_paths.append(file_path)
-                    if not test_framework:
-                        test_framework = "junit"
-                elif any(file_name.endswith(ext) for ext in ["Test.cs", "Tests.cs"]):
-                    test_file_paths.append(file_path)
-                    if not test_framework:
-                        test_framework = "nunit"
-                
-                # Check if file is in a test directory
-                if any(test_dir in path.parts for test_dir in test_dirs):
-                    if file_path not in test_file_paths:
-                        test_file_paths.append(file_path)
-        
+                for file_name in files:
+                    if file_name.startswith("."):
+                        continue
+                    file_path = str(Path(root, file_name).relative_to(repo_path))
+                    
+                    if file_name.startswith("test_") or file_name.endswith("_test.py"):
+                        if file_path not in seen_paths:
+                            test_file_paths.append(file_path)
+                            seen_paths.add(file_path)
+                        test_framework = test_framework or "pytest"
+                    elif file_name.endswith((".test.js", ".test.ts", ".spec.js", ".spec.ts")):
+                        if file_path not in seen_paths:
+                            test_file_paths.append(file_path)
+                            seen_paths.add(file_path)
+                        test_framework = test_framework or "jest"
+                    elif file_name.endswith("_test.go"):
+                        if file_path not in seen_paths:
+                            test_file_paths.append(file_path)
+                            seen_paths.add(file_path)
+                        test_framework = test_framework or "go_test"
+                    elif file_name.endswith("_test.rs"):
+                        if file_path not in seen_paths:
+                            test_file_paths.append(file_path)
+                            seen_paths.add(file_path)
+                        test_framework = test_framework or "rust_test"
+                    elif file_name.endswith(("Test.java", "Tests.java")):
+                        if file_path not in seen_paths:
+                            test_file_paths.append(file_path)
+                            seen_paths.add(file_path)
+                        test_framework = test_framework or "junit"
+                    elif file_name.endswith(("Test.cs", "Tests.cs")):
+                        if file_path not in seen_paths:
+                            test_file_paths.append(file_path)
+                            seen_paths.add(file_path)
+                        test_framework = test_framework or "nunit"
+                    
+                    if any(test_dir in Path(file_path).parts for test_dir in test_dirs):
+                        if file_path not in seen_paths:
+                            test_file_paths.append(file_path)
+                            seen_paths.add(file_path)
+                    
+                    if len(test_file_paths) >= max_results:
+                        break
+                if len(test_file_paths) >= max_results:
+                    break
         except Exception as exc:
             LOG.warning("Failed to detect test files: %s", exc)
         
@@ -403,29 +429,17 @@ Return JSON:
 Return only valid JSON, no markdown."""
 
         try:
-            # Access the internal OpenAI client
-            if hasattr(self.llm_client, '_client'):
-                openai_client = self.llm_client._client
-                model = self.llm_client._model if hasattr(self.llm_client, '_model') else "gpt-4o-mini"
-            else:
-                # Fallback: try to use as OpenAI client directly
-                openai_client = self.llm_client
-                model = getattr(self.llm_client, 'model', "gpt-4o-mini")
-            
-            response = openai_client.chat.completions.create(
-                model=model,
+            response_text = self.llm_client.chat(
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a test engineer. Suggest comprehensive test cases with proper skeletons. Return only valid JSON."
+                        "content": "You are a test engineer. Suggest comprehensive test cases with proper skeletons. Return only valid JSON.",
                     },
-                    {"role": "user", "content": prompt}
+                    {"role": "user", "content": prompt},
                 ],
                 temperature=0.3,
-                max_tokens=800,  # Reduced for faster responses
+                max_output_tokens=800,
             )
-
-            response_text = response.choices[0].message.content if response.choices else ""
             
             # Use robust JSON parsing
             test_data = self._parse_llm_json_response(response_text)
@@ -667,5 +681,3 @@ Return only valid JSON, no markdown."""
         else:
             LOG.warning("Could not parse JSON response, returning empty dict. Response preview: %s", text[:200])
         return {}
-
-

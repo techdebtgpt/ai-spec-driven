@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional
 
-from openai import OpenAI, OpenAIError
+try:
+    # Optional at dev-time: editors/CI environments may not have extras installed.
+    # If you want LLM features, install dependencies (e.g. `pip install -e .`).
+    from openai import OpenAI, OpenAIError  # type: ignore[reportMissingImports]
+except ModuleNotFoundError as exc:  # pragma: no cover
+    OpenAI = None  # type: ignore[assignment]
+    OpenAIError = Exception  # type: ignore[assignment]
+    _OPENAI_IMPORT_ERROR = exc
 
 
 LOG = logging.getLogger(__name__)
@@ -29,6 +36,12 @@ class OpenAILLMClient:
         base_url: Optional[str] = None,
         timeout_seconds: int = 60,
     ) -> None:
+        if OpenAI is None:  # pragma: no cover
+            raise ModuleNotFoundError(
+                "OpenAI SDK not installed. Install project dependencies (e.g. `pip install -e .`) "
+                "or add `openai` to your environment."
+            ) from _OPENAI_IMPORT_ERROR
+
         if not api_key:
             raise ValueError("OpenAI API key must be provided when enabling the LLM.")
 
@@ -43,15 +56,28 @@ class OpenAILLMClient:
         """
         Execute a short, deterministic call against the configured OpenAI model.
         """
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        return self.chat(messages, temperature=0.2, max_output_tokens=max_output_tokens)
 
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        max_output_tokens: int = 800,
+    ) -> str:
+        """
+        Generic chat completion helper so downstream services do not shell out
+        to the SDK directly.
+        """
         try:
             response = self._client.chat.completions.create(
                 model=self._model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.2,
+                messages=messages,
+                temperature=temperature,
                 max_tokens=max_output_tokens,
             )
         except OpenAIError as exc:
@@ -81,4 +107,3 @@ class OpenAILLMClient:
         except Exception as exc:
             LOG.error("Failed to extract text from OpenAI response: %s", exc)
             return ""
-

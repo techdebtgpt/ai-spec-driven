@@ -23,6 +23,9 @@ class JsonStore:
         self.tasks_file = self.root / "tasks.json"
         self.logs_file = self.root / "logs.json"
         self.index_file = self.root / "repository_index.json"
+        # Convenience export for the (potentially large) Serena semantic tree so it's easy
+        # to inspect in ~/.spec_agent without digging through repository_index.json.
+        self.serena_tree_file = self.root / "serena_semantic_tree.json"
         self._lock = Lock()
 
     # --- Task persistence -------------------------------------------------

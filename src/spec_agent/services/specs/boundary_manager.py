@@ -42,19 +42,24 @@ class BoundaryManager:
         for step in plan.steps:
             # TODO: Replace with real boundary detection from section 2.3
             if self._is_boundary_crossing(step):
-                if self.llm_client:
-                    try:
-                        LOG.info("Generating boundary spec using LLM for step: %s", step.description)
-                        spec = self._generate_spec_with_llm(plan.task_id, step)
-                        boundary_specs.append(spec)
-                    except Exception as exc:
-                        LOG.warning("LLM spec generation failed: %s, falling back to template", exc)
-                        boundary_specs.append(self._generate_spec_template(plan.task_id, step))
-                else:
-                    LOG.debug("No LLM client available, using template spec")
-                    boundary_specs.append(self._generate_spec_template(plan.task_id, step))
+                boundary_specs.append(self.generate_spec_for_step(plan.task_id, step))
 
         return boundary_specs
+
+    def generate_spec_for_step(self, task_id: str, step: PlanStep) -> BoundarySpec:
+        """
+        Generate (or regenerate) a boundary specification for a single plan step.
+        """
+        if self.llm_client:
+            try:
+                LOG.info("Generating boundary spec using LLM for step: %s", step.description)
+                return self._generate_spec_with_llm(task_id, step)
+            except Exception as exc:
+                LOG.warning("LLM spec generation failed: %s, falling back to template", exc)
+                return self._generate_spec_template(task_id, step)
+
+        LOG.debug("No LLM client available, using template spec")
+        return self._generate_spec_template(task_id, step)
 
     def _is_boundary_crossing(self, step: PlanStep) -> bool:
         """
@@ -93,6 +98,7 @@ class BoundaryManager:
             human_description=spec_data.get("human_description", ""),
             diagram_text=spec_data.get("diagram_text", ""),
             machine_spec=spec_data.get("machine_spec", {}),
+            plan_step=step.description,
         )
 
     def _create_system_prompt(self) -> str:
@@ -201,6 +207,6 @@ Focus on making the boundary maintainable and loosely coupled."""
                     "Changes to one component should not require changes to the other."
                 ],
             },
+            plan_step=step.description,
         )
-
 
