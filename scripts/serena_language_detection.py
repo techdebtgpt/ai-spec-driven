@@ -9,9 +9,11 @@ the repository structure and detect programming languages.
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -83,6 +85,89 @@ def _get_serena_mcp_command(repo_path: Path) -> list[str]:
     ]
 
 
+CODE_FILE_PATTERN = re.compile(
+    r"([A-Za-z0-9_\-./\\]+?\.(?:py|pyi|pyw|ts|tsx|js|jsx|mjs|c|cc|cpp|cxx|h|hpp|cs|java|go|rb|php|rs|swift|kt|kts|scala|tf|yaml|yml|json))"
+)
+
+
+def _module_name_from_path(path_str: str) -> str:
+    normalized = path_str.replace("\\", "/").lstrip("./")
+    if not normalized:
+        return "root"
+    parts = normalized.split("/")
+    if len(parts) > 1 and parts[0]:
+        return parts[0]
+    filename = Path(normalized).stem
+    return filename or normalized
+
+
+def _extract_paths_from_text(text: str) -> List[str]:
+    if not text:
+        return []
+    matches = CODE_FILE_PATTERN.findall(text)
+    paths: List[str] = []
+    for match in matches:
+        candidate = match.strip().strip("',.:()[]")
+        if not candidate:
+            continue
+        cleaned = candidate.replace("\\", "/")
+        if cleaned not in paths:
+            paths.append(cleaned)
+    return paths
+
+
+def _parse_symbol_names(text: str, max_symbols: int = 8) -> List[str]:
+    symbols: List[str] = []
+    if not text:
+        return symbols
+    for line in text.splitlines():
+        cleaned = line.strip(" -*\t")
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if any(keyword in lowered for keyword in ["error", "warning", "validation", "traceback"]):
+            continue
+        cleaned = cleaned.replace("()", "")
+        tokens = cleaned.replace(":", " ").split()
+        if not tokens:
+            continue
+        # Prefer tokens that resemble symbol identifiers
+        candidate = tokens[-1]
+        if candidate.lower() in {"class", "def", "function", "module", "namespace"} and len(tokens) > 1:
+            candidate = tokens[-2]
+        candidate = candidate.strip("{}()")
+        if not candidate:
+            continue
+        if candidate not in symbols:
+            symbols.append(candidate)
+        if len(symbols) >= max_symbols:
+            break
+    return symbols
+
+
+def _content_to_text(content: Optional[List]) -> str:
+    if not content:
+        return ""
+    chunks: List[str] = []
+    for item in content:
+        text = getattr(item, "text", None)
+        if text:
+            chunks.append(text)
+            continue
+        json_value = getattr(item, "json", None)
+        if json_value:
+            try:
+                chunks.append(json.dumps(json_value))
+                continue
+            except Exception:
+                pass
+        if hasattr(item, "type") and hasattr(item, "data"):
+            chunks.append(str(item.data))
+            continue
+        chunks.append(str(item))
+    return "\n".join(chunks)
+
+
 async def _detect_languages_async(repo_path: Path) -> Dict[str, any]:
     """
     Use Serena MCP tools to detect languages in the repository.
@@ -140,6 +225,8 @@ async def _detect_languages_async(repo_path: Path) -> Dict[str, any]:
                     "modules": [],
                     "namespaces": [],
                     "top_directories": [],
+                    "semantic_modules": [],
+                    "semantic_dependencies": [],
                 }
                 
                 # Try to get symbols overview which often includes language info
@@ -485,6 +572,146 @@ async def _detect_languages_async(repo_path: Path) -> Dict[str, any]:
                     except Exception as exc:
                         logger.warning(f"find_symbol for modules failed: {exc}")
                 
+                # Build semantic module summaries via get_symbols_overview
+                if "get_symbols_overview" in tools:
+                    candidate_files: List[str] = []
+
+                    async def _collect_candidate_files() -> List[str]:
+                        collected: List[str] = []
+                        if "find_file" in tools:
+                            search_patterns = [
+                                "*.py",
+                                "*.ts",
+                                "*.tsx",
+                                "*.js",
+                                "*.jsx",
+                                "*.cs",
+                                "*.java",
+                                "*.go",
+                                "*.rs",
+                            ]
+                            for pattern in search_patterns:
+                                if len(collected) >= 20:
+                                    break
+                                try:
+                                    result = await session.call_tool(
+                                        "find_file",
+                                        arguments={
+                                            "file_mask": pattern,
+                                            "relative_path": ".",
+                                        },
+                                    )
+                                    text = _content_to_text(result.content)
+                                    for path in _extract_paths_from_text(text):
+                                        if path not in collected:
+                                            collected.append(path)
+                                        if len(collected) >= 20:
+                                            break
+                                except Exception:
+                                    continue
+                        return collected
+
+                    candidate_files = await _collect_candidate_files()
+
+                    module_file_map: Dict[str, str] = {}
+                    for file_path in candidate_files:
+                        module_name = _module_name_from_path(file_path)
+                        if module_name in module_file_map:
+                            continue
+                        module_file_map[module_name] = file_path
+                        if len(module_file_map) >= 5:
+                            break
+
+                    semantic_modules: List[Dict[str, any]] = []
+                    dependency_tracker: Dict[str, set] = defaultdict(set)
+
+                    async def _collect_references(symbol_name: str, file_path: str) -> Dict[str, List[str]]:
+                        referencing_files: List[str] = []
+                        referencing_modules: List[str] = []
+                        if "find_referencing_symbols" not in tools:
+                            return {"files": referencing_files, "modules": referencing_modules}
+
+                        # Try with relative_path hint first, then without if it fails
+                        reference_args = [
+                            {"symbol_name": symbol_name, "relative_path": file_path},
+                            {"symbol_name": symbol_name},
+                        ]
+                        result = None
+                        for args in reference_args:
+                            try:
+                                result = await session.call_tool(
+                                    "find_referencing_symbols",
+                                    arguments=args,
+                                )
+                                break
+                            except Exception:
+                                result = None
+                                continue
+
+                        if not result:
+                            return {"files": referencing_files, "modules": referencing_modules}
+
+                        text = _content_to_text(result.content)
+                        referencing_files = _extract_paths_from_text(text)[:5]
+                        referenced_modules = []
+                        for ref_path in referencing_files:
+                            module = _module_name_from_path(ref_path)
+                            if module not in referenced_modules:
+                                referenced_modules.append(module)
+                        return {"files": referencing_files, "modules": referenced_modules}
+
+                    for module_name, file_path in module_file_map.items():
+                        try:
+                            overview_result = await session.call_tool(
+                                "get_symbols_overview",
+                                arguments={"relative_path": file_path},
+                            )
+                        except Exception as exc:
+                            logger.debug(f"get_symbols_overview failed for {file_path}: {exc}")
+                            continue
+
+                        overview_text = _content_to_text(overview_result.content)
+                        symbol_names = _parse_symbol_names(overview_text)
+                        module_entry = {
+                            "module": module_name,
+                            "file": file_path,
+                            "symbol_count": len(symbol_names),
+                            "top_symbols": [],
+                            "referenced_by_modules": [],
+                            "raw_overview": overview_text[:500] if overview_text else "",
+                        }
+
+                        referenced_accumulator: set = set()
+                        for symbol_name in symbol_names[:3]:
+                            symbol_info = {"symbol": symbol_name}
+                            references = await _collect_references(symbol_name, file_path)
+                            if references["files"]:
+                                symbol_info["referenced_by_files"] = references["files"]
+                            if references["modules"]:
+                                symbol_info["referenced_by_modules"] = references["modules"]
+                                for ref_module in references["modules"]:
+                                    referenced_accumulator.add(ref_module)
+                                    dependency_tracker[module_name].add(ref_module)
+                            module_entry["top_symbols"].append(symbol_info)
+
+                        if referenced_accumulator:
+                            module_entry["referenced_by_modules"] = sorted(referenced_accumulator)[:5]
+
+                        semantic_modules.append(module_entry)
+
+                    if semantic_modules:
+                        language_info["semantic_modules"] = semantic_modules
+                        dependencies_summary = []
+                        for module, refs in dependency_tracker.items():
+                            dependencies_summary.append(
+                                {
+                                    "module": module,
+                                    "referenced_by": sorted(refs)[:10],
+                                    "reference_count": len(refs),
+                                }
+                            )
+                        language_info["semantic_dependencies"] = dependencies_summary
+
                 total_time = time.time() - start_time
                 logger.info(f"Serena language detection completed in {total_time:.2f}s")
                 logger.info(f"Detected: {len(language_info.get('languages', []))} languages, {len(language_info.get('modules', []))} modules, {len(language_info.get('namespaces', []))} namespaces")

@@ -85,7 +85,7 @@ Focus on questions about:
 1. **Scope**: What's in/out of scope? Edge cases? Boundaries?
 2. **Technical Approach**: Preferred patterns, libraries, or existing code to follow?
 3. **Dependencies**: What systems, modules, or APIs are affected?
-4. **Testing**: What testing strategy? Which tests need updating?
+4. **Testing**: What testing strategy? Which tests need updating? (If no tests are detected in the repo, do NOT ask about tests unless the request explicitly mentions them.)
 5. **Risks**: Known constraints, performance concerns, or compatibility issues?
 
 Guidelines:
@@ -110,6 +110,7 @@ Do not include any explanatory text before or after the JSON."""
         # Extract context information
         languages = ""
         modules = ""
+        tests_str = "unknown"
 
         if context_summary:
             top_languages = context_summary.get("top_languages", [])
@@ -117,12 +118,14 @@ Do not include any explanatory text before or after the JSON."""
 
             top_modules = context_summary.get("top_modules", [])
             modules = ", ".join(top_modules[:5]) if top_modules else "not analyzed"
+            tests_str = "present" if bool(context_summary.get("has_tests", False)) else "not detected"
 
         return f"""Task Description: {description}
 
 Repository Context:
 - Languages: {languages}
 - Key Modules: {modules}
+- Tests: {tests_str}
 
 Generate clarifying questions that will help create a detailed, accurate implementation plan."""
 

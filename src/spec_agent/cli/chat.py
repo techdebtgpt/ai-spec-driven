@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import sys
 from enum import Enum
+import shlex
 from pathlib import Path
 from typing import Optional
+from threading import Lock, Thread
+from uuid import uuid4
 
 from prompt_toolkit import prompt as prompt_toolkit_prompt
 from prompt_toolkit.completion import PathCompleter
@@ -17,6 +20,90 @@ from ..workflow.orchestrator import TaskOrchestrator
 
 
 console = Console()
+
+
+def _infer_step_scenario(description: str, notes: Optional[str] = None, *, has_tests: bool = True) -> list[str]:
+    """
+    Create a small, human-readable Given/When/Then scenario for a plan step.
+
+    This is intentionally heuristic: it converts high-level plan text into a
+    quick "what success looks like" summary for senior engineers skimming.
+    """
+    desc = (description or "").strip()
+    if not desc:
+        return []
+
+    desc_l = desc.lower()
+    notes_clean = (notes or "").strip()
+
+    given = "Given the codebase is indexed and the current behavior is understood"
+
+    if desc_l.startswith("implement"):
+        when = f"When we {desc_l}"
+        then = "Then the new component exists and is ready to be integrated"
+    elif desc_l.startswith("update") or desc_l.startswith("refactor"):
+        when = f"When we {desc_l}"
+        then = "Then the existing flow uses the updated configuration path"
+    elif "test" in desc_l and has_tests:
+        when = f"When we {desc_l}"
+        then = "Then automated tests validate both happy-path and failure cases"
+    elif desc_l.startswith("document"):
+        when = f"When we {desc_l}"
+        then = "Then the team can maintain the setup confidently without tribal knowledge"
+    else:
+        when = f"When we {desc_l}"
+        then = "Then the change is implemented with clear acceptance criteria"
+
+    lines = [
+        f"Given: {given}",
+        f"When:  {when}",
+        f"Then:  {then}",
+    ]
+    if notes_clean:
+        lines.append(f"And:   {notes_clean}")
+    return lines
+
+
+def _format_plan_steps_human(steps: list[object], *, has_tests: bool = True) -> tuple[list[str], list[str]]:
+    """
+    Turn plan step payloads (dicts or strings) into:
+    - a readable step list
+    - a readable scenario list (Given/When/Then)
+    """
+    step_lines: list[str] = []
+    scenario_lines: list[str] = []
+
+    for idx, step in enumerate(steps or [], start=1):
+        if isinstance(step, dict):
+            description = (step.get("description") or "").strip()
+            target_files = step.get("target_files") or []
+            notes = step.get("notes")
+
+            step_lines.append(f"{idx}. {description or '(missing step description)'}")
+            if target_files:
+                step_lines.append(f"   Targets: {', '.join(str(t) for t in target_files)}")
+            if notes:
+                step_lines.append(f"   Notes: {notes}")
+
+            scenario = _infer_step_scenario(description, notes, has_tests=has_tests)
+            if scenario:
+                if scenario_lines:
+                    scenario_lines.append("")  # spacer between scenarios
+                scenario_lines.append(f"Step {idx}: {description or '(missing step description)'}")
+                for line in scenario:
+                    scenario_lines.append(f"- {line}")
+        else:
+            text = str(step)
+            step_lines.append(f"{idx}. {text}")
+            scenario = _infer_step_scenario(text, None, has_tests=has_tests)
+            if scenario:
+                if scenario_lines:
+                    scenario_lines.append("")
+                scenario_lines.append(f"Step {idx}: {text}")
+                for line in scenario:
+                    scenario_lines.append(f"- {line}")
+
+    return step_lines, scenario_lines
 
 
 class ConversationState(str, Enum):
@@ -45,6 +132,56 @@ class ChatSession:
         self.indexed_repo: Optional[Path] = None
         self.indexed_branch: str = "main"
         self.index_only: bool = False  # Track if we're just indexing vs starting a task
+        self._bg_lock = Lock()
+        self._bg_jobs: dict[str, dict] = {}
+
+    def _start_background_job(self, name: str, fn) -> str:
+        job_id = str(uuid4())
+        with self._bg_lock:
+            self._bg_jobs[job_id] = {
+                "name": name,
+                "status": "RUNNING",
+                "error": None,
+                "result": None,
+                "notified": False,
+            }
+
+        def runner() -> None:
+            try:
+                result = fn()
+                with self._bg_lock:
+                    self._bg_jobs[job_id]["status"] = "DONE"
+                    self._bg_jobs[job_id]["result"] = result
+            except Exception as exc:  # pragma: no cover
+                with self._bg_lock:
+                    self._bg_jobs[job_id]["status"] = "FAILED"
+                    self._bg_jobs[job_id]["error"] = str(exc)
+
+        Thread(target=runner, daemon=True).start()
+        return job_id
+
+    def _notify_background_jobs(self) -> None:
+        to_notify: list[dict] = []
+        with self._bg_lock:
+            for job in self._bg_jobs.values():
+                if job.get("notified"):
+                    continue
+                status = job.get("status")
+                if status in {"DONE", "FAILED"}:
+                    job["notified"] = True
+                    to_notify.append(dict(job))
+
+        for job in to_notify:
+            name = job.get("name") or "job"
+            if job.get("status") == "DONE":
+                console.print(f"[green]✓ Background job finished:[/] {name}")
+            else:
+                err = job.get("error") or "unknown error"
+                console.print(f"[red]✗ Background job failed:[/] {name} ({err})")
+
+    def _show_cli_command(self, command: str) -> None:
+        """Mirror the CLI command that corresponds to the current action."""
+        console.print(f"[dim]→ Running:[/] [bold]{command}[/]")
 
     def run(self) -> None:
         """Main conversation loop."""
@@ -52,6 +189,8 @@ class ChatSession:
 
         while self.state != ConversationState.EXITING:
             try:
+                # Surface any background job completions between steps.
+                self._notify_background_jobs()
                 if self.state == ConversationState.MAIN_MENU:
                     self._handle_main_menu()
                 elif self.state == ConversationState.INDEXING:
@@ -165,7 +304,12 @@ class ChatSession:
         # Ask for branch
         branch = Prompt.ask("Branch", default="main")
 
-        # Index the repository
+        # Show equivalent CLI command and index the repository
+        command = f"./spec-agent index {shlex.quote(str(repo_path))}"
+        if branch != "main":
+            command += f" --branch {shlex.quote(branch)}"
+        self._show_cli_command(command)
+
         console.print()
         console.print("[yellow]Indexing repository...[/]")
 
@@ -272,6 +416,15 @@ class ChatSession:
             else:
                 console.print("[dim]Basic language detection (Serena not enabled)[/]")
 
+            # Optional: run the expensive Serena semantic tree export in the background
+            if Confirm.ask("Export Serena semantic tree in background? (slow)", default=False):
+                console.print("[dim]Starting background export. You can continue using chat.[/]")
+
+                def _job():
+                    return self.orchestrator.enrich_repository_index_with_serena_semantic_tree(repo_path)
+
+                self._start_background_job("Serena semantic tree export", _job)
+
             self.indexed_repo = repo_path
             self.indexed_branch = branch
 
@@ -302,16 +455,22 @@ class ChatSession:
             console.print("[yellow]Description cannot be empty.[/]")
             return
 
-        # Create the task
+        if not self.indexed_repo:
+            console.print("[red]Please index a repository before creating a task.[/]")
+            self.state = ConversationState.MAIN_MENU
+            return
+
+        command = f"./spec-agent start --description {shlex.quote(description)}"
+        self._show_cli_command(command)
+
+        # Create the task using the indexed repository metadata
         console.print()
         console.print("[yellow]Creating task...[/]")
 
         try:
-            self.current_task = self.orchestrator.create_task(
-                repo_path=self.indexed_repo,
-                branch=self.indexed_branch,
-                description=description
-            )
+            self.current_task = self.orchestrator.create_task_from_index(description=description)
+            self.indexed_repo = self.current_task.repo_path
+            self.indexed_branch = self.current_task.branch
 
             console.print(f"[green]✓[/] Task created: [cyan]{self.current_task.id}[/]")
             self.state = ConversationState.CLARIFYING
@@ -325,6 +484,9 @@ class ChatSession:
         if not self.current_task:
             self.state = ConversationState.MAIN_MENU
             return
+
+        # Reload task to pick up any auto-resets (e.g. description changed in tasks.json)
+        self.current_task = self.orchestrator._get_task(self.current_task.id)
 
         clarifications = self.current_task.metadata.get("clarifications", [])
 
@@ -379,6 +541,9 @@ class ChatSession:
             self.state = ConversationState.MAIN_MENU
             return
 
+        # Reload task to ensure metadata matches current description/clarifications
+        self.current_task = self.orchestrator._get_task(self.current_task.id)
+
         console.print()
         console.print("[yellow]Generating implementation plan...[/]")
 
@@ -401,6 +566,9 @@ class ChatSession:
             self.state = ConversationState.MAIN_MENU
             return
 
+        # Reload in case plan/spec metadata was regenerated elsewhere
+        self.current_task = self.orchestrator._get_task(self.current_task.id)
+
         plan_preview = self.current_task.metadata.get("plan_preview", {})
         steps = plan_preview.get("steps", [])
         risks = plan_preview.get("risks", [])
@@ -409,13 +577,27 @@ class ChatSession:
         # Display steps (disable markup to avoid conflicts with LLM-generated content)
         if steps:
             console.print()
-            # Use markup=False to prevent Rich from parsing brackets in plan steps
-            step_text = "\n".join(f"{i}. {step}" for i, step in enumerate(steps, 1))
+            has_tests = bool((self.current_task.metadata.get("repository_summary") or {}).get("has_tests", False))
+            step_lines, scenario_lines = _format_plan_steps_human(steps, has_tests=has_tests)
+            step_text = "\n".join(step_lines) if step_lines else ""
             console.print(Panel.fit(
                 step_text,
                 title="Implementation Plan",
                 border_style="blue"
             ), markup=False)
+
+            if scenario_lines:
+                console.print()
+                console.print(
+                    Panel.fit(
+                        "\n".join(scenario_lines),
+                        title="Scenarios (Given / When / Then)",
+                        border_style="blue",
+                    ),
+                    markup=False,
+                )
+            if not has_tests:
+                console.print("[dim]No automated tests detected in this repository. Consider adding them later.[/]")
         else:
             console.print()
             console.print("[yellow]No plan steps generated.[/]")
@@ -444,8 +626,88 @@ class ChatSession:
             console.print()
             # Escape spec names to avoid Rich markup conflicts
             spec_names = ', '.join(s.get('boundary_name', 'Unknown') for s in specs)
-            console.print(f"[dim]Note: {len(specs)} boundary specification(s) identified[/]")
-            console.print(f"[dim]  → {spec_names}[/]", markup=False)
+            console.print(
+                f"Note: {len(specs)} boundary specification(s) identified",
+                style="dim",
+            )
+            console.print(f"  → {spec_names}", style="dim")
+
+        # Show scoped/bounded impact if available (post-clarifications indexing)
+        bounded_context = self.current_task.metadata.get("bounded_context", {}) or {}
+        bounded = bounded_context.get("manual") or bounded_context.get("plan_targets")
+        if bounded:
+            console.print()
+            aggregate = bounded.get("aggregate", {}) if isinstance(bounded, dict) else {}
+            impact = bounded.get("impact", {}) if isinstance(bounded, dict) else {}
+            resolution = bounded.get("plan_targets_resolution") if isinstance(bounded, dict) else None
+
+            scope_lines = [
+                f"Files: {aggregate.get('file_count', 0)}",
+                f"Size: {aggregate.get('total_size_bytes', 0)} bytes",
+                f"Languages: {', '.join(aggregate.get('top_languages', [])) or 'unknown'}",
+            ]
+            console.print(
+                Panel.fit(
+                    "\n".join(scope_lines),
+                    title="Scoped Context (Bounded Index)",
+                    border_style="magenta",
+                ),
+                markup=False,
+            )
+
+            # If we have an empty scope, explain why (plan targets are logical module names).
+            if aggregate.get("file_count", 0) == 0 and isinstance(resolution, dict):
+                raw_targets = resolution.get("raw_targets") or []
+                resolved_targets = resolution.get("resolved_targets") or []
+                unresolved_targets = resolution.get("unresolved_targets") or []
+
+                explain_lines = [
+                    "This scoped index is empty because plan targets are module labels (e.g. 'Api', 'Data')",
+                    "and don't necessarily correspond to real directories/files under the indexed repo path.",
+                ]
+                if raw_targets:
+                    explain_lines.append("")
+                    explain_lines.append(f"Plan targets: {', '.join(str(t) for t in raw_targets[:12])}{' ...' if len(raw_targets) > 12 else ''}")
+                if resolved_targets:
+                    explain_lines.append(f"Resolved to paths: {', '.join(str(t) for t in resolved_targets[:12])}{' ...' if len(resolved_targets) > 12 else ''}")
+                if unresolved_targets:
+                    explain_lines.append(f"Unresolved: {', '.join(str(t) for t in unresolved_targets[:12])}{' ...' if len(unresolved_targets) > 12 else ''}")
+                    explain_lines.append("")
+                    explain_lines.append("Tip: run a bounded index on real paths (directories/files) you care about.")
+                    explain_lines.append(f"Example: ./spec-agent bounded-index {self.current_task.id} <path1> <path2>")
+
+                console.print(
+                    Panel.fit(
+                        "\n".join(explain_lines),
+                        title="Why Files=0",
+                        border_style="yellow",
+                    ),
+                    markup=False,
+                )
+
+            impact_lines = []
+            top_dirs = impact.get("top_directories") or []
+            namespaces = impact.get("namespaces") or []
+            files_sample = impact.get("files_sample") or []
+            if top_dirs:
+                impact_lines.append(f"Top directories: {', '.join(top_dirs[:10])}")
+            if namespaces:
+                impact_lines.append(f"Namespaces: {', '.join(namespaces[:10])}")
+            if files_sample:
+                impact_lines.append("")
+                impact_lines.append("Impacted files (sample):")
+                for p in files_sample[:12]:
+                    impact_lines.append(f"- {p}")
+
+            if impact_lines:
+                console.print(
+                    Panel.fit(
+                        "\n".join(impact_lines),
+                        title="Impacted Modules / Files (Scoped)",
+                        border_style="magenta",
+                    ),
+                    markup=False,
+                )
 
         console.print()
         console.print("[bold]Plan Approval[/]")
@@ -466,11 +728,19 @@ class ChatSession:
 
                 # Generate patches and test suggestions after plan approval
                 console.print()
-                console.print("[cyan]Generating patches and test suggestions...[/]")
+                has_tests = bool((self.current_task.metadata.get("repository_summary") or {}).get("has_tests", False))
+                if has_tests:
+                    console.print("[cyan]Generating patches and test suggestions...[/]")
+                else:
+                    console.print("[cyan]Generating patches...[/]")
                 patch_result = self.orchestrator.generate_patches(self.current_task.id)
                 patch_count = patch_result.get("patch_count", 0)
                 test_count = patch_result.get("test_count", 0)
-                console.print(f"[green]✓[/] Generated {patch_count} patch(es) and {test_count} test suggestion(s)")
+                tests_skipped_reason = patch_result.get("tests_skipped_reason")
+                if tests_skipped_reason:
+                    console.print(f"[green]✓[/] Generated {patch_count} patch(es); test suggestions skipped ({tests_skipped_reason})")
+                else:
+                    console.print(f"[green]✓[/] Generated {patch_count} patch(es) and {test_count} test suggestion(s)")
 
                 # Reload task to get updated metadata with patches
                 self.current_task = self.orchestrator._get_task(self.current_task.id)
@@ -479,9 +749,24 @@ class ChatSession:
             except Exception as exc:
                 console.print(f"[red]Error approving plan: {exc}[/]")
         elif choice == "2":
-            # Reject and regenerate
-            console.print("[yellow]Regenerating plan...[/]")
-            self.state = ConversationState.PLANNING
+            # Reject: route back through clarifications so we can tighten requirements,
+            # then regenerate the plan with better inputs.
+            console.print()
+            console.print("[bold yellow]Plan rejected[/]")
+            feedback = Prompt.ask(
+                "What is missing/incorrect? (This will be used to generate clarifying questions)",
+                default="",
+            )
+            try:
+                self.orchestrator.restart_clarifications(self.current_task.id, reason=feedback)
+                # Reload to get the newly generated clarifications
+                self.current_task = self.orchestrator._get_task(self.current_task.id)
+                console.print("[cyan]Returning to clarifying questions...[/]")
+                self.state = ConversationState.CLARIFYING
+            except Exception as exc:
+                console.print(f"[red]Failed to restart clarifications: {exc}[/]")
+                console.print("[yellow]Falling back to plan regeneration...[/]")
+                self.state = ConversationState.PLANNING
         elif choice == "3":
             # Show spec details but don't require approval
             self._show_spec_details()
@@ -656,6 +941,20 @@ class ChatSession:
                 self.current_task = tasks[idx]
                 self.indexed_repo = self.current_task.repo_path
                 self.indexed_branch = self.current_task.branch
+
+                # Optional: allow updating the description when resuming.
+                if Confirm.ask("Update task description before continuing?", default=False):
+                    new_desc = Prompt.ask("New description", default=self.current_task.description).strip()
+                    if new_desc and new_desc != self.current_task.description:
+                        self.current_task = self.orchestrator.update_task_description(
+                            self.current_task.id,
+                            new_desc,
+                            reason="Updated during interactive resume",
+                            reset_metadata=True,
+                        )
+
+                # Reload to pick up any auto-resets (e.g. tasks.json description edits)
+                self.current_task = self.orchestrator._get_task(self.current_task.id)
 
                 # Determine state based on task status
                 if self.current_task.status == TaskStatus.CLARIFYING:

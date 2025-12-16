@@ -5,13 +5,16 @@ import sys
 from dataclasses import asdict
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 from datetime import datetime
+import json
 
 from ..config.settings import AgentSettings, get_settings
 from ..domain.models import (
     BoundarySpec,
+    BoundarySpecStatus,
+    ClarificationStatus,
     Patch,
     PatchKind,
     PatchStatus,
@@ -68,7 +71,12 @@ class TaskOrchestrator:
         self.test_suggester = TestSuggester(llm_client=self.llm_client)
 
     # ------------------------------------------------------------------ Tasks
-    def index_repository(self, repo_path: Path, branch: str) -> Dict:
+    def index_repository(
+        self,
+        repo_path: Path,
+        branch: str,
+        include_serena_semantic_tree: bool = False,
+    ) -> Dict:
         """
         Index a repository and save the context for later use.
         
@@ -79,8 +87,11 @@ class TaskOrchestrator:
         if not repo_path.exists():
             raise FileNotFoundError(f"Repository not found: {repo_path}")
 
-        sys.stderr.write(f"Analyzing repository structure...\n")
-        summary = self.context_indexer.summarize_repository(repo_path.resolve())
+        sys.stderr.write("Analyzing repository structure...\n")
+        summary = self.context_indexer.summarize_repository(
+            repo_path.resolve(),
+            include_serena_semantic_tree=include_serena_semantic_tree,
+        )
         
         # Get comprehensive git information
         git_info = {}
@@ -119,6 +130,13 @@ class TaskOrchestrator:
         }
 
         self.store.save_repository_index(index_data)
+        # Also export the semantic tree as a standalone file for easy inspection.
+        try:
+            tree_payload = (summary or {}).get("serena_semantic_tree") if isinstance(summary, dict) else None
+            if tree_payload is not None:
+                self.store.serena_tree_file.write_text(json.dumps(tree_payload, indent=2, default=str))
+        except Exception:  # pragma: no cover - best-effort export
+            LOG.debug("Failed to write serena_semantic_tree.json", exc_info=True)
         self.logger.record(
             "SYSTEM",
             "REPOSITORY_INDEXED",
@@ -126,6 +144,63 @@ class TaskOrchestrator:
         )
 
         return index_data
+
+    def enrich_repository_index_with_serena_semantic_tree(
+        self,
+        repo_path: Path,
+        *,
+        targets: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Add (or refresh) the Serena semantic tree inside the saved repository index.
+
+        This is useful when you want to keep chat responsive: run a normal index first,
+        then run this slower Serena export in the background and persist it.
+        """
+        index_data = self.store.load_repository_index()
+
+        indexed_repo = Path(index_data.get("repo_path", "")).resolve() if index_data.get("repo_path") else None
+        requested_repo = repo_path.resolve()
+        if indexed_repo and indexed_repo != requested_repo:
+            raise ValueError(
+                f"Repository index is for {indexed_repo}, but enrichment requested for {requested_repo}. "
+                "Re-run index for the target repo first."
+            )
+
+        summary = index_data.get("repository_summary") or {}
+        if not isinstance(summary, dict):
+            summary = {}
+
+        tree_payload = self.context_indexer._export_semantic_tree_with_serena(
+            requested_repo,
+            targets=targets,
+        )
+
+        summary["serena_semantic_tree"] = tree_payload
+        index_data["repository_summary"] = summary
+        index_data["indexed_at"] = datetime.now().isoformat()
+
+        self.store.save_repository_index(index_data)
+        # Standalone convenience file in ~/.spec_agent/
+        try:
+            self.store.serena_tree_file.write_text(json.dumps(tree_payload, indent=2, default=str))
+        except Exception:  # pragma: no cover
+            LOG.debug("Failed to write serena_semantic_tree.json", exc_info=True)
+        self.logger.record(
+            "SYSTEM",
+            "REPOSITORY_INDEX_ENRICHED_SERENA_TREE",
+            {
+                "repo_path": str(requested_repo),
+                "has_tree": bool(tree_payload),
+                "targets": list(targets or []),
+            },
+        )
+
+        return {
+            "repo_path": str(requested_repo),
+            "targets": list(targets or []),
+            "serena_semantic_tree": tree_payload,
+        }
 
     def create_task_from_index(self, description: str) -> Task:
         """
@@ -147,6 +222,7 @@ class TaskOrchestrator:
         # Use the pre-computed summary from the index
         task.metadata["repository_summary"] = index_data["repository_summary"]
         task.metadata["starting_commit"] = index_data.get("starting_commit")
+        task.metadata["description_snapshot"] = task.description
 
         # Generate clarifications based on the task description
         clarifications = self.clarifier.generate_questions(
@@ -159,6 +235,7 @@ class TaskOrchestrator:
         # Snapshot the current worktree status
         self._snapshot_worktree_status(task)
 
+        self._seed_context_from_description(task)
         self.store.upsert_task(task)
         self.logger.record(
             task.id,
@@ -190,8 +267,10 @@ class TaskOrchestrator:
         task.metadata["repository_summary"] = summary
         task.metadata["clarifications"] = [asdict(item) for item in clarifications]
         task.metadata["starting_commit"] = self._current_commit(task.repo_path)
+        task.metadata["description_snapshot"] = task.description
         self._snapshot_worktree_status(task)
 
+        self._seed_context_from_description(task)
         self.store.upsert_task(task)
         self.logger.record(task.id, "TASK_CREATED", {"summary": summary, "clarifications": task.metadata["clarifications"]})
 
@@ -204,17 +283,623 @@ class TaskOrchestrator:
         tasks.sort(key=lambda t: t.created_at)
         return tasks
 
+    def _seed_context_from_description(self, task: Task) -> None:
+        """
+        Seed the context history with modules referenced in the task description.
+        """
+        summary = task.metadata.get("repository_summary", {})
+        top_modules = summary.get("top_modules", [])
+        if not top_modules:
+            return
+
+        description_lower = task.description.lower()
+        candidates: List[Path] = []
+        for entry in top_modules:
+            module_name = entry.split(" ")[0].rstrip("/").strip()
+            if not module_name:
+                continue
+            if module_name.lower() in description_lower:
+                candidate = (task.repo_path / module_name).resolve()
+                if candidate.exists():
+                    candidates.append(candidate)
+
+        if candidates:
+            self._record_context_step(
+                task,
+                "task-description",
+                included=candidates,
+                note="Auto-detected modules mentioned in description",
+            )
+
+    def get_cached_repository_index(self) -> Dict[str, Any]:
+        """
+        Return the most recent repository index payload saved by the index command.
+        """
+        return self.store.load_repository_index()
+
+    def list_clarifications(self, task_id: str) -> List[Dict[str, Any]]:
+        task = self._get_task(task_id)
+        return task.metadata.get("clarifications", [])
+
+    def has_pending_clarifications(self, task_id: str) -> bool:
+        task = self._get_task(task_id)
+        clarifications = task.metadata.get("clarifications", [])
+        for item in clarifications:
+            status = item.get("status") or ClarificationStatus.PENDING.value
+            if status == ClarificationStatus.PENDING.value:
+                return True
+        return False
+
+    def update_clarification(
+        self,
+        task_id: str,
+        clarification_id: str,
+        answer: Optional[str],
+        status: ClarificationStatus,
+    ) -> Dict[str, Any]:
+        task = self._get_task(task_id)
+        clarifications = task.metadata.get("clarifications", [])
+        found = None
+        for item in clarifications:
+            if item.get("id") == clarification_id:
+                item["status"] = status.value
+                if answer is not None:
+                    item["answer"] = answer
+                found = item
+                break
+
+        if not found:
+            raise ValueError(f"Clarification {clarification_id} not found for task {task_id}")
+
+        task.metadata["clarifications"] = clarifications
+        task.touch()
+        self.store.upsert_task(task)
+        self.logger.record(
+            task.id,
+            "CLARIFICATION_UPDATED",
+            {"clarification_id": clarification_id, "status": status.value, "answer": answer or ""},
+        )
+        return found
+
+    def restart_clarifications(self, task_id: str, *, reason: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Restart clarifications for a task.
+
+        Intended for use when an engineer rejects a plan due to unclear or missing requirements.
+        We generate a fresh set of questions (LLM-powered when available; heuristic fallback otherwise),
+        preserve the previous clarification set in history, reset plan artifacts, and move the task
+        back to CLARIFYING.
+        """
+        task = self._get_task(task_id)
+
+        # Preserve prior clarifications for traceability.
+        history = task.metadata.get("clarifications_history") or []
+        if not isinstance(history, list):
+            history = []
+        previous = task.metadata.get("clarifications", []) or []
+        history.append(
+            {
+                "timestamp": datetime.now().isoformat(),
+                "reason": (reason or "").strip(),
+                "clarifications": previous,
+            }
+        )
+        task.metadata["clarifications_history"] = history
+
+        # Use the repo index summary when available to produce better questions.
+        context_summary = (
+            (task.metadata.get("repository_summary") or {})
+            if isinstance(task.metadata.get("repository_summary"), dict)
+            else None
+        )
+
+        augmented_description = task.description.strip()
+        if reason and reason.strip():
+            augmented_description = f"{augmented_description}\n\nPlan rejected feedback:\n- {reason.strip()}"
+
+        new_items = self.clarifier.generate_questions(
+            task_id,
+            augmented_description,
+            context_summary=context_summary,
+        )
+        task.metadata["clarifications"] = [asdict(item) for item in new_items]
+
+        # Reset downstream artifacts so the next plan is generated from the clarified inputs.
+        self._reset_task_artifacts(task)
+
+        task.status = TaskStatus.CLARIFYING
+        task.touch()
+        self.store.upsert_task(task)
+        self.logger.record(
+            task.id,
+            "CLARIFICATIONS_RESTARTED",
+            {
+                "reason": (reason or "").strip(),
+                "question_count": len(new_items),
+            },
+        )
+        return task.metadata.get("clarifications", [])
+
+    def update_task_description(
+        self,
+        task_id: str,
+        description: str,
+        *,
+        reason: Optional[str] = None,
+        reset_metadata: bool = True,
+    ) -> Task:
+        """
+        Update a task description safely.
+
+        If reset_metadata is True, we treat this as a new task intent and regenerate
+        clarifications, clear downstream artifacts (plan/specs/patches/bounded context),
+        and move the task back to CLARIFYING.
+
+        This is also used internally when we detect the description was edited directly
+        in tasks.json.
+        """
+        task = self._get_task(task_id, _skip_description_guard=True)
+        new_desc = (description or "").strip()
+        if not new_desc:
+            raise ValueError("Task description cannot be empty.")
+
+        old_desc = (task.description or "").strip()
+        if old_desc == new_desc:
+            # Still update snapshot for consistency if it's missing.
+            if (task.metadata.get("description_snapshot") or "").strip() != new_desc:
+                task.metadata["description_snapshot"] = new_desc
+                task.touch()
+                self.store.upsert_task(task)
+            return task
+
+        history = task.metadata.get("description_history") or []
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "timestamp": datetime.now().isoformat(),
+                "from": old_desc,
+                "to": new_desc,
+                "reason": (reason or "").strip(),
+            }
+        )
+        task.metadata["description_history"] = history
+
+        task.description = new_desc
+        task.metadata["description_snapshot"] = new_desc
+
+        if reset_metadata:
+            self._preserve_clarifications_history(task, reason=reason or "Task description changed")
+
+            context_summary = (
+                (task.metadata.get("repository_summary") or {})
+                if isinstance(task.metadata.get("repository_summary"), dict)
+                else None
+            )
+            new_items = self.clarifier.generate_questions(
+                task_id,
+                new_desc,
+                context_summary=context_summary,
+            )
+            task.metadata["clarifications"] = [asdict(item) for item in new_items]
+
+            self._reset_task_artifacts(task, reset_context_steps=True)
+            task.status = TaskStatus.CLARIFYING
+            task.touch()
+            self.store.upsert_task(task)
+
+            # Re-seed context based on the new description (after clearing history).
+            self._seed_context_from_description(task)
+
+            self.logger.record(
+                task.id,
+                "TASK_DESCRIPTION_UPDATED_RESET",
+                {
+                    "reason": (reason or "").strip(),
+                    "old_description": old_desc,
+                    "new_description": new_desc,
+                    "question_count": len(new_items),
+                },
+            )
+        else:
+            task.touch()
+            self.store.upsert_task(task)
+            self.logger.record(
+                task.id,
+                "TASK_DESCRIPTION_UPDATED",
+                {"reason": (reason or "").strip(), "old_description": old_desc, "new_description": new_desc},
+            )
+
+        return task
+
+    def get_context_history(self, task_id: str) -> List[Dict[str, Any]]:
+        task = self._get_task(task_id)
+        return task.metadata.get("context_steps", [])
+
+    def update_context(
+        self,
+        task_id: str,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+        trigger: str = "manual-context-update",
+        note: Optional[str] = None,
+        summarize: bool = True,
+    ) -> Dict[str, Any]:
+        task = self._get_task(task_id)
+        include_paths = self._normalize_paths(task.repo_path, include or [])
+        exclude_paths = self._normalize_paths(task.repo_path, exclude or [])
+        step = self._record_context_step(task, trigger, include_paths, exclude_paths, note=note)
+
+        summary = None
+        if summarize and include_paths:
+            target_args = [
+                str(path.relative_to(task.repo_path))
+                if path.is_relative_to(task.repo_path)
+                else str(path)
+                for path in include_paths
+            ]
+            summary = self.context_indexer.summarize_targets(task.repo_path, target_args)
+
+        return {"step": step, "summary": summary}
+
     # ------------------------------------------------------------------ Planning
+    @staticmethod
+    def _collect_directory_candidates_from_summary(summary: Dict[str, Any]) -> List[str]:
+        """
+        Extract directory paths (relative, POSIX) from the indexed directory tree.
+
+        This is intentionally shallow (whatever the index stored) to avoid rescanning
+        large repos during planning.
+        """
+        root = summary.get("directory_structure")
+        if not isinstance(root, dict):
+            return []
+
+        results: List[str] = []
+
+        def walk(node: Dict[str, Any]) -> None:
+            if not isinstance(node, dict):
+                return
+            if node.get("type") == "directory":
+                rel = str(node.get("path") or "").replace("\\", "/")
+                if rel and rel != ".":
+                    results.append(rel)
+            for child in (node.get("children") or []):
+                if isinstance(child, dict):
+                    walk(child)
+
+        walk(root)
+        # Prefer stable order for debugging and deterministic tests.
+        return sorted(set(results), key=lambda p: (p.count("/"), len(p), p))
+
+    def _resolve_plan_targets_to_paths(
+        self,
+        repo_path: Path,
+        raw_targets: List[str],
+        summary: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Convert plan "target_modules" (often logical names like 'Api', 'Data', 'Pbp.Payments')
+        into real filesystem paths for bounded indexing (best-effort).
+
+        Strategy:
+        - If raw target already exists as a path under repo_path, keep it.
+        - Otherwise, try namespace → path mapping (dots to slashes).
+        - Otherwise, fuzzy match against indexed directory names (from directory_structure).
+        """
+        repo_path = repo_path.resolve()
+        directory_candidates = self._collect_directory_candidates_from_summary(summary)
+        # Fallback if index didn't include a tree (or was produced by older versions).
+        if not directory_candidates:
+            try:
+                directory_candidates = sorted(
+                    {p.name for p in repo_path.iterdir() if p.is_dir()},
+                    key=lambda p: (len(p), p),
+                )
+            except OSError:
+                directory_candidates = []
+
+        resolved: List[str] = []
+        unresolved: List[str] = []
+        matches: Dict[str, List[str]] = {}
+
+        def norm_token(value: str) -> str:
+            return (
+                (value or "")
+                .strip()
+                .strip("/")
+                .strip("\\")
+                .replace("\\", "/")
+            )
+
+        def fuzzy_key(value: str) -> str:
+            return (
+                value.lower()
+                .replace("-", "")
+                .replace("_", "")
+                .replace(".", "")
+                .replace("/", "")
+                .strip()
+            )
+
+        # Precompute candidate name map for faster matching.
+        candidate_names = []
+        for cand in directory_candidates:
+            cand_rel = norm_token(cand)
+            cand_name = cand_rel.rsplit("/", 1)[-1]
+            candidate_names.append((cand_rel, cand_name, fuzzy_key(cand_name)))
+
+        def _repo_seems_terraform(summary_payload: Dict[str, Any]) -> bool:
+            # Summary values can vary (strings like ".tf (123)" / "Terraform", etc.).
+            frameworks = summary_payload.get("frameworks") or []
+            if any(str(f).lower() == "terraform" for f in frameworks):
+                return True
+            top_langs = summary_payload.get("top_languages") or []
+            if any("terraform" in str(x).lower() for x in top_langs):
+                return True
+            exts = summary_payload.get("top_file_extensions") or []
+            if any(".tf" in str(x).lower() for x in exts):
+                return True
+            return False
+
+        repo_is_terraform = _repo_seems_terraform(summary or {})
+
+        def default_terraform_paths() -> List[str]:
+            """
+            When the repo is clearly Terraform-heavy but plan targets are generic labels,
+            pick a small, high-signal set of Terraform/IAM files for bounded indexing.
+            """
+            hits: List[str] = []
+
+            def add_if_exists(p: Path) -> None:
+                if not p.exists():
+                    return
+                try:
+                    rel = str(p.relative_to(repo_path)).replace("\\", "/")
+                except ValueError:
+                    rel = str(p).replace("\\", "/")
+                if rel and rel not in hits:
+                    hits.append(rel)
+
+            for fname in (
+                "main.tf",
+                "variables.tf",
+                "outputs.tf",
+                "providers.tf",
+                "provider.tf",
+                "versions.tf",
+                "locals.tf",
+            ):
+                add_if_exists(repo_path / fname)
+
+            # Common infra directories
+            for dname in ("modules", "terraform", "infra", "infrastructure", "iam"):
+                add_if_exists(repo_path / dname)
+
+            # If nothing obvious exists, sample a few *.tf files.
+            if not hits:
+                tf_files: List[Path] = []
+                try:
+                    for p in repo_path.rglob("*.tf"):
+                        if ".git" in p.parts or ".terraform" in p.parts:
+                            continue
+                        tf_files.append(p)
+                        if len(tf_files) >= 30:
+                            break
+                except OSError:
+                    tf_files = []
+                tf_files = sorted(tf_files, key=lambda p: (len(p.parts), len(str(p))))
+                for p in tf_files[:12]:
+                    add_if_exists(p)
+
+            # Add IAM-y terraform files if present
+            iam_files: List[Path] = []
+            try:
+                for p in repo_path.rglob("*iam*.tf"):
+                    if ".git" in p.parts or ".terraform" in p.parts:
+                        continue
+                    iam_files.append(p)
+                    if len(iam_files) >= 20:
+                        break
+            except OSError:
+                iam_files = []
+            iam_files = sorted(iam_files, key=lambda p: (len(p.parts), len(str(p))))
+            for p in iam_files[:10]:
+                add_if_exists(p)
+
+            return hits[:12]
+
+        def heuristic_matches(target: str) -> List[str]:
+            """
+            Best-effort mapping from logical labels (e.g. "Terraform Configuration")
+            to real filesystem paths (e.g. main.tf, variables.tf, iam/*.tf).
+            """
+            t_lower = (target or "").lower()
+            hits: List[str] = []
+
+            def add_if_exists(p: Path) -> None:
+                if not p.exists():
+                    return
+                try:
+                    rel = str(p.relative_to(repo_path)).replace("\\", "/")
+                except ValueError:
+                    rel = str(p).replace("\\", "/")
+                if rel and rel not in hits:
+                    hits.append(rel)
+
+            is_terraformish = any(k in t_lower for k in ("terraform", "iac", "infra", "infrastructure", "hcl", ".tf"))
+            is_iamish = ("iam" in t_lower) or ("role" in t_lower)
+
+            if is_terraformish:
+                for fname in (
+                    "main.tf",
+                    "variables.tf",
+                    "outputs.tf",
+                    "providers.tf",
+                    "provider.tf",
+                    "versions.tf",
+                    "locals.tf",
+                ):
+                    add_if_exists(repo_path / fname)
+                for dname in ("terraform", "infra", "infrastructure", "modules"):
+                    add_if_exists(repo_path / dname)
+
+                # Fallback: include a small sample of *.tf if nothing obvious exists.
+                if not hits:
+                    tf_files: List[Path] = []
+                    try:
+                        for p in repo_path.rglob("*.tf"):
+                            if ".git" in p.parts or ".terraform" in p.parts:
+                                continue
+                            tf_files.append(p)
+                            if len(tf_files) >= 24:
+                                break
+                    except OSError:
+                        tf_files = []
+                    tf_files = sorted(tf_files, key=lambda p: (len(p.parts), len(str(p))))
+                    for p in tf_files[:10]:
+                        add_if_exists(p)
+
+            if is_iamish:
+                add_if_exists(repo_path / "iam")
+                iam_files: List[Path] = []
+                try:
+                    for p in repo_path.rglob("*iam*.tf"):
+                        if ".git" in p.parts or ".terraform" in p.parts:
+                            continue
+                        iam_files.append(p)
+                        if len(iam_files) >= 20:
+                            break
+                except OSError:
+                    iam_files = []
+                iam_files = sorted(iam_files, key=lambda p: (len(p.parts), len(str(p))))
+                for p in iam_files[:10]:
+                    add_if_exists(p)
+
+            return hits[:12]
+
+        for raw in raw_targets or []:
+            t = norm_token(str(raw))
+            if not t:
+                continue
+
+            local_matches: List[str] = []
+
+            # 1) Direct path match
+            direct = (repo_path / t).resolve()
+            if direct.exists():
+                try:
+                    local_matches.append(str(direct.relative_to(repo_path)).replace("\\", "/"))
+                except ValueError:
+                    local_matches.append(str(direct).replace("\\", "/"))
+
+            # 2) Namespace path mapping (Pbp.Payments.Auth -> Pbp/Payments/Auth)
+            if not local_matches and "." in t and "/" not in t:
+                ns_candidate = t.replace(".", "/")
+                ns_path = (repo_path / ns_candidate).resolve()
+                if ns_path.exists():
+                    try:
+                        local_matches.append(str(ns_path.relative_to(repo_path)).replace("\\", "/"))
+                    except ValueError:
+                        local_matches.append(str(ns_path).replace("\\", "/"))
+
+            # 3) Fuzzy directory matching by name
+            if not local_matches and directory_candidates:
+                t_key = fuzzy_key(t)
+                last_segment = t.split(".")[-1] if "." in t else t
+                last_key = fuzzy_key(last_segment)
+                for cand_rel, cand_name, cand_key in candidate_names:
+                    if not cand_rel:
+                        continue
+                    # Exact-ish
+                    if cand_name.lower() == t.lower():
+                        local_matches.append(cand_rel)
+                        continue
+                    # Fuzzy contains (Api -> api, data-api -> dataapi)
+                    if t_key and t_key in cand_key:
+                        local_matches.append(cand_rel)
+                        continue
+                    # Namespace last segment hint (Pbp.Payments -> Payments)
+                    if last_key and last_key == cand_key:
+                        local_matches.append(cand_rel)
+
+            # 4) Heuristic mapping for common logical labels (Terraform, IAM, etc.)
+            if not local_matches:
+                local_matches.extend(heuristic_matches(t))
+
+            # 5) Terraform repo fallback: plan targets are often abstract labels, so
+            # include core terraform/IAM files to avoid an empty scoped index.
+            if not local_matches and repo_is_terraform:
+                local_matches.extend(default_terraform_paths())
+
+            # Keep a small, deterministic set of matches.
+            local_matches = sorted(set(local_matches), key=lambda p: (p.count("/"), len(p), p))[:6]
+            matches[t] = local_matches
+
+            if local_matches:
+                resolved.extend(local_matches)
+            else:
+                unresolved.append(t)
+
+        resolved_unique = sorted(set(resolved), key=lambda p: (p.count("/"), len(p), p))
+        unresolved_unique = sorted(set(unresolved))
+
+        return {
+            "raw_targets": list(raw_targets or []),
+            "resolved_targets": resolved_unique,
+            "unresolved_targets": unresolved_unique,
+            "matches": matches,
+            "candidate_directory_count": len(directory_candidates),
+        }
+
     def generate_plan(self, task_id: str, skip_rationale_enhancement: bool = False) -> Dict[str, List[str]]:
         import sys
         
         task = self._get_task(task_id)
-        context_summary = task.metadata.get("repository_summary", {})
+        base_summary = task.metadata.get("repository_summary", {})
+        bounded_context = task.metadata.get("bounded_context", {}) or {}
+        scoped_manual = bounded_context.get("manual")
+        # Prefer manual bounded index (post-clarifications) if present; otherwise fall back to plan-targets after plan creation.
+        context_summary = dict(base_summary)
+        if scoped_manual:
+            context_summary["scoped_context"] = scoped_manual
+            context_summary["scoped_context_source"] = "bounded_context.manual"
+
+        # Include answered clarifications in the plan prompt so the plan actually
+        # reflects user-provided constraints (e.g., "this repo does not have tests").
+        augmented_description = task.description.strip()
+        clarifications = task.metadata.get("clarifications", []) or []
+        answered_lines: List[str] = []
+        for item in clarifications:
+            if not isinstance(item, dict):
+                continue
+            status = (item.get("status") or "").strip().upper()
+            question = (item.get("question") or "").strip()
+            answer = (item.get("answer") or "").strip()
+            if status == "ANSWERED" and question and answer:
+                answered_lines.append(f"- Q: {question}\n  A: {answer}")
+        if answered_lines:
+            augmented_description = f"{augmented_description}\n\nClarifications (answered):\n" + "\n".join(answered_lines)
         
         # Show progress
         sys.stderr.write("Building plan...\n")
-        plan = self.plan_builder.build_plan(task.id, task.description, context_summary)
+        plan = self.plan_builder.build_plan(task.id, augmented_description, context_summary)
         sys.stderr.write(f"Plan created with {len(plan.steps)} steps\n")
+        
+        # Defensive: if no tests are detected in the repo and the change request
+        # doesn't explicitly ask for tests, strip any test-related plan steps that
+        # the LLM might have suggested anyway.
+        if not bool(context_summary.get("has_tests", False)):
+            desc_lower = augmented_description.lower()
+            wants_tests = any(token in desc_lower for token in ("test", "tests", "pytest", "jest", "integration test", "unit test"))
+            if not wants_tests and plan.steps:
+                filtered = []
+                for step in plan.steps:
+                    text = f"{step.description} {step.notes or ''}".lower()
+                    if "test" in text:
+                        continue
+                    filtered.append(step)
+                plan.steps = filtered
 
         # Create BoundaryManager with LLM client and context for this plan
         sys.stderr.write("Detecting boundaries...\n")
@@ -229,27 +914,89 @@ class TaskOrchestrator:
         refactors = self.refactor_advisor.suggest(plan)
         sys.stderr.write("Plan generation complete!\n")
 
-        task.metadata["plan_preview"] = {
-            "steps": [step.description for step in plan.steps],
+        previous_statuses = {
+            spec.get("boundary_name"): spec.get("status", BoundarySpecStatus.PENDING.value)
+            for spec in task.metadata.get("boundary_specs", [])
+        }
+        for spec in specs:
+            prev_status = previous_statuses.get(spec.boundary_name)
+            if prev_status:
+                try:
+                    spec.status = BoundarySpecStatus(prev_status)
+                except ValueError:
+                    LOG.debug("Ignoring unknown spec status '%s' for %s", prev_status, spec.boundary_name)
+
+        plan_preview = {
+            "id": plan.id,
+            "steps": [step.to_dict() for step in plan.steps],
             "risks": plan.risks,
             "refactors": plan.refactor_suggestions,
         }
-        # Store full boundary spec objects for approval workflow
-        task.metadata["boundary_specs"] = [
+        task.metadata["plan_preview"] = plan_preview
+
+        serialized_specs = [
             {
                 "id": spec.id,
+                "task_id": spec.task_id,
                 "boundary_name": spec.boundary_name,
                 "human_description": spec.human_description,
                 "diagram_text": spec.diagram_text,
                 "machine_spec": spec.machine_spec,
                 "status": spec.status.value,
+                "plan_step": spec.plan_step,
             }
             for spec in specs
         ]
-        # Also store just names for backward compatibility with CLI display
-        task.metadata["pending_specs"] = [spec.boundary_name for spec in specs]
+        task.metadata["boundary_specs"] = serialized_specs
+        pending_specs = [spec["boundary_name"] for spec in serialized_specs if spec["status"] == BoundarySpecStatus.PENDING.value]
+        task.metadata["pending_specs"] = pending_specs
         task.metadata["refactor_suggestions"] = [item.to_dict() for item in refactors]
-        task.status = TaskStatus.SPEC_PENDING if specs else TaskStatus.PLANNING
+        task.metadata["plan_approved"] = False
+        task.metadata.pop("plan_approved_at", None)
+        for key in ("patch_queue", "patch_queue_state", "test_suggestions"):
+            task.metadata.pop(key, None)
+
+        plan_targets = sorted(
+            {
+                target
+                for step in plan.steps
+                for target in (step.target_files or [])
+                if target
+            }
+        )
+        plan_targets_resolution = None
+        if plan_targets:
+            plan_targets_resolution = self._resolve_plan_targets_to_paths(
+                task.repo_path,
+                plan_targets,
+                base_summary or {},
+            )
+
+            resolved_targets = list(plan_targets_resolution.get("resolved_targets") or [])
+            include_paths: List[Path] = []
+            for rel in resolved_targets:
+                candidate = (task.repo_path / rel).resolve()
+                if candidate.exists():
+                    include_paths.append(candidate)
+
+            if include_paths:
+                self._record_context_step(
+                    task,
+                    "plan-targets",
+                    included=include_paths,
+                    note="Auto-selected from plan targets (resolved to filesystem paths)",
+                )
+
+            bounded_summary: Dict[str, Any] = (
+                self.context_indexer.summarize_targets(task.repo_path, resolved_targets)
+                if resolved_targets
+                else {"targets": {}, "aggregate": {}, "impact": {}, "serena_semantic_tree": None}
+            )
+            bounded_summary["plan_targets_resolution"] = plan_targets_resolution
+            task.metadata.setdefault("bounded_context", {})
+            task.metadata["bounded_context"]["plan_targets"] = bounded_summary
+
+        task.status = TaskStatus.SPEC_PENDING if pending_specs else TaskStatus.PLANNING
         self._snapshot_worktree_status(task)
         task.touch()
         self.store.upsert_task(task)
@@ -258,17 +1005,64 @@ class TaskOrchestrator:
             task.id,
             "PLAN_GENERATED",
             {
-                "plan": task.metadata["plan_preview"],
-                "pending_specs": task.metadata["pending_specs"],
+                "plan": plan_preview,
+                "pending_specs": pending_specs,
                 "refactor_suggestions": task.metadata["refactor_suggestions"],
+                "plan_targets_indexed": bool(
+                    (plan_targets_resolution or {}).get("resolved_targets")
+                    if plan_targets_resolution
+                    else plan_targets
+                ),
+                "plan_targets_resolution": plan_targets_resolution,
             },
         )
 
-        return {
-            "plan": task.metadata["plan_preview"],
-            "pending_specs": task.metadata["pending_specs"],
+        return_payload = {
+            "plan": plan_preview,
+            "pending_specs": pending_specs,
             "refactor_suggestions": task.metadata["refactor_suggestions"],
+            # Prefer manual bounded index when available; otherwise show plan-targets scope.
+            "bounded_context": (task.metadata.get("bounded_context", {}) or {}).get("manual")
+            or (task.metadata.get("bounded_context", {}) or {}).get("plan_targets"),
         }
+        if plan_targets_resolution:
+            return_payload["plan_targets_resolution"] = plan_targets_resolution
+        return return_payload
+
+    def bounded_index_task(
+        self,
+        task_id: str,
+        targets: List[str],
+        *,
+        include_serena_semantic_tree: bool = False,
+    ) -> Dict[str, any]:
+        """
+        Run a bounded index over a subset of repo paths and store the summary.
+        """
+        task = self._get_task(task_id)
+        summary = self.context_indexer.summarize_targets(
+            task.repo_path,
+            targets,
+            include_serena_semantic_tree=include_serena_semantic_tree,
+            include_file_list=True,
+        )
+        task.metadata.setdefault("bounded_context", {})
+        task.metadata["bounded_context"]["manual"] = summary
+        include_paths = [
+            (task.repo_path / Path(target)).resolve()
+            if not Path(target).is_absolute()
+            else Path(target).resolve()
+            for target in targets
+        ]
+        self._record_context_step(task, "bounded-index", included=include_paths, note="Engineer requested scoped index")
+        task.touch()
+        self.store.upsert_task(task)
+        self.logger.record(
+            task.id,
+            "BOUNDED_INDEX_CREATED",
+            {"targets": list(summary.get("targets", {}).keys())},
+        )
+        return summary
 
     # ------------------------------------------------------------------ Boundary Specs
     def get_boundary_specs(self, task_id: str) -> List[Dict]:
@@ -296,6 +1090,7 @@ class TaskOrchestrator:
             raise ValueError(f"Boundary spec not found: {spec_id}")
 
         task.metadata["boundary_specs"] = specs
+        self._update_pending_specs(task)
         task.touch()
         self.store.upsert_task(task)
 
@@ -325,6 +1120,7 @@ class TaskOrchestrator:
             raise ValueError(f"Boundary spec not found: {spec_id}")
 
         task.metadata["boundary_specs"] = specs
+        self._update_pending_specs(task)
         task.touch()
         self.store.upsert_task(task)
 
@@ -336,6 +1132,97 @@ class TaskOrchestrator:
 
         return {"spec_id": spec_id, "status": "SKIPPED"}
 
+    def update_spec_fields(
+        self,
+        task_id: str,
+        spec_id: str,
+        *,
+        description: Optional[str] = None,
+        diagram_text: Optional[str] = None,
+        machine_spec: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        task = self._get_task(task_id)
+        specs = task.metadata.get("boundary_specs", [])
+        target = None
+        for spec in specs:
+            if spec["id"] == spec_id:
+                target = spec
+                break
+
+        if not target:
+            raise ValueError(f"Boundary spec not found: {spec_id}")
+
+        if description is not None:
+            target["human_description"] = description
+        if diagram_text is not None:
+            target["diagram_text"] = diagram_text
+        if machine_spec is not None:
+            target["machine_spec"] = machine_spec
+
+        # Editing a spec re-opens approval
+        target["status"] = BoundarySpecStatus.PENDING.value
+        task.metadata["boundary_specs"] = specs
+        self._update_pending_specs(task)
+        task.touch()
+        self.store.upsert_task(task)
+        self.logger.record(
+            task.id,
+            "SPEC_UPDATED",
+            {"spec_id": spec_id, "description_changed": description is not None},
+        )
+        return target
+
+    def regenerate_spec(self, task_id: str, spec_id: str) -> Dict[str, Any]:
+        """
+        Regenerate a boundary spec from its associated plan step using the BoundaryManager.
+        """
+        task = self._get_task(task_id)
+        specs = task.metadata.get("boundary_specs", [])
+        target = None
+        for spec in specs:
+            if spec["id"] == spec_id:
+                target = spec
+                break
+
+        if not target:
+            raise ValueError(f"Boundary spec not found: {spec_id}")
+
+        plan_step_description = target.get("plan_step")
+        if not plan_step_description:
+            raise ValueError("This boundary spec is not linked to a plan step and cannot be regenerated automatically.")
+
+        plan_preview = task.metadata.get("plan_preview", {})
+        plan_steps = [
+            PlanStep.from_dict(step) if isinstance(step, dict) else PlanStep(description=str(step))
+            for step in plan_preview.get("steps", [])
+        ]
+        plan_step = next((step for step in plan_steps if step.description == plan_step_description), None)
+        if not plan_step:
+            raise ValueError("Unable to locate the original plan step for this boundary spec.")
+
+        boundary_manager = BoundaryManager(
+            llm_client=self.llm_client,
+            context_summary=task.metadata.get("repository_summary"),
+        )
+        new_spec = boundary_manager.generate_spec_for_step(task.id, plan_step)
+
+        target.update(
+            {
+                "boundary_name": new_spec.boundary_name,
+                "human_description": new_spec.human_description,
+                "diagram_text": new_spec.diagram_text,
+                "machine_spec": new_spec.machine_spec,
+                "status": BoundarySpecStatus.PENDING.value,
+                "plan_step": plan_step.description,
+            }
+        )
+        task.metadata["boundary_specs"] = specs
+        self._update_pending_specs(task)
+        task.touch()
+        self.store.upsert_task(task)
+        self.logger.record(task.id, "SPEC_REGENERATED", {"spec_id": spec_id})
+        return target
+
     def approve_plan(self, task_id: str) -> Dict:
         """
         Approve the entire implementation plan.
@@ -344,6 +1231,13 @@ class TaskOrchestrator:
         approval of individual boundary specifications.
         """
         task = self._get_task(task_id)
+
+        unresolved = [
+            spec for spec in task.metadata.get("boundary_specs", [])
+            if spec.get("status") == BoundarySpecStatus.PENDING.value
+        ]
+        if unresolved:
+            raise ValueError("All boundary specs must be approved or skipped before approving the plan.")
 
         # Mark plan as approved
         task.metadata["plan_approved"] = True
@@ -387,22 +1281,28 @@ class TaskOrchestrator:
         # Reconstruct plan object from stored data
         from ..domain.models import Plan, PlanStep
         plan = Plan(
+            id=plan_preview.get("id", str(uuid4())),
             task_id=task_id,
-            steps=[PlanStep(description=step) for step in plan_preview.get("steps", [])],
+            steps=[
+                PlanStep.from_dict(step) if isinstance(step, dict) else PlanStep(description=str(step))
+                for step in plan_preview.get("steps", [])
+            ],
             risks=plan_preview.get("risks", []),
             refactor_suggestions=plan_preview.get("refactors", [])
         )
 
         # Reconstruct boundary specs from stored data
-        from ..domain.models import BoundarySpec, SpecStatus
+        from ..domain.models import BoundarySpec, BoundarySpecStatus
         specs = [
             BoundarySpec(
                 id=spec_data["id"],
+                task_id=spec_data.get("task_id", task_id),
                 boundary_name=spec_data["boundary_name"],
                 human_description=spec_data["human_description"],
                 diagram_text=spec_data["diagram_text"],
                 machine_spec=spec_data["machine_spec"],
-                status=SpecStatus(spec_data["status"])
+                status=BoundarySpecStatus(spec_data["status"]),
+                plan_step=spec_data.get("plan_step"),
             )
             for spec_data in boundary_specs_data
         ]
@@ -422,15 +1322,21 @@ class TaskOrchestrator:
             patches = []  # Continue without patches
 
         # Generate test suggestions with patches (Epic 4.2)
-        sys.stderr.write("Generating test suggestions...\n")
-        tests = self.test_suggester.suggest(
-            plan=plan,
-            patches=patches,
-            boundary_specs=specs,
-            repo_context=context_summary,
-            repo_path=task.repo_path,
-        )
-        sys.stderr.write(f"Generated {len(tests)} test suggestions\n")
+        tests_skipped_reason: str | None = None
+        if not bool(context_summary.get("has_tests", False)):
+            tests_skipped_reason = "no tests detected in repository"
+            sys.stderr.write(f"Skipping test suggestions ({tests_skipped_reason}).\n")
+            tests = []
+        else:
+            sys.stderr.write("Generating test suggestions...\n")
+            tests = self.test_suggester.suggest(
+                plan=plan,
+                patches=patches,
+                boundary_specs=specs,
+                repo_context=context_summary,
+                repo_path=task.repo_path,
+            )
+            sys.stderr.write(f"Generated {len(tests)} test suggestions\n")
 
         # Store rationale history for each patch (Epic 4.1)
         rationale_history = task.metadata.get("rationale_history", [])
@@ -465,15 +1371,88 @@ class TaskOrchestrator:
             "patch_count": len(patches),
             "patches": task.metadata["patch_queue"],
             "test_count": len(tests),
-            "test_suggestions": task.metadata["test_suggestions"]
+            "test_suggestions": task.metadata["test_suggestions"],
+            "tests_skipped_reason": tests_skipped_reason,
         }
 
     # ------------------------------------------------------------------ Helpers
-    def _get_task(self, task_id: str) -> Task:
+    def _get_task(self, task_id: str, *, _skip_description_guard: bool = False) -> Task:
         for task in self.store.load_tasks():
             if task.id == task_id:
-                return task
+                if _skip_description_guard:
+                    return task
+                return self._ensure_description_consistency(task)
         raise ValueError(f"Task not found: {task_id}")
+
+    def _ensure_description_consistency(self, task: Task) -> Task:
+        """
+        Guardrail: if someone edits tasks.json and changes the description for an
+        existing task, regenerate clarifications and clear stale metadata so we
+        don't ask nonsense questions based on the old intent.
+        """
+        current = (task.description or "").strip()
+        snapshot = (task.metadata.get("description_snapshot") or "").strip()
+
+        if not current:
+            return task
+
+        if not snapshot:
+            task.metadata["description_snapshot"] = current
+            task.touch()
+            self.store.upsert_task(task)
+            return task
+
+        if snapshot == current:
+            return task
+
+        # Only auto-reset if the task is still in early workflow stages.
+        early_states = {
+            TaskStatus.CREATED,
+            TaskStatus.CLARIFYING,
+            TaskStatus.PLANNING,
+            TaskStatus.SPEC_PENDING,
+        }
+        reset = task.status in early_states
+
+        return self.update_task_description(
+            task.id,
+            current,
+            reason="Auto-detected description change (tasks.json edit)",
+            reset_metadata=reset,
+        )
+
+    def _preserve_clarifications_history(self, task: Task, *, reason: str) -> None:
+        history = task.metadata.get("clarifications_history") or []
+        if not isinstance(history, list):
+            history = []
+        previous = task.metadata.get("clarifications", []) or []
+        history.append(
+            {
+                "timestamp": datetime.now().isoformat(),
+                "reason": (reason or "").strip(),
+                "clarifications": previous,
+            }
+        )
+        task.metadata["clarifications_history"] = history
+
+    def _reset_task_artifacts(self, task: Task, *, reset_context_steps: bool = False) -> None:
+        # Reset downstream artifacts so the next plan/specs/patches are generated
+        # from the current description + clarifications.
+        for key in (
+            "plan_preview",
+            "refactor_suggestions",
+            "boundary_specs",
+            "pending_specs",
+            "patches",
+            "patch_queue",
+            "patch_queue_state",
+            "test_suggestions",
+            "bounded_context",
+        ):
+            task.metadata.pop(key, None)
+
+        if reset_context_steps:
+            task.metadata.pop("context_steps", None)
 
     def _maybe_create_llm_client(self) -> Optional[OpenAILLMClient]:
         """
@@ -518,16 +1497,10 @@ class TaskOrchestrator:
     # ------------------------------------------------------------------ Patch queue helpers
     def list_patches(self, task_id: str) -> List[Patch]:
         task = self._get_task(task_id)
-        if self._detect_manual_edits(task):
-            self.generate_plan(task_id)
-            task = self._get_task(task_id)
         return self._load_patch_queue(task)
 
     def get_next_pending_patch(self, task_id: str) -> Patch | None:
         task = self._get_task(task_id)
-        if self._detect_manual_edits(task):
-            self.generate_plan(task_id)
-            task = self._get_task(task_id)
         patches = self._load_patch_queue(task)
         for patch in patches:
             if patch.status == PatchStatus.PENDING:
@@ -1098,11 +2071,74 @@ class TaskOrchestrator:
         raise ValueError(f"Refactor suggestion not found: {suggestion_id}")
 
     # ------------------------------------------------------------------ Manual override helpers
+    def _record_context_step(
+        self,
+        task: Task,
+        trigger: str,
+        included: Optional[List[Path]] = None,
+        excluded: Optional[List[Path]] = None,
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        included_rel = self._relative_paths(task.repo_path, included or [])
+        excluded_rel = self._relative_paths(task.repo_path, excluded or [])
+        step = {
+            "id": str(uuid4()),
+            "timestamp": datetime.now().isoformat(),
+            "trigger": trigger,
+            "note": note,
+            "included": included_rel,
+            "excluded": excluded_rel,
+        }
+        steps = task.metadata.setdefault("context_steps", [])
+        steps.append(step)
+        task.touch()
+        self.store.upsert_task(task)
+        self.logger.record(task.id, "CONTEXT_UPDATED", step)
+        return step
+
+    @staticmethod
+    def _relative_paths(repo_path: Path, paths: List[Path]) -> List[str]:
+        results: List[str] = []
+        for path in paths:
+            try:
+                results.append(str(path.resolve().relative_to(repo_path)))
+            except ValueError:
+                results.append(str(path.resolve()))
+        return results
+
+    @staticmethod
+    def _normalize_paths(repo_path: Path, raw_paths: List[str]) -> List[Path]:
+        normalized: List[Path] = []
+        for raw in raw_paths:
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                candidate = (repo_path / candidate).resolve()
+            else:
+                candidate = candidate.resolve()
+            normalized.append(candidate)
+        return normalized
+
     def _snapshot_worktree_status(self, task: Task) -> None:
         status = self._get_git_status(task.repo_path)
         task.metadata["worktree_status"] = status
         task.metadata["last_snapshot_commit"] = self._current_commit(task.repo_path)
         self.store.upsert_task(task)
+
+    def has_manual_edits(self, task_id: str) -> bool:
+        task = self._get_task(task_id)
+        return self._detect_manual_edits(task)
+
+    def acknowledge_manual_edits(self, task_id: str) -> None:
+        task = self._get_task(task_id)
+        self._snapshot_worktree_status(task)
+
+    def _update_pending_specs(self, task: Task) -> None:
+        specs = task.metadata.get("boundary_specs", [])
+        task.metadata["pending_specs"] = [
+            spec.get("boundary_name")
+            for spec in specs
+            if spec.get("status") == BoundarySpecStatus.PENDING.value
+        ]
 
     def _detect_manual_edits(self, task: Task) -> bool:
         current = self._get_git_status(task.repo_path)
@@ -1242,5 +2278,3 @@ class TaskOrchestrator:
             },
             "git_status": git_status or "clean",
         }
-
-

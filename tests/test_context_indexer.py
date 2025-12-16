@@ -24,3 +24,20 @@ def test_summarize_repository_counts_tmp_path(tmp_path: Path) -> None:
     assert summary["hotspots"], "Expected the large file to be flagged as a hotspot"
 
 
+def test_summarize_targets_limits_scope(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "a.py").write_text("print('a')\n")
+    (repo / "b.py").write_text("print('b')\n")
+    (repo / "nested").mkdir()
+    (repo / "nested" / "c.py").write_text("print('c')\n" * 600)
+
+    settings = AgentSettings()
+    indexer = ContextIndexer(settings)
+
+    summary = indexer.summarize_targets(repo, ["nested"])
+    aggregate = summary["aggregate"]
+
+    assert aggregate["file_count"] == 1
+    assert "nested/c.py" in summary["targets"]["nested"]["hotspots"][0]["path"]
+

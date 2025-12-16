@@ -78,6 +78,8 @@ The plan should include:
 3. **Refactorings**: Opportunities to improve code quality while making changes
 
 Focus on architectural and component-level changes, not specific file paths.
+If the repository has no existing tests (or no test harness is detected) and the change request
+does not explicitly require adding tests, do NOT add plan steps about creating tests.
 Return ONLY valid JSON in this exact format:
 
 {
@@ -106,18 +108,41 @@ Do not include any explanatory text before or after the JSON."""
         top_modules = context_summary.get("top_modules", [])
         modules_str = ", ".join(top_modules[:5]) if top_modules else "not analyzed"
 
+        has_tests = bool(context_summary.get("has_tests", False))
+        tests_str = "present" if has_tests else "not detected"
+
         # Extract top hotspots (large files)
         hotspots = context_summary.get("hotspots", [])
         hotspot_names = [h.get("path", "") for h in hotspots[:5]]
         hotspots_str = ", ".join(hotspot_names) if hotspot_names else "none detected"
+
+        scoped = context_summary.get("scoped_context") or {}
+        scoped_hint = ""
+        if isinstance(scoped, dict) and scoped:
+            impact = scoped.get("impact") or {}
+            targets = list((scoped.get("targets") or {}).keys())
+            top_dirs = impact.get("top_directories") or []
+            namespaces = impact.get("namespaces") or []
+            scoped_hint = "\n\nScoped Context (post-clarifications):\n"
+            if targets:
+                scoped_hint += f"- Targets: {', '.join(targets[:8])}{' ...' if len(targets) > 8 else ''}\n"
+            if top_dirs:
+                scoped_hint += f"- Impacted directories: {', '.join(top_dirs[:10])}\n"
+            if namespaces:
+                scoped_hint += f"- Impacted namespaces: {', '.join(namespaces[:10])}\n"
 
         return f"""Change Request: {description}
 
 Repository Context:
 - Total Files: {context_summary.get('file_count', 'unknown')}
 - Main Languages: {languages_str}
+- Tests: {tests_str}
 - Legacy Hotspots (large files): {hotspots_str}
 - Key Modules: {modules_str}
+{scoped_hint}
+
+Guidance:
+- If tests are not detected and the change request does not explicitly ask to add tests, omit test-related steps and suggestions.
 
 Generate a high-level implementation plan for this change request."""
 

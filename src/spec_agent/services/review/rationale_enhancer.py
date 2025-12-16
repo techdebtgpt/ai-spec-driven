@@ -128,30 +128,23 @@ Format your response as JSON:
 Return only valid JSON, no markdown, no explanations."""
 
         try:
-            # Access the internal OpenAI client
-            if hasattr(self.llm_client, '_client'):
-                openai_client = self.llm_client._client
-                model = self.llm_client._model if hasattr(self.llm_client, '_model') else "gpt-4o-mini"
-            else:
-                # Fallback: try to use as OpenAI client directly
-                openai_client = self.llm_client
-                model = getattr(self.llm_client, 'model', "gpt-4o-mini")
-            
-            response = openai_client.chat.completions.create(
-                model=model,
+            import json
+
+            response_text = self.llm_client.chat(
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a senior software engineer providing code review rationale. Analyze code changes and explain design decisions, trade-offs, and alternatives. Return only valid JSON."
+                        "content": (
+                            "You are a senior software engineer providing code review rationale. "
+                            "Analyze code changes and explain design decisions, trade-offs, and alternatives. "
+                            "Return only valid JSON."
+                        ),
                     },
-                    {"role": "user", "content": prompt}
+                    {"role": "user", "content": prompt},
                 ],
                 temperature=0.3,
-                max_tokens=800,  # Reduced for faster responses
+                max_output_tokens=800,
             )
-
-            import json
-            response_text = response.choices[0].message.content if response.choices else ""
             
             # Clean up JSON if wrapped in markdown
             if response_text.strip().startswith("```"):
@@ -288,29 +281,17 @@ Question: {question}
 
 Provide a clear, concise answer that references the rationale, design decisions, and alternatives."""
 
-                # Access the internal OpenAI client
-                if hasattr(self.llm_client, '_client'):
-                    openai_client = self.llm_client._client
-                    model = self.llm_client._model if hasattr(self.llm_client, '_model') else "gpt-4o-mini"
-                else:
-                    # Fallback: try to use as OpenAI client directly
-                    openai_client = self.llm_client
-                    model = getattr(self.llm_client, 'model', "gpt-4o-mini")
-                
-                response = openai_client.chat.completions.create(
-                    model=model,
+                return self.llm_client.chat(
                     messages=[
                         {
                             "role": "system",
-                            "content": "You are a senior software engineer explaining code changes. Answer questions clearly and reference the rationale."
+                            "content": "You are a senior software engineer explaining code changes. Answer questions clearly and reference the rationale.",
                         },
-                        {"role": "user", "content": prompt}
+                        {"role": "user", "content": prompt},
                     ],
                     temperature=0.3,
-                    max_tokens=500,
+                    max_output_tokens=500,
                 )
-
-                return response.choices[0].message.content if response.choices else "Unable to generate answer."
             except Exception as exc:
                 LOG.error("Failed to answer follow-up question: %s", exc)
                 return f"Error generating answer: {exc}. Please review the patch rationale manually."

@@ -89,6 +89,21 @@ class PlanStep:
     target_files: List[str] = field(default_factory=list)
     notes: Optional[str] = None
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "description": self.description,
+            "target_files": list(self.target_files),
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Dict[str, Any]) -> "PlanStep":
+        return cls(
+            description=raw.get("description", ""),
+            target_files=list(raw.get("target_files", [])),
+            notes=raw.get("notes"),
+        )
+
 
 @dataclass
 class Plan:
@@ -115,6 +130,7 @@ class BoundarySpec:
     diagram_text: str
     machine_spec: Dict[str, Any]
     status: BoundarySpecStatus = BoundarySpecStatus.PENDING
+    plan_step: Optional[str] = None
 
 
 class PatchStatus(str, Enum):
@@ -226,5 +242,3 @@ class RefactorSuggestion:
             scope=raw.get("scope", []),
             status=RefactorSuggestionStatus(raw.get("status", RefactorSuggestionStatus.PENDING.value)),
         )
-
-
