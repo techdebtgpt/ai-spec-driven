@@ -172,17 +172,105 @@ class ChatSession:
         try:
             index_data = self.orchestrator.index_repository(repo_path=repo_path, branch=branch)
             summary = index_data.get("repository_summary", {})
+            git_info = index_data.get("git_info", {})
 
-            # Show summary
             console.print()
-            console.print(Panel.fit(
-                f"[green]✓[/] Repository indexed successfully!\n\n"
-                f"Files: {summary.get('file_count', 0):,}\n"
-                f"Directories: {summary.get('directory_count', 0):,}\n"
-                f"Languages: {', '.join(summary.get('top_languages', [])[:3]) or 'unknown'}",
-                title="Index Complete",
-                border_style="green"
-            ))
+            console.print(f"[bold green]Repository indexed successfully[/]\n")
+            
+            # Merged Repository Info and Semantic Analysis Panel
+            info_lines = []
+            
+            # Basic repository information
+            info_lines.append(f"[bold cyan]Repository:[/] {index_data.get('repo_name', repo_path.name)}")
+            info_lines.append(f"[bold cyan]Path:[/] {repo_path}")
+            info_lines.append(f"[bold cyan]Branch:[/] {branch}")
+            
+            # Git information
+            if git_info.get("current_commit"):
+                info_lines.append(f"[bold cyan]Commit:[/] {git_info['current_commit'][:12]}")
+            if git_info.get("commit_message"):
+                commit_msg = git_info['commit_message']
+                if len(commit_msg) > 60:
+                    commit_msg = commit_msg[:60] + "..."
+                info_lines.append(f"[bold cyan]Message:[/] {commit_msg}")
+            if git_info.get("commit_author"):
+                info_lines.append(f"[bold cyan]Author:[/] {git_info['commit_author']}")
+            if git_info.get("remote_url"):
+                remote_url = git_info['remote_url']
+                if len(remote_url) > 60:
+                    remote_url = remote_url[:57] + "..."
+                info_lines.append(f"[bold cyan]Remote:[/] {remote_url}")
+            
+            # Semantic index information
+            semantic_index = index_data.get('semantic_index')
+            if semantic_index:
+                repo_info = semantic_index.get('repository', {})
+                
+                # Add separator
+                info_lines.append("")
+                
+                # Primary languages
+                primary_languages = repo_info.get('primaryLanguages', [])
+                if primary_languages:
+                    lang_str = ', '.join(primary_languages[:5])  # Limit to 5 languages
+                    info_lines.append(f"[bold cyan]Languages:[/] {lang_str}")
+                
+                # Frameworks
+                frameworks = repo_info.get('frameworks', [])
+                if frameworks:
+                    fw_str = ', '.join(frameworks[:5])  # Limit to 5 frameworks
+                    info_lines.append(f"[bold cyan]Frameworks:[/] {fw_str}")
+                
+                # Architecture style
+                if repo_info.get('architectureStyle'):
+                    info_lines.append(f"[bold cyan]Architecture:[/] {repo_info['architectureStyle']}")
+                
+                # Add another separator before counts
+                info_lines.append("")
+                
+                # Module and domain counts
+                structure = semantic_index.get('structure', {})
+                modules = structure.get('modules', [])
+                domains = semantic_index.get('domains', [])
+                
+                if modules:
+                    info_lines.append(f"[bold cyan]Modules:[/] {len(modules)} detected")
+                if domains:
+                    info_lines.append(f"[bold cyan]Domains:[/] {len(domains)} identified")
+                
+                # Public interfaces
+                public_interfaces = semantic_index.get('publicInterfaces', {})
+                http_apis = public_interfaces.get('httpApis', [])
+                cli_commands = public_interfaces.get('cliCommands', [])
+                events = public_interfaces.get('events', [])
+                
+                interface_parts = []
+                if http_apis:
+                    interface_parts.append(f"{len(http_apis)} HTTP API{'s' if len(http_apis) != 1 else ''}")
+                if cli_commands:
+                    interface_parts.append(f"{len(cli_commands)} CLI command{'s' if len(cli_commands) != 1 else ''}")
+                if events:
+                    interface_parts.append(f"{len(events)} event{'s' if len(events) != 1 else ''}")
+                
+                if interface_parts:
+                    info_lines.append(f"[bold cyan]Public Interfaces:[/] {', '.join(interface_parts)}")
+                
+                # Key components and integrations
+                key_components = semantic_index.get('keyComponents', [])
+                external_integrations = semantic_index.get('externalIntegrations', [])
+                
+                if key_components:
+                    info_lines.append(f"[bold cyan]Key Components:[/] {len(key_components)}")
+                if external_integrations:
+                    info_lines.append(f"[bold cyan]External Integrations:[/] {len(external_integrations)}")
+            
+            console.print(Panel.fit("\n".join(info_lines), title="Repository Overview", border_style="bright_blue"))
+            
+            # Serena Status
+            if summary.get('serena_enabled'):
+                console.print("[dim]Enhanced with Serena language detection[/]")
+            else:
+                console.print("[dim]Basic language detection (Serena not enabled)[/]")
 
             self.indexed_repo = repo_path
             self.indexed_branch = branch

@@ -68,7 +68,6 @@ class ContextIndexer:
         
         # Track file sizes for statistics
         total_size_bytes = 0
-        largest_files = []  # Track top 5 largest files
 
         for path in repo_path.rglob("*"):
             # Get relative path for gitignore matching
@@ -96,7 +95,6 @@ class ContextIndexer:
             try:
                 file_size = path.stat().st_size
                 total_size_bytes += file_size
-                largest_files.append((str(relative_path), file_size))
             except OSError:
                 pass
             
@@ -115,9 +113,6 @@ class ContextIndexer:
                 if imports:
                     import_edges[str(relative_path)].extend(imports)
 
-        # Sort and limit largest files
-        largest_files.sort(key=lambda x: x[1], reverse=True)
-        largest_files = largest_files[:5]
 
         graph = self._build_graph(import_edges)
         top_modules = [
@@ -193,9 +188,6 @@ class ContextIndexer:
         # Detect frameworks based on common patterns
         frameworks = self._detect_frameworks(repo_path)
         
-        # Build directory structure (limited depth to avoid huge data)
-        directory_structure = self._build_directory_structure(repo_path, gitignore_spec, max_depth=3)
-        
         # Build comprehensive response with enhanced data
         return {
             # Basic counts
@@ -219,96 +211,14 @@ class ContextIndexer:
             "namespaces": serena_namespaces[:10] if serena_namespaces else [],
             "top_directories": serena_directories[:10] if serena_directories else [],
             
-            # Directory structure
-            "directory_structure": directory_structure,
-            
             # Code quality indicators
             "hotspots": hotspots,
-            "largest_files": [{"path": path, "size_bytes": size, "size_kb": round(size / 1024, 2)} for path, size in largest_files],
             
             # Serena-specific data
             "serena_enabled": bool(serena_info),
             "serena_file_extensions": serena_file_extensions,
         }
 
-    def _build_directory_structure(self, repo_path: Path, gitignore_spec: Optional[pathspec.PathSpec], max_depth: int = 3) -> Dict[str, any]:
-        """
-        Build a hierarchical directory structure with file counts and sizes.
-        
-        Args:
-            repo_path: Root path of the repository
-            gitignore_spec: Gitignore patterns to respect
-            max_depth: Maximum depth to traverse (default 3 levels)
-        
-        Returns:
-            Dictionary representing the directory tree structure
-        """
-        def build_tree(current_path: Path, depth: int = 0) -> Dict[str, any]:
-            if depth > max_depth:
-                return None
-            
-            relative_path = current_path.relative_to(repo_path) if current_path != repo_path else Path(".")
-            
-            # Skip if matches gitignore
-            if gitignore_spec and gitignore_spec.match_file(str(relative_path)):
-                return None
-            
-            # Skip .git directory
-            if ".git" in current_path.parts:
-                return None
-            
-            node = {
-                "name": current_path.name if current_path != repo_path else ".",
-                "path": str(relative_path),
-                "type": "directory" if current_path.is_dir() else "file",
-                "depth": depth,
-            }
-            
-            if current_path.is_file():
-                try:
-                    node["size"] = current_path.stat().st_size
-                    node["extension"] = current_path.suffix.lower() if current_path.suffix else None
-                except OSError:
-                    node["size"] = 0
-                return node
-            
-            # It's a directory
-            children = []
-            file_count = 0
-            dir_count = 0
-            total_size = 0
-            
-            try:
-                for child in sorted(current_path.iterdir(), key=lambda x: (not x.is_dir(), x.name)):
-                    # Skip .git
-                    if child.name == ".git":
-                        continue
-                    
-                    child_relative = child.relative_to(repo_path)
-                    if gitignore_spec and gitignore_spec.match_file(str(child_relative)):
-                        continue
-                    
-                    child_node = build_tree(child, depth + 1)
-                    if child_node:
-                        children.append(child_node)
-                        if child_node["type"] == "file":
-                            file_count += 1
-                            total_size += child_node.get("size", 0)
-                        else:
-                            dir_count += 1
-                            file_count += child_node.get("file_count", 0)
-                            total_size += child_node.get("total_size", 0)
-            except (OSError, PermissionError):
-                pass
-            
-            node["children"] = children
-            node["file_count"] = file_count
-            node["dir_count"] = dir_count
-            node["total_size"] = total_size
-            
-            return node
-        
-        return build_tree(repo_path)
 
     def _detect_language(self, path: Path) -> str | None:
         suffix = path.suffix.lower()
