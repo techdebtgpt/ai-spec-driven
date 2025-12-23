@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
@@ -18,15 +19,32 @@ class JsonStore:
     """
 
     def __init__(self, root: Path) -> None:
+        self._lock = Lock()
         self.root = root
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.tasks_file = self.root / "tasks.json"
-        self.logs_file = self.root / "logs.json"
-        self.index_file = self.root / "repository_index.json"
+
+    @property
+    def root(self) -> Path:
+        return self._root
+
+    @root.setter
+    def root(self, value: Path) -> None:
+        """
+        Update the store root and all derived file paths.
+
+        Tests sometimes rebind the store root after constructing `TaskOrchestrator`;
+        keeping derived paths in sync avoids accidental writes to `~/.spec_agent`.
+        """
+        self._root = value
+        self._root.mkdir(parents=True, exist_ok=True)
+        self.tasks_file = self._root / "tasks.json"
+        self.logs_file = self._root / "logs.json"
+        self.index_file = self._root / "repository_index.json"
+        # Per-repo cache of indexes so chat can reuse multiple repositories.
+        self.indexes_dir = self._root / "repository_indexes"
+        self.indexes_dir.mkdir(parents=True, exist_ok=True)
         # Convenience export for the (potentially large) Serena semantic tree so it's easy
         # to inspect in ~/.spec_agent without digging through repository_index.json.
-        self.serena_tree_file = self.root / "serena_semantic_tree.json"
-        self._lock = Lock()
+        self.serena_tree_file = self._root / "serena_semantic_tree.json"
 
     # --- Task persistence -------------------------------------------------
     def load_tasks(self) -> List[Task]:
@@ -81,10 +99,42 @@ class JsonStore:
         ]
 
     # --- Repository index persistence ------------------------------------
+    @staticmethod
+    def _repo_key(repo_path: Path, branch: str | None = None) -> str:
+        """
+        Deterministic key for a repository path (+ optional branch).
+        """
+        normalized = str(repo_path.resolve())
+        if branch:
+            normalized = f"{normalized}::{branch}"
+        return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
+
+    def _index_file_for_repo(self, repo_path: Path, branch: str | None = None) -> Path:
+        return self.indexes_dir / f"{self._repo_key(repo_path, branch)}.json"
+
     def save_repository_index(self, index_data: Dict) -> None:
         """Save repository index data for later use."""
         with self._lock:
             self.index_file.write_text(json.dumps(index_data, indent=2, default=str))
+
+        # Also save a per-repo copy (best-effort).
+        try:
+            repo_path_str = index_data.get("repo_path")
+            if repo_path_str:
+                repo_path = Path(str(repo_path_str)).resolve()
+                branch = str(index_data.get("branch") or "") or None
+                per_repo = self._index_file_for_repo(repo_path, branch)
+                with self._lock:
+                    per_repo.write_text(json.dumps(index_data, indent=2, default=str))
+
+                # Back-compat: also write the repo-only key (older caches).
+                legacy = self._index_file_for_repo(repo_path, None)
+                if legacy != per_repo:
+                    with self._lock:
+                        legacy.write_text(json.dumps(index_data, indent=2, default=str))
+        except Exception:
+            # Best-effort only; don't fail indexing.
+            pass
 
     def load_repository_index(self) -> Dict:
         """Load the most recent repository index data."""
@@ -92,3 +142,21 @@ class JsonStore:
             raise ValueError("No repository index found. Please run 'index' command first.")
         with self._lock:
             return json.loads(self.index_file.read_text())
+
+    def load_repository_index_for_repo(self, repo_path: Path, branch: str | None = None) -> Dict:
+        """
+        Load a cached repository index for a specific repo path (+ optional branch).
+        """
+        # Prefer branch-specific cache when branch is provided.
+        candidates: list[Path] = []
+        if branch:
+            candidates.append(self._index_file_for_repo(repo_path, branch))
+        # Fallback to repo-only cache.
+        candidates.append(self._index_file_for_repo(repo_path, None))
+
+        for file_path in candidates:
+            if file_path.exists():
+                with self._lock:
+                    return json.loads(file_path.read_text())
+
+        raise ValueError(f"No repository index found for: {repo_path}{f' ({branch})' if branch else ''}")

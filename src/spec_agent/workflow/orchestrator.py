@@ -24,7 +24,6 @@ from ..domain.models import (
     RefactorSuggestionStatus,
     Task,
     TaskStatus,
-    TestSuggestion,
 )
 from ..persistence.store import JsonStore
 from ..services.context.indexer import ContextIndexer
@@ -71,6 +70,50 @@ class TaskOrchestrator:
         self.test_suggester = TestSuggester(llm_client=self.llm_client)
 
     # ------------------------------------------------------------------ Tasks
+    def resolve_repo_root(self, repo_path: Path) -> Path:
+        return self._resolve_repo_root(repo_path)
+
+    def _resolve_repo_root(self, repo_path: Path) -> Path:
+        """
+        Best-effort: if user points at a subdirectory (e.g. ".../src"), resolve to the
+        repository root so we don't miss tests/config in sibling folders.
+        """
+        try:
+            candidate = repo_path.resolve()
+        except Exception:
+            candidate = repo_path
+
+        if candidate.exists() and candidate.is_file():
+            candidate = candidate.parent
+
+        # Walk upward to the nearest directory that looks like a VCS root.
+        # Note: we don't require git; many repos (or test fixtures) may not have an actual
+        # `.git/` directory. In those cases, fall back to common "repo root" marker files.
+        root_markers = (
+            ".gitignore",
+            "pyproject.toml",
+            "package.json",
+            "go.mod",
+            "Cargo.toml",
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "requirements.txt",
+            "setup.py",
+        )
+        for parent in [candidate, *candidate.parents]:
+            git_marker = parent / ".git"
+            if git_marker.exists():
+                return parent
+            for marker in root_markers:
+                if (parent / marker).exists():
+                    return parent
+            # Globs for ecosystems where a single root marker is often sufficient.
+            if next(parent.glob("*.sln"), None) is not None:
+                return parent
+
+        return candidate
+
     def index_repository(
         self,
         repo_path: Path,
@@ -87,41 +130,45 @@ class TaskOrchestrator:
         if not repo_path.exists():
             raise FileNotFoundError(f"Repository not found: {repo_path}")
 
+        requested_path = repo_path.resolve()
+        resolved_repo_path = self._resolve_repo_root(requested_path)
+
         sys.stderr.write("Analyzing repository structure...\n")
         summary = self.context_indexer.summarize_repository(
-            repo_path.resolve(),
+            resolved_repo_path,
             include_serena_semantic_tree=include_serena_semantic_tree,
         )
         
         # Get comprehensive git information
         git_info = {}
         try:
-            git_info["current_commit"] = self._current_commit(repo_path.resolve())
-            git_info["current_branch"] = self._get_current_branch(repo_path.resolve())
-            git_info["remote_url"] = self._get_remote_url(repo_path.resolve())
-            git_info["commit_author"] = self._get_commit_author(repo_path.resolve())
-            git_info["commit_message"] = self._get_commit_message(repo_path.resolve())
-            git_info["commit_date"] = self._get_commit_date(repo_path.resolve())
+            git_info["current_commit"] = self._current_commit(resolved_repo_path)
+            git_info["current_branch"] = self._get_current_branch(resolved_repo_path)
+            git_info["remote_url"] = self._get_remote_url(resolved_repo_path)
+            git_info["commit_author"] = self._get_commit_author(resolved_repo_path)
+            git_info["commit_message"] = self._get_commit_message(resolved_repo_path)
+            git_info["commit_date"] = self._get_commit_date(resolved_repo_path)
         except Exception as e:
             self.logger.record("WARNING", "GIT_INFO_FAILED", {"error": str(e)})
             git_info["error"] = str(e)
 
         # Generate semantic index using LLM
-        sys.stderr.write(f"Generating semantic index (this may take a minute)...\n")
+        sys.stderr.write("Generating semantic index (this may take a minute)...\n")
         semantic_index = None
         try:
             semantic_index = self.semantic_indexer.generate_semantic_index(
-                repo_path=repo_path.resolve(),
+                repo_path=resolved_repo_path,
                 basic_summary=summary
             )
-            sys.stderr.write(f"✓ Semantic index generated successfully\n")
+            sys.stderr.write("✓ Semantic index generated successfully\n")
         except Exception as e:
             sys.stderr.write(f"Warning: Failed to generate semantic index: {e}\n")
             self.logger.record("WARNING", "SEMANTIC_INDEX_FAILED", {"error": str(e)})
 
         index_data = {
-            "repo_path": str(repo_path.resolve()),
-            "repo_name": repo_path.name,
+            "repo_path": str(resolved_repo_path),
+            "requested_path": str(requested_path),
+            "repo_name": resolved_repo_path.name,
             "branch": branch,
             "repository_summary": summary,
             "semantic_index": semantic_index,
@@ -140,7 +187,7 @@ class TaskOrchestrator:
         self.logger.record(
             "SYSTEM",
             "REPOSITORY_INDEXED",
-            {"repo_path": str(repo_path), "branch": branch, "has_semantic_index": semantic_index is not None}
+            {"repo_path": str(resolved_repo_path), "requested_path": str(requested_path), "branch": branch, "has_semantic_index": semantic_index is not None}
         )
 
         return index_data
@@ -160,7 +207,7 @@ class TaskOrchestrator:
         index_data = self.store.load_repository_index()
 
         indexed_repo = Path(index_data.get("repo_path", "")).resolve() if index_data.get("repo_path") else None
-        requested_repo = repo_path.resolve()
+        requested_repo = self._resolve_repo_root(repo_path.resolve())
         if indexed_repo and indexed_repo != requested_repo:
             raise ValueError(
                 f"Repository index is for {indexed_repo}, but enrichment requested for {requested_repo}. "
@@ -249,9 +296,10 @@ class TaskOrchestrator:
         return task
 
     def create_task(self, repo_path: Path, branch: str, description: str) -> Task:
+        resolved_repo_path = self._resolve_repo_root(repo_path.resolve())
         task = Task(
             id=str(uuid4()),
-            repo_path=repo_path.resolve(),
+            repo_path=resolved_repo_path,
             branch=branch,
             description=description,
             status=TaskStatus.CLARIFYING,
@@ -316,6 +364,18 @@ class TaskOrchestrator:
         Return the most recent repository index payload saved by the index command.
         """
         return self.store.load_repository_index()
+
+    def get_repository_index_for_repo(self, repo_path: Path) -> Dict[str, Any]:
+        """
+        Return the cached repository index payload for a specific repo (if present).
+        """
+        return self.store.load_repository_index_for_repo(repo_path.resolve(), None)
+
+    def get_repository_index_for_repo_and_branch(self, repo_path: Path, branch: str) -> Dict[str, Any]:
+        """
+        Return the cached repository index payload for a specific repo+branch (if present).
+        """
+        return self.store.load_repository_index_for_repo(repo_path.resolve(), branch)
 
     def list_clarifications(self, task_id: str) -> List[Dict[str, Any]]:
         task = self._get_task(task_id)
@@ -541,6 +601,268 @@ class TaskOrchestrator:
             summary = self.context_indexer.summarize_targets(task.repo_path, target_args)
 
         return {"step": step, "summary": summary}
+
+    def infer_scope_targets(self, task_id: str) -> Dict[str, Any]:
+        """
+        Infer a small set of repo paths to use as frozen scope for bounded indexing.
+
+        Primary signal: Serena semantic tree (code symbols + paths).
+        Fallback signals: repo top_directories/namespaces, and lightweight filename globs for config files.
+        """
+        import re
+
+        task = self._get_task(task_id)
+        repo_path = task.repo_path.resolve()
+        desc = (task.description or "").strip()
+
+        clarifications = task.metadata.get("clarifications", []) or []
+        # Try to extract the "directly affected modules/components" answer to bias scope.
+        affected_answer = ""
+        for item in clarifications:
+            if not isinstance(item, dict):
+                continue
+            status = (item.get("status") or "").strip().upper()
+            if status != "ANSWERED":
+                continue
+            q = (item.get("question") or "").strip().lower()
+            a = (item.get("answer") or "").strip()
+            if not a:
+                continue
+            if any(
+                needle in q
+                for needle in (
+                    "directly affected",
+                    "modules or components",
+                    "components within the repository",
+                    "affected by the",
+                    "impacted",
+                )
+            ):
+                affected_answer = a
+                break
+
+        answered_text = " ".join(
+            (item.get("answer") or "")
+            for item in clarifications
+            if isinstance(item, dict) and (item.get("status") or "").strip().upper() == "ANSWERED"
+        )
+        text = f"{desc}\n{answered_text}".strip()
+
+        # Build keyword set (basic, but effective).
+        raw_tokens = re.findall(r"[A-Za-z0-9_.-]{3,}", text)
+        keywords: set[str] = set()
+        for tok in raw_tokens:
+            t = tok.strip().strip(".,:;()[]{}\"'").lower()
+            if len(t) < 4:
+                continue
+            # Skip very common noise tokens
+            if t in {"this", "that", "with", "from", "into", "only", "should", "need", "have", "been"}:
+                continue
+            keywords.add(t)
+
+        # Always seed with common config/security terms.
+        keywords |= {"oauth", "oauth2", "token", "secret", "secrets", "encrypt", "encrypted", "credential", "credentials", "appsettings"}
+
+        # Focus tokens: when the engineer answers "this is about encrypted service",
+        # we should bias scope toward that component and its tests, not the whole repo.
+        focus_tokens: set[str] = set()
+        if affected_answer:
+            # Extract words and also a compact "joined" token.
+            words = re.findall(r"[A-Za-z0-9]{3,}", affected_answer.lower())
+            joined = re.sub(r"[^a-z0-9]+", "", affected_answer.lower())
+            for w in words:
+                if len(w) >= 4:
+                    focus_tokens.add(w)
+            if len(joined) >= 6:
+                focus_tokens.add(joined)
+            # Common expansions for "encrypted service" phrasing
+            if "encrypted" in focus_tokens and "service" in focus_tokens:
+                focus_tokens.add("encryptedservice")
+            if "encryption" in focus_tokens and "service" in focus_tokens:
+                focus_tokens.add("encryptionservice")
+            # A few relevant stems
+            for stem in ("encrypt", "encrypted", "encryption", "encryptionservice", "encryptedservice"):
+                if stem in joined:
+                    focus_tokens.add(stem)
+
+        def _is_noise_path(rel_path: str) -> bool:
+            p = (rel_path or "").replace("\\", "/").lower()
+            return any(
+                token in p
+                for token in (
+                    "/bin/",
+                    "/obj/",
+                    "/node_modules/",
+                    "/dist/",
+                    "/build/",
+                    "/.git/",
+                    "/.venv/",
+                    "/.idea/",
+                )
+            )
+
+        def _load_serena_tree_payload() -> Dict[str, Any] | None:
+            summary = task.metadata.get("repository_summary") or {}
+            if isinstance(summary, dict) and summary.get("serena_semantic_tree"):
+                return summary.get("serena_semantic_tree")
+            # If the task was created before background Serena export finished, use latest repository index.
+            try:
+                index = self.store.load_repository_index()
+                if Path(index.get("repo_path", "")).resolve() == repo_path:
+                    rs = index.get("repository_summary") or {}
+                    if isinstance(rs, dict) and rs.get("serena_semantic_tree"):
+                        return rs.get("serena_semantic_tree")
+            except Exception:
+                return None
+            return None
+
+        def _flatten_tree_files(tree_node: Dict[str, Any]) -> list[dict]:
+            out: list[dict] = []
+            stack = [tree_node]
+            while stack:
+                node = stack.pop()
+                if not isinstance(node, dict):
+                    continue
+                t = node.get("type")
+                if t == "file":
+                    out.append(node)
+                for child in (node.get("children") or []):
+                    stack.append(child)
+            return out
+
+        targets: list[str] = []
+        sample_files: list[str] = []
+        reason = "fallback"
+
+        serena = _load_serena_tree_payload()
+        if isinstance(serena, dict) and isinstance(serena.get("tree"), dict):
+            reason = "serena-semantic-tree"
+            files = _flatten_tree_files(serena["tree"])
+            scored: list[tuple[int, str]] = []
+            for f in files:
+                path = (f.get("path") or "").replace("\\", "/")
+                if not path:
+                    continue
+                if _is_noise_path(path):
+                    continue
+                p_l = path.lower()
+                score = 0
+
+                # If we have a focused component, require at least one focus token match
+                # in path/symbols/overview to avoid pulling unrelated modules.
+                focus_match = False
+                if focus_tokens:
+                    if any(tok in p_l for tok in focus_tokens):
+                        focus_match = True
+                    else:
+                        for sym in (f.get("symbols") or []):
+                            name = (sym.get("name") or "").lower()
+                            if any(tok in name for tok in focus_tokens):
+                                focus_match = True
+                                break
+                    if not focus_match:
+                        overview = (f.get("overview") or "").lower()
+                        if any(tok in overview for tok in focus_tokens):
+                            focus_match = True
+
+                # Path matches are strong.
+                for k in keywords:
+                    if k in p_l:
+                        score += 3
+                # Symbol name matches are medium.
+                for sym in (f.get("symbols") or []):
+                    name = (sym.get("name") or "").lower()
+                    for k in keywords:
+                        if k and k in name:
+                            score += 2
+                # Overview matches are weak but helpful.
+                overview = (f.get("overview") or "").lower()
+                for k in keywords:
+                    if k in overview:
+                        score += 1
+
+                # Apply strong bias toward focused component (but still allow tests/config
+                # if they reference the focused component).
+                if focus_tokens:
+                    if not focus_match:
+                        # Drop unrelated files entirely.
+                        continue
+                    score += 10
+
+                if score > 0:
+                    scored.append((score, path))
+
+            scored.sort(key=lambda x: (-x[0], x[1]))
+            top_files = [p for _, p in scored[:30]]
+            sample_files = top_files[:12]
+
+            # Convert to directory targets (prefer shallow dirs).
+            dir_hits: dict[str, int] = {}
+            for score, p in scored[:80]:
+                parts = p.split("/")
+                if len(parts) >= 2:
+                    # When focus exists, use a slightly deeper directory (e.g. src/Foo.Domain/Services)
+                    # to avoid scoping the entire module root.
+                    depth = 3 if focus_tokens else 2
+                    d = "/".join(parts[: min(len(parts) - 1, depth)])
+                else:
+                    d = p
+                if _is_noise_path(d):
+                    continue
+                dir_hits[d] = dir_hits.get(d, 0) + score
+
+            ranked_dirs = sorted(dir_hits.items(), key=lambda x: (-x[1], x[0]))
+            targets = [d for d, _ in ranked_dirs[:8]]
+
+        # Fallback: if we couldn't infer from Serena, use top-level dirs and common config files.
+        if not targets:
+            summary = task.metadata.get("repository_summary") or {}
+            if isinstance(summary, dict):
+                top_dirs = summary.get("top_directories") or []
+                if top_dirs:
+                    targets = [str(d).rstrip("/") + "/" for d in top_dirs[:6]]
+                    reason = "serena-top-directories"
+
+        # Add lightweight config file directories (without scanning whole repo).
+        config_candidates: list[Path] = []
+        for pat in ("**/appsettings*.json", "**/*oauth*.*", "**/*token*.*", "**/*secret*.*"):
+            try:
+                for p in list(repo_path.glob(pat))[:8]:
+                    config_candidates.append(p)
+            except Exception:
+                continue
+        for p in config_candidates[:12]:
+            try:
+                rel = str(p.relative_to(repo_path)).replace("\\", "/")
+            except Exception:
+                continue
+            if _is_noise_path(rel):
+                continue
+            parent = rel.rsplit("/", 1)[0] if "/" in rel else rel
+            if parent and parent not in targets:
+                targets.append(parent)
+
+        # Validate existence and normalize.
+        normalized: list[str] = []
+        for t in targets:
+            tt = str(t).strip().strip("/")
+            if not tt:
+                continue
+            if _is_noise_path(tt):
+                continue
+            cand = (repo_path / tt).resolve()
+            if cand.exists():
+                normalized.append(tt)
+        # De-dupe preserving order
+        seen: set[str] = set()
+        final_targets: list[str] = []
+        for t in normalized:
+            if t in seen:
+                continue
+            seen.add(t)
+            final_targets.append(t)
+
+        return {"targets": final_targets[:12], "sample_files": sample_files, "reason": reason}
 
     # ------------------------------------------------------------------ Planning
     @staticmethod
@@ -926,14 +1248,13 @@ class TaskOrchestrator:
                 except ValueError:
                     LOG.debug("Ignoring unknown spec status '%s' for %s", prev_status, spec.boundary_name)
 
+        # Serialize preliminary plan artifacts.
         plan_preview = {
             "id": plan.id,
             "steps": [step.to_dict() for step in plan.steps],
             "risks": plan.risks,
             "refactors": plan.refactor_suggestions,
         }
-        task.metadata["plan_preview"] = plan_preview
-
         serialized_specs = [
             {
                 "id": spec.id,
@@ -947,15 +1268,12 @@ class TaskOrchestrator:
             }
             for spec in specs
         ]
-        task.metadata["boundary_specs"] = serialized_specs
-        pending_specs = [spec["boundary_name"] for spec in serialized_specs if spec["status"] == BoundarySpecStatus.PENDING.value]
-        task.metadata["pending_specs"] = pending_specs
-        task.metadata["refactor_suggestions"] = [item.to_dict() for item in refactors]
-        task.metadata["plan_approved"] = False
-        task.metadata.pop("plan_approved_at", None)
-        for key in ("patch_queue", "patch_queue_state", "test_suggestions"):
-            task.metadata.pop(key, None)
 
+        pending_specs = [spec["boundary_name"] for spec in serialized_specs if spec["status"] == BoundarySpecStatus.PENDING.value]
+
+        # Resolve plan targets to paths and build a frozen scoped index (allowlist).
+        # Note: the final plan regeneration happens when the preliminary plan is approved
+        # in chat (see build_final_plan_with_frozen_scope()).
         plan_targets = sorted(
             {
                 target
@@ -965,20 +1283,22 @@ class TaskOrchestrator:
             }
         )
         plan_targets_resolution = None
+        resolved_targets: list[str] = []
+
         if plan_targets:
             plan_targets_resolution = self._resolve_plan_targets_to_paths(
                 task.repo_path,
                 plan_targets,
                 base_summary or {},
             )
-
             resolved_targets = list(plan_targets_resolution.get("resolved_targets") or [])
+
+        if resolved_targets:
             include_paths: List[Path] = []
             for rel in resolved_targets:
                 candidate = (task.repo_path / rel).resolve()
                 if candidate.exists():
                     include_paths.append(candidate)
-
             if include_paths:
                 self._record_context_step(
                     task,
@@ -987,14 +1307,38 @@ class TaskOrchestrator:
                     note="Auto-selected from plan targets (resolved to filesystem paths)",
                 )
 
-            bounded_summary: Dict[str, Any] = (
-                self.context_indexer.summarize_targets(task.repo_path, resolved_targets)
-                if resolved_targets
-                else {"targets": {}, "aggregate": {}, "impact": {}, "serena_semantic_tree": None}
+            bounded_summary = self.context_indexer.summarize_targets(
+                task.repo_path,
+                resolved_targets,
+                include_file_list=True,
             )
             bounded_summary["plan_targets_resolution"] = plan_targets_resolution
             task.metadata.setdefault("bounded_context", {})
             task.metadata["bounded_context"]["plan_targets"] = bounded_summary
+            # If no manual scope is present, this plan is a preliminary plan that can be
+            # finalized later by regenerating with a frozen allowlist.
+            task.metadata["plan_stage"] = "PRELIMINARY"
+
+        # If we already have a frozen manual bounded scope (from clarifications),
+        # treat the plan as FINAL immediately (no second pass required).
+        if scoped_manual:
+            scope_meta = (scoped_manual.get("scope") or {}) if isinstance(scoped_manual, dict) else {}
+            frozen = bool(scope_meta.get("frozen"))
+            agg = (scoped_manual.get("aggregate") or {}) if isinstance(scoped_manual, dict) else {}
+            file_count = agg.get("file_count", 0) if isinstance(agg, dict) else 0
+            if frozen and isinstance(file_count, int) and file_count > 0:
+                task.metadata["plan_stage"] = "FINAL"
+        # Default stage if not otherwise set.
+        task.metadata.setdefault("plan_stage", "PRELIMINARY")
+
+        task.metadata["plan_preview"] = plan_preview
+        task.metadata["boundary_specs"] = serialized_specs
+        task.metadata["pending_specs"] = pending_specs
+        task.metadata["refactor_suggestions"] = [item.to_dict() for item in refactors]
+        task.metadata["plan_approved"] = False
+        task.metadata.pop("plan_approved_at", None)
+        for key in ("patch_queue", "patch_queue_state", "test_suggestions"):
+            task.metadata.pop(key, None)
 
         task.status = TaskStatus.SPEC_PENDING if pending_specs else TaskStatus.PLANNING
         self._snapshot_worktree_status(task)
@@ -1029,6 +1373,111 @@ class TaskOrchestrator:
             return_payload["plan_targets_resolution"] = plan_targets_resolution
         return return_payload
 
+    def build_final_plan_with_frozen_scope(self, task_id: str) -> Dict[str, Any]:
+        """
+        After a preliminary plan is approved (in chat), freeze scope and regenerate a final plan
+        using the frozen allowlist from bounded_context.plan_targets (or bounded_context.manual).
+        """
+        import sys
+
+        task = self._get_task(task_id)
+        base_summary = task.metadata.get("repository_summary", {}) or {}
+        bounded_context = task.metadata.get("bounded_context", {}) or {}
+
+        # Prefer manual bounded scope if present; it is already frozen (allowlist).
+        manual = bounded_context.get("manual")
+        plan_targets_scope = bounded_context.get("plan_targets")
+        scoped = manual or plan_targets_scope
+        if not isinstance(scoped, dict) or not scoped:
+            raise ValueError("No scoped context available to freeze. Provide scope paths during chat or via bounded-index.")
+
+        aggregate = (scoped.get("aggregate") or {}) if isinstance(scoped, dict) else {}
+        scoped_files = aggregate.get("file_count", 0) if isinstance(aggregate, dict) else 0
+        if not isinstance(scoped_files, int) or scoped_files <= 0:
+            raise ValueError("Scoped context is empty; cannot build a final plan. Provide real filesystem paths for scope.")
+
+        # Use the same augmented description logic as generate_plan (include answered clarifications).
+        augmented_description = task.description.strip()
+        clarifications = task.metadata.get("clarifications", []) or []
+        answered_lines: List[str] = []
+        for item in clarifications:
+            if not isinstance(item, dict):
+                continue
+            status = (item.get("status") or "").strip().upper()
+            question = (item.get("question") or "").strip()
+            answer = (item.get("answer") or "").strip()
+            if status == "ANSWERED" and question and answer:
+                answered_lines.append(f"- Q: {question}\n  A: {answer}")
+        if answered_lines:
+            augmented_description = f"{augmented_description}\n\nClarifications (answered):\n" + "\n".join(answered_lines)
+
+        sys.stderr.write(f"Rebuilding final plan with frozen scoped context ({scoped_files} files)...\n")
+        second_pass_context = dict(base_summary)
+        second_pass_context["scoped_context"] = scoped
+        second_pass_context["scoped_context_source"] = (
+            "bounded_context.manual" if manual else "bounded_context.plan_targets"
+        )
+
+        plan = self.plan_builder.build_plan(task.id, augmented_description, second_pass_context)
+        sys.stderr.write(f"Final plan created with {len(plan.steps)} steps\n")
+
+        sys.stderr.write("Detecting boundaries (final plan)...\n")
+        boundary_manager = BoundaryManager(
+            llm_client=self.llm_client,
+            context_summary=second_pass_context,
+        )
+        specs = boundary_manager.required_specs(plan)
+        sys.stderr.write(f"Found {len(specs)} boundary specs (final plan)\n")
+
+        sys.stderr.write("Generating refactor suggestions (final plan)...\n")
+        refactors = self.refactor_advisor.suggest(plan)
+
+        # Preserve preliminary plan for auditability.
+        if task.metadata.get("plan_preview"):
+            task.metadata["plan_preview_preliminary"] = task.metadata.get("plan_preview")
+
+        plan_preview = {
+            "id": plan.id,
+            "steps": [step.to_dict() for step in plan.steps],
+            "risks": plan.risks,
+            "refactors": plan.refactor_suggestions,
+        }
+        serialized_specs = [
+            {
+                "id": spec.id,
+                "task_id": spec.task_id,
+                "boundary_name": spec.boundary_name,
+                "human_description": spec.human_description,
+                "diagram_text": spec.diagram_text,
+                "machine_spec": spec.machine_spec,
+                "status": spec.status.value,
+                "plan_step": spec.plan_step,
+            }
+            for spec in specs
+        ]
+        pending_specs = [
+            spec["boundary_name"]
+            for spec in serialized_specs
+            if spec["status"] == BoundarySpecStatus.PENDING.value
+        ]
+
+        task.metadata["plan_preview"] = plan_preview
+        task.metadata["boundary_specs"] = serialized_specs
+        task.metadata["pending_specs"] = pending_specs
+        task.metadata["refactor_suggestions"] = [item.to_dict() for item in refactors]
+        task.metadata["plan_stage"] = "FINAL"
+        task.metadata["plan_approved"] = False
+        task.metadata.pop("plan_approved_at", None)
+        for key in ("patch_queue", "patch_queue_state", "test_suggestions"):
+            task.metadata.pop(key, None)
+
+        task.status = TaskStatus.SPEC_PENDING if pending_specs else TaskStatus.PLANNING
+        self._snapshot_worktree_status(task)
+        task.touch()
+        self.store.upsert_task(task)
+
+        return {"status": "FINAL_BUILT", "plan": plan_preview, "pending_specs": pending_specs}
+
     def bounded_index_task(
         self,
         task_id: str,
@@ -1046,22 +1495,34 @@ class TaskOrchestrator:
             include_serena_semantic_tree=include_serena_semantic_tree,
             include_file_list=True,
         )
-        task.metadata.setdefault("bounded_context", {})
-        task.metadata["bounded_context"]["manual"] = summary
-        include_paths = [
-            (task.repo_path / Path(target)).resolve()
-            if not Path(target).is_absolute()
-            else Path(target).resolve()
-            for target in targets
-        ]
-        self._record_context_step(task, "bounded-index", included=include_paths, note="Engineer requested scoped index")
-        task.touch()
-        self.store.upsert_task(task)
-        self.logger.record(
-            task.id,
-            "BOUNDED_INDEX_CREATED",
-            {"targets": list(summary.get("targets", {}).keys())},
-        )
+        aggregate = summary.get("aggregate", {}) if isinstance(summary, dict) else {}
+        file_count = aggregate.get("file_count", 0) if isinstance(aggregate, dict) else 0
+        targets_indexed = list((summary.get("targets", {}) or {}).keys()) if isinstance(summary, dict) else []
+
+        # Defensive: don't persist an empty bounded index. In practice, this usually
+        # means the provided targets were invalid or were module labels rather than paths.
+        if isinstance(file_count, int) and file_count > 0 and targets_indexed:
+            task.metadata.setdefault("bounded_context", {})
+            task.metadata["bounded_context"]["manual"] = summary
+            include_paths = [
+                (task.repo_path / Path(target)).resolve()
+                if not Path(target).is_absolute()
+                else Path(target).resolve()
+                for target in targets
+            ]
+            self._record_context_step(
+                task,
+                "bounded-index",
+                included=include_paths,
+                note="Engineer requested scoped index",
+            )
+            task.touch()
+            self.store.upsert_task(task)
+            self.logger.record(
+                task.id,
+                "BOUNDED_INDEX_CREATED",
+                {"targets": targets_indexed},
+            )
         return summary
 
     # ------------------------------------------------------------------ Boundary Specs
@@ -1131,6 +1592,34 @@ class TaskOrchestrator:
         )
 
         return {"spec_id": spec_id, "status": "SKIPPED"}
+
+    def approve_all_specs(self, task_id: str) -> Dict[str, Any]:
+        """
+        Approve all remaining pending boundary specs for a task.
+        """
+        specs = self.get_boundary_specs(task_id)
+        pending_ids = [
+            s.get("id")
+            for s in (specs or [])
+            if (s.get("status") or "") == BoundarySpecStatus.PENDING.value and s.get("id")
+        ]
+        for spec_id in pending_ids:
+            self.approve_spec(task_id, str(spec_id))
+        return {"approved_count": len(pending_ids), "approved_spec_ids": pending_ids}
+
+    def skip_all_specs(self, task_id: str) -> Dict[str, Any]:
+        """
+        Skip all remaining pending boundary specs for a task.
+        """
+        specs = self.get_boundary_specs(task_id)
+        pending_ids = [
+            s.get("id")
+            for s in (specs or [])
+            if (s.get("status") or "") == BoundarySpecStatus.PENDING.value and s.get("id")
+        ]
+        for spec_id in pending_ids:
+            self.skip_spec(task_id, str(spec_id))
+        return {"skipped_count": len(pending_ids), "skipped_spec_ids": pending_ids}
 
     def update_spec_fields(
         self,
@@ -1259,6 +1748,128 @@ class TaskOrchestrator:
 
         return {"status": "APPROVED", "task_id": task_id}
 
+    def export_approved_plan_markdown(self, task_id: str, *, output_path: Path | None = None) -> Path:
+        """
+        Export the approved plan to a Markdown file under the target repository.
+
+        Default path: <repo>/docs/plans/<slugified-description>.md (with a short task id suffix if needed)
+        """
+        task = self._get_task(task_id)
+        if not task.metadata.get("plan_approved", False):
+            raise ValueError("Plan must be approved before exporting Markdown.")
+
+        plan_preview = task.metadata.get("plan_preview", {}) or {}
+        steps = plan_preview.get("steps", []) or []
+        risks = plan_preview.get("risks", []) or []
+        refactors = plan_preview.get("refactors", []) or []
+        specs = task.metadata.get("boundary_specs", []) or []
+
+        bounded_context = task.metadata.get("bounded_context", {}) or {}
+        bounded = bounded_context.get("manual") or bounded_context.get("plan_targets") or {}
+        scoped_aggregate = (bounded.get("aggregate") or {}) if isinstance(bounded, dict) else {}
+
+        repo_path = task.repo_path.resolve()
+        docs_dir = repo_path / "docs"
+        docs_dir.mkdir(parents=True, exist_ok=True)
+        plans_dir = docs_dir / "plans"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+
+        if output_path is None:
+            raw_title = (task.description or "").strip() or f"task-{task.id}"
+            title_line = raw_title.splitlines()[0].strip() if raw_title else f"task-{task.id}"
+
+            def _slugify(value: str) -> str:
+                import re
+
+                s = (value or "").strip().lower()
+                s = re.sub(r"[^a-z0-9]+", "-", s)
+                s = re.sub(r"-{2,}", "-", s).strip("-")
+                return s or f"task-{task.id}"
+
+            slug = _slugify(title_line)[:80].rstrip("-")
+            candidate = plans_dir / f"{slug}.md"
+            if candidate.exists():
+                candidate = plans_dir / f"{slug}-{task.id[:8]}.md"
+            output_path = candidate
+
+        def _fmt_list(items: list[str]) -> str:
+            return "\n".join(f"- {item}" for item in items) if items else "_None_"
+
+        lines: list[str] = []
+        title = (task.description or "").strip().splitlines()[0].strip() if (task.description or "").strip() else "Spec Agent Plan"
+        if len(title) > 120:
+            title = title[:117].rstrip() + "..."
+        lines.append(f"# {title}")
+        lines.append("")
+        lines.append(f"- **Task ID**: `{task.id}`")
+        lines.append(f"- **Repo**: `{repo_path}`")
+        lines.append(f"- **Branch**: `{task.branch}`")
+        if task.metadata.get("plan_approved_at"):
+            lines.append(f"- **Approved at**: `{task.metadata.get('plan_approved_at')}`")
+        lines.append("")
+        lines.append("## Change request")
+        lines.append("")
+        lines.append(task.description.strip() or "_(missing description)_")
+        lines.append("")
+
+        repo_summary = task.metadata.get("repository_summary", {}) or {}
+        repo_files = repo_summary.get("file_count", "unknown")
+        scoped_files = scoped_aggregate.get("file_count")
+        if isinstance(scoped_files, int):
+            lines.append("## Scope")
+            lines.append("")
+            lines.append(f"- **Total files (scoped)**: {scoped_files} (repo: {repo_files})")
+            targets = list(((bounded.get("targets") or {}) if isinstance(bounded, dict) else {}).keys())
+            if targets:
+                lines.append(f"- **Targets**: {', '.join(f'`{t}`' for t in targets[:25])}{' …' if len(targets) > 25 else ''}")
+            lines.append("")
+
+        lines.append("## Plan steps")
+        lines.append("")
+        if steps:
+            for idx, step in enumerate(steps, start=1):
+                if isinstance(step, dict):
+                    desc = (step.get("description") or "").strip() or "(missing step description)"
+                    lines.append(f"{idx}. {desc}")
+                    targets = step.get("target_files") or []
+                    if targets:
+                        lines.append(f"   - Targets: {', '.join(f'`{t}`' for t in targets)}")
+                    notes = (step.get("notes") or "").strip()
+                    if notes:
+                        lines.append(f"   - Notes: {notes}")
+                else:
+                    lines.append(f"{idx}. {str(step)}")
+        else:
+            lines.append("_No plan steps generated._")
+        lines.append("")
+
+        lines.append("## Risks")
+        lines.append("")
+        lines.append(_fmt_list([str(r) for r in risks if str(r).strip()]))
+        lines.append("")
+
+        lines.append("## Refactor suggestions")
+        lines.append("")
+        lines.append(_fmt_list([str(r) for r in refactors if str(r).strip()]))
+        lines.append("")
+
+        lines.append("## Boundary specs")
+        lines.append("")
+        if specs:
+            for spec in specs:
+                name = (spec.get("boundary_name") or "Unknown").strip()
+                status = (spec.get("status") or "").strip()
+                lines.append(f"- **{name}**{f' ({status})' if status else ''}")
+        else:
+            lines.append("_None_")
+        lines.append("")
+
+        output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        task.metadata["plan_markdown_path"] = str(output_path)
+        task.touch()
+        self.store.upsert_task(task)
+        return output_path
+
     def generate_patches(self, task_id: str, skip_rationale_enhancement: bool = False) -> Dict:
         """
         Generate patches for an approved plan.
@@ -1292,7 +1903,7 @@ class TaskOrchestrator:
         )
 
         # Reconstruct boundary specs from stored data
-        from ..domain.models import BoundarySpec, BoundarySpecStatus
+        from ..domain.models import BoundarySpecStatus
         specs = [
             BoundarySpec(
                 id=spec_data["id"],
@@ -1447,9 +2058,20 @@ class TaskOrchestrator:
             "patch_queue",
             "patch_queue_state",
             "test_suggestions",
-            "bounded_context",
         ):
             task.metadata.pop(key, None)
+
+        # Preserve engineer-provided bounded scope across plan resets/rejections, but
+        # drop auto-generated plan-target scoping (it can be regenerated).
+        bounded = task.metadata.get("bounded_context")
+        if isinstance(bounded, dict) and bounded:
+            manual = bounded.get("manual")
+            if manual:
+                task.metadata["bounded_context"] = {"manual": manual}
+            else:
+                task.metadata.pop("bounded_context", None)
+        else:
+            task.metadata.pop("bounded_context", None)
 
         if reset_context_steps:
             task.metadata.pop("context_steps", None)
@@ -1581,7 +2203,7 @@ class TaskOrchestrator:
         
         # Try applying with --3way first (allows 3-way merge for better conflict resolution)
         try:
-            result = subprocess.run(
+            subprocess.run(
                 ["git", "apply", "--whitespace=nowarn", "--3way"],
                 input=diff,
                 text=True,
@@ -1599,7 +2221,7 @@ class TaskOrchestrator:
         
         # Try with more lenient whitespace handling
         try:
-            result = subprocess.run(
+            subprocess.run(
                 ["git", "apply", "--whitespace=nowarn", "--ignore-space-change"],
                 input=diff,
                 text=True,
@@ -1615,7 +2237,7 @@ class TaskOrchestrator:
         
         # Fallback to standard apply
         try:
-            result = subprocess.run(
+            subprocess.run(
                 ["git", "apply", "--whitespace=nowarn"],
                 input=diff,
                 text=True,
@@ -1786,7 +2408,6 @@ class TaskOrchestrator:
                         hunks.append((*current_hunk, additions))
                     start_line = int(hunk_match.group(1))
                     old_count = int(hunk_match.group(2))
-                    new_count = int(hunk_match.group(4))
                     current_hunk = (start_line, old_count)
                     additions = []
                     continue

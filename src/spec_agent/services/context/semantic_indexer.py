@@ -294,7 +294,7 @@ Do NOT wrap the JSON in code blocks."""
             prompt_parts.append(f"- Detected Frameworks: {', '.join(basic_summary['frameworks'])}")
         
         if basic_summary.get('top_modules'):
-            prompt_parts.append(f"\n## Top Modules/Namespaces:")
+            prompt_parts.append("\n## Top Modules/Namespaces:")
             for module in basic_summary['top_modules'][:10]:
                 prompt_parts.append(f"  - {module}")
         

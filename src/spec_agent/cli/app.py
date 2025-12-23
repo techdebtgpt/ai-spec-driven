@@ -130,8 +130,9 @@ def index(
 
     summary = index_data.get("repository_summary", {})
     git_info = index_data.get("git_info", {})
+    resolved_repo_path = Path(index_data.get("repo_path") or repo).resolve()
 
-    console.print(f"[bold green]Repository indexed successfully[/]\n")
+    console.print("[bold green]Repository indexed successfully[/]\n")
 
     if serena_semantic_tree:
         tree_payload = summary.get("serena_semantic_tree") or {}
@@ -151,7 +152,7 @@ def index(
     
     # Basic repository information
     info_lines.append(f"[bold cyan]Repository:[/] {index_data.get('repo_name', repo.name)}")
-    info_lines.append(f"[bold cyan]Path:[/] {repo}")
+    info_lines.append(f"[bold cyan]Path:[/] {resolved_repo_path}")
     info_lines.append(f"[bold cyan]Branch:[/] {branch}")
     
     # Git information
@@ -267,7 +268,7 @@ def index(
     else:
         console.print("[dim]Basic language detection (Serena not enabled)[/]")
     
-    console.print(f"\n[cyan]Index saved. You can now run:[/] [bold]./spec-agent start --description \"Your task\"[/]")
+    console.print("\n[cyan]Index saved. You can now run:[/] [bold]./spec-agent start --description \"Your task\"[/]")
 
     if json_output:
         console.print_json(data=json.dumps(index_data, default=str))
@@ -411,7 +412,7 @@ def bounded_index(
                 f"[dim]Scoped Serena semantic tree: indexed {stats.get('indexed_files', 0)} files "
                 f"(failed {stats.get('failed_files', 0)}) in {stats.get('elapsed_seconds', '?')}s[/]"
             )
-    else:
+    elif not targets_summary and not (aggregate.get("file_count") or 0):
         console.print("[yellow]No matching files were indexed for the provided targets.[/]")
 
 
@@ -769,18 +770,18 @@ def specs(task_id: str = typer.Argument(..., help="UUID of the task.")) -> None:
         console.print(f"[bold]Boundary Spec #{i}: {spec.get('boundary_name')} [[{status_color}]{spec.get('status', 'PENDING')}[/]]")
         console.print(f"[bold]{'='*70}[/]\n")
         console.print(f"[bold]ID:[/] {spec.get('id')}\n")
-        console.print(f"[bold cyan]Description:[/]")
+        console.print("[bold cyan]Description:[/]")
         console.print(f"{spec.get('human_description', 'No description provided.')}\n")
-        console.print(f"[bold cyan]Mermaid Diagram:[/]")
+        console.print("[bold cyan]Mermaid Diagram:[/]")
         console.print(f"[dim]{spec.get('diagram_text', 'No diagram provided.')}[/]\n")
-        console.print(f"[bold cyan]Machine Spec:[/]")
+        console.print("[bold cyan]Machine Spec:[/]")
 
         machine_spec = spec.get('machine_spec', {})
         console.print(f"[bold]Actors:[/] {', '.join(machine_spec.get('actors', []))}")
-        console.print(f"[bold]Interfaces:[/]")
+        console.print("[bold]Interfaces:[/]")
         for interface in machine_spec.get('interfaces', []):
             console.print(f"  - {interface}")
-        console.print(f"[bold]Invariants:[/]")
+        console.print("[bold]Invariants:[/]")
         for invariant in machine_spec.get('invariants', []):
             console.print(f"  - {invariant}")
 
@@ -792,7 +793,7 @@ def specs(task_id: str = typer.Argument(..., help="UUID of the task.")) -> None:
         console.print(f"[dim]Approve: ./spec-agent approve-spec {task_id} <spec-id>[/]")
         console.print(f"[dim]Skip: ./spec-agent skip-spec {task_id} <spec-id>[/]")
     else:
-        console.print(f"\n[green]All specs resolved.[/]")
+        console.print("\n[green]All specs resolved.[/]")
 
 
 @app.command()
@@ -813,7 +814,7 @@ def approve_spec(
         specs = orchestrator.get_boundary_specs(task_id)
         pending = [s for s in specs if s.get("status") == "PENDING"]
         if not pending:
-            console.print(f"\n[bold green]All boundary specs resolved![/] Ready to generate patches.")
+            console.print("\n[bold green]All boundary specs resolved![/] Ready to generate patches.")
         else:
             console.print(f"\n[yellow]{len(pending)} spec(s) still pending approval.[/]")
     except ValueError as exc:
@@ -839,7 +840,7 @@ def skip_spec(
         specs = orchestrator.get_boundary_specs(task_id)
         pending = [s for s in specs if s.get("status") == "PENDING"]
         if not pending:
-            console.print(f"\n[bold green]All boundary specs resolved![/] Ready to generate patches.")
+            console.print("\n[bold green]All boundary specs resolved![/] Ready to generate patches.")
         else:
             console.print(f"\n[yellow]{len(pending)} spec(s) still pending approval.[/]")
     except ValueError as exc:
@@ -1108,7 +1109,7 @@ def review_patches(
                 orchestrator.approve_patch(task_id, patch.id)
                 console.print(f"[green]✓ Patch {patch_index}/{total_pending} applied to working tree.[/]")
                 if patch_index < total_pending:
-                    console.print(f"[dim]Continuing to next patch...[/]\n")
+                    console.print("[dim]Continuing to next patch...[/]\n")
             except Exception as exc:  # pragma: no cover - CLI guardrail
                 console.print(f"[red]Failed to apply patch:[/] {exc}")
                 # Ask if they want to continue or stop

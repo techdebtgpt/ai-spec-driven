@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import List
 
 
@@ -30,7 +29,7 @@ class DummyRepo:
         self.applied_diffs.append(diff)
 
     # Helpers invoked via monkeypatched subprocess.run in tests.
-    def run(self, args: List[str], **_: object):
+    def run(self, args: List[str], **kwargs: object):
         cmd = " ".join(args)
         if cmd.endswith("rev-parse --abbrev-ref HEAD"):
             return _CompletedProcess(self.branch)
@@ -39,7 +38,7 @@ class DummyRepo:
         if cmd.endswith("status --short"):
             return _CompletedProcess(self.status)
         if cmd.startswith("git apply"):
-            self.apply(kwargs.get("input", ""))
+            self.apply(str(kwargs.get("input", "")))
             return _CompletedProcess("")
 
         raise AssertionError(f"Unexpected command {cmd}")

@@ -91,7 +91,7 @@ class RationaleEnhancer:
 
         repo_info = ""
         if repo_context:
-            repo_info = f"\nRepository Context:\n"
+            repo_info = "\nRepository Context:\n"
             repo_info += f"- Primary language: {repo_context.get('primary_language', 'unknown')}\n"
             if repo_context.get("modules"):
                 repo_info += f"- Modules: {', '.join(repo_context.get('modules', [])[:5])}\n"
@@ -207,13 +207,13 @@ Return only valid JSON, no markdown, no explanations."""
         # Build template rationale
         rationale_parts = [patch.rationale]
         
-        rationale_parts.append(f"\n\n**Why this change is needed:**")
+        rationale_parts.append("\n\n**Why this change is needed:**")
         rationale_parts.append(f"This change implements the plan step: {plan_step.description}")
         if plan_step.notes:
             rationale_parts.append(f"Additional context: {plan_step.notes}")
         
         if boundary_specs:
-            rationale_parts.append(f"\n**Constraints from boundary specifications:**")
+            rationale_parts.append("\n**Constraints from boundary specifications:**")
             for spec in boundary_specs:
                 rationale_parts.append(f"- {spec.boundary_name}: Must respect {spec.human_description}")
                 if spec.machine_spec:
@@ -222,7 +222,7 @@ Return only valid JSON, no markdown, no explanations."""
                         rationale_parts.append(f"  Invariants: {', '.join(invariants[:2])}")
         
         if plan.risks:
-            rationale_parts.append(f"\n**Risks considered:**")
+            rationale_parts.append("\n**Risks considered:**")
             for risk in plan.risks[:3]:
                 rationale_parts.append(f"- {risk}")
         

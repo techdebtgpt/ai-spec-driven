@@ -98,7 +98,19 @@ class ContextIndexer:
                 # Heuristic: common test directories
                 if not has_tests:
                     dir_name = path.name.lower()
-                    if dir_name in {"test", "tests", "__tests__", "spec", "specs"}:
+                    # Common cross-language test dirs + dotnet conventions like Foo.Tests / Foo.IntegrationTests
+                    if (
+                        dir_name in {"test", "tests", "__tests__", "spec", "specs"}
+                        # dotnet naming often includes ".Tests." segments (e.g. Foo.Tests.Unit)
+                        or ".tests." in dir_name
+                        or ".test." in dir_name
+                        or dir_name.endswith(".test")
+                        or dir_name.endswith(".tests")
+                        or dir_name.endswith(".integrationtest")
+                        or dir_name.endswith(".integrationtests")
+                        or dir_name.endswith(".unittest")
+                        or dir_name.endswith(".unittests")
+                    ):
                         has_tests = True
                         if len(test_paths_sample) < 10:
                             test_paths_sample.append(str(relative_path).replace("\\", "/"))
@@ -125,6 +137,7 @@ class ContextIndexer:
             if not has_tests:
                 name_lower = path.name.lower()
                 rel_str = str(relative_path).replace("\\", "/")
+                rel_lower = rel_str.lower()
                 if (
                     name_lower.startswith("test_")
                     or name_lower.endswith("_test.py")
@@ -135,8 +148,19 @@ class ContextIndexer:
                     or name_lower.endswith(".test.tsx")
                     or name_lower.endswith(".spec.js")
                     or name_lower.endswith(".test.js")
-                    or "/test/" in f"/{rel_str.lower()}/"
-                    or "/tests/" in f"/{rel_str.lower()}/"
+                    or "/test/" in f"/{rel_lower}/"
+                    or "/tests/" in f"/{rel_lower}/"
+                    # .NET conventions: csproj names/folders often contain ".Tests" or "IntegrationTests"
+                    or name_lower.endswith(".tests.csproj")
+                    or name_lower.endswith(".test.csproj")
+                    or name_lower.endswith("tests.cs")
+                    or name_lower.endswith("test.cs")
+                    or "integrationtests" in name_lower
+                    or "unittests" in name_lower
+                    or ".tests." in rel_lower
+                    or ".test." in rel_lower
+                    or "/.tests/" in f"/{rel_lower}/"
+                    or "/.test/" in f"/{rel_lower}/"
                 ):
                     has_tests = True
                     if len(test_paths_sample) < 10:
@@ -153,6 +177,9 @@ class ContextIndexer:
                 if imports:
                     import_edges[str(relative_path)].extend(imports)
 
+        # Store a shallow directory tree for later "logical target" → path resolution,
+        # without re-scanning the repo during planning.
+        directory_structure = self._build_directory_structure(repo_path, gitignore_spec, max_depth=3)
 
         graph = self._build_graph(import_edges)
         top_modules = [
@@ -290,6 +317,9 @@ class ContextIndexer:
             
             # Dependency graph insight
             "dependency_graph": dependency_graph_summary,
+
+            # Shallow directory tree (for plan-target resolution / UX)
+            "directory_structure": directory_structure,
         }
 
     def summarize_targets(

@@ -118,7 +118,14 @@ Do not include any explanatory text before or after the JSON."""
 
         scoped = context_summary.get("scoped_context") or {}
         scoped_hint = ""
+        total_files_line = f"- Total Files: {context_summary.get('file_count', 'unknown')}"
         if isinstance(scoped, dict) and scoped:
+            agg = scoped.get("aggregate") or {}
+            scoped_files = agg.get("file_count")
+            if isinstance(scoped_files, int):
+                repo_files = context_summary.get("file_count", "unknown")
+                total_files_line = f"- Total Files (scoped): {scoped_files} (repo: {repo_files})"
+
             impact = scoped.get("impact") or {}
             targets = list((scoped.get("targets") or {}).keys())
             top_dirs = impact.get("top_directories") or []
@@ -134,7 +141,7 @@ Do not include any explanatory text before or after the JSON."""
         return f"""Change Request: {description}
 
 Repository Context:
-- Total Files: {context_summary.get('file_count', 'unknown')}
+- {total_files_line}
 - Main Languages: {languages_str}
 - Tests: {tests_str}
 - Legacy Hotspots (large files): {hotspots_str}

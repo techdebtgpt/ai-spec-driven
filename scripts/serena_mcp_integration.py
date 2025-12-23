@@ -25,7 +25,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 try:
     from mcp import ClientSession, StdioServerParameters
@@ -923,7 +923,7 @@ Return only the JSON array, no other text."""
                                     text_lower = text.lower()
                                     if any(err in text_lower for err in ['error', 'validation error', 'failed', 'exception']):
                                         # This looks like an error message, skip it
-                                        sys.stderr.write(f"Warning: read_file returned error message, treating as file not found\n")
+                                        sys.stderr.write("Warning: read_file returned error message, treating as file not found\n")
                                         file_exists = False
                                         original_content = ""
                                     else:
@@ -1895,9 +1895,9 @@ data "{provider}_secretsmanager_secret_version" "oauth_config" {{
                                     new_line = f"{comment_prefix}{step_description}"
                                 
                                 if target_file.endswith('.tf'):
-                                    sys.stderr.write(f"Warning: Using basic Terraform code generation as last resort. Consider setting OPENAI_API_KEY for better code generation.\n")
+                                    sys.stderr.write("Warning: Using basic Terraform code generation as last resort. Consider setting OPENAI_API_KEY for better code generation.\n")
                                 else:
-                                    sys.stderr.write(f"Warning: Using comment insertion as last resort. Consider setting OPENAI_API_KEY for better code generation.\n")
+                                    sys.stderr.write("Warning: Using comment insertion as last resort. Consider setting OPENAI_API_KEY for better code generation.\n")
                                 
                                 # Use replace_content to insert the line
                                 replacement_result = await session.call_tool(
