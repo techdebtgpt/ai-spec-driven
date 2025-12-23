@@ -25,7 +25,7 @@ def orchestrator(tmp_path: Path, monkeypatch: Any) -> TaskOrchestrator:
 def make_task(tmp_path: Path) -> Task:
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / ".git").mkdir()
+    (repo / ".gitignore").write_text("", encoding="utf-8")
     return Task(
         id="task-1",
         repo_path=repo,
@@ -51,6 +51,8 @@ def make_patch(kind: PatchKind = PatchKind.IMPLEMENTATION, status: PatchStatus =
 def test_has_manual_edits_detects_manual_changes(mock_run: MagicMock, tmp_path: Path) -> None:
     mock_run.return_value.stdout = "M new_file.py"
     orch = TaskOrchestrator()
+    orch.store.root = tmp_path / "state"
+    orch.store.root.mkdir(exist_ok=True)
     task = make_task(tmp_path)
     task.metadata["patch_queue_state"] = [make_patch().to_dict()]
     task.metadata["worktree_status"] = "A test.py"
@@ -75,6 +77,8 @@ def test_approve_patch_applies_diff(mock_run: MagicMock, tmp_path: Path) -> None
         metadata={"patch_queue_state": [make_patch().to_dict()]},
     )
     orch = TaskOrchestrator()
+    orch.store.root = tmp_path / "state"
+    orch.store.root.mkdir(exist_ok=True)
     orch.store.upsert_task(task)
 
     mock_run.side_effect = [
@@ -103,6 +107,8 @@ def test_reject_patch_marks_status_and_regenerates(mock_run: MagicMock, tmp_path
         metadata={"patch_queue_state": [make_patch().to_dict()]},
     )
     orch = TaskOrchestrator()
+    orch.store.root = tmp_path / "state"
+    orch.store.root.mkdir(exist_ok=True)
     orch.store.upsert_task(task)
 
     mock_run.side_effect = [
@@ -113,3 +119,37 @@ def test_reject_patch_marks_status_and_regenerates(mock_run: MagicMock, tmp_path
     orch.reject_patch(task.id, orch.list_patches(task.id)[0].id)
     task_after = orch._get_task(task.id)
     assert "patch_queue_state" not in task_after.metadata
+
+
+def test_restart_clarifications_preserves_manual_bounded_context(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".gitignore").write_text("", encoding="utf-8")
+
+    task = Task(
+        id="task-1",
+        repo_path=repo,
+        branch="main",
+        description="desc",
+        status=TaskStatus.PLANNING,
+        metadata={
+            "repository_summary": {"file_count": 100, "has_tests": True},
+            "bounded_context": {
+                "manual": {"aggregate": {"file_count": 7}},
+                "plan_targets": {"aggregate": {"file_count": 42}},
+            },
+        },
+    )
+    orch = TaskOrchestrator()
+    orch.store.root = tmp_path / "state"
+    orch.store.root.mkdir(exist_ok=True)
+    orch.store.upsert_task(task)
+
+    with patch.object(orch.clarifier, "generate_questions", return_value=[]):
+        orch.restart_clarifications(task.id, reason="scope was too broad")
+
+    task_after = orch._get_task(task.id)
+    bounded = task_after.metadata.get("bounded_context") or {}
+    assert "manual" in bounded
+    assert bounded["manual"]["aggregate"]["file_count"] == 7
+    assert "plan_targets" not in bounded

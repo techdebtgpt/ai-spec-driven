@@ -162,7 +162,7 @@ def main():
     # Verify MCP library is installed (should be via serena dependencies, but double-check)
     print("Verifying Serena dependencies...")
     try:
-        result = subprocess.run(
+        subprocess.run(
             [str(pip_path), "show", "mcp"],
             capture_output=True,
             text=True,

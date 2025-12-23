@@ -41,3 +41,24 @@ def test_summarize_targets_limits_scope(tmp_path: Path) -> None:
     assert aggregate["file_count"] == 1
     assert "nested/c.py" in summary["targets"]["nested"]["hotspots"][0]["path"]
 
+
+def test_summarize_repository_detects_dotnet_test_projects(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    # Typical dotnet convention: Foo.Tests/*.csproj
+    tests_proj_dir = repo / "CardStoreService.Tests"
+    tests_proj_dir.mkdir()
+    (tests_proj_dir / "CardStoreService.Tests.csproj").write_text("<Project></Project>\n")
+
+    # Another common convention: Foo.Tests.Unit
+    tests_unit_dir = repo / "Pbp.Payments.CardStore.Tests.Unit"
+    tests_unit_dir.mkdir()
+    (tests_unit_dir / "ExampleTests.cs").write_text("public class ExampleTests {}\n")
+
+    settings = AgentSettings()
+    indexer = ContextIndexer(settings)
+
+    summary = indexer.summarize_repository(repo)
+    assert summary["has_tests"] is True
+

@@ -18,10 +18,9 @@ import asyncio
 from dataclasses import dataclass
 import json
 import os
-import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from mcp import ClientSession, StdioServerParameters

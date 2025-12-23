@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from enum import Enum
 import shlex
 from pathlib import Path
@@ -134,6 +133,53 @@ class ChatSession:
         self.index_only: bool = False  # Track if we're just indexing vs starting a task
         self._bg_lock = Lock()
         self._bg_jobs: dict[str, dict] = {}
+        self._maybe_load_cached_index()
+
+    def _maybe_load_cached_index(self) -> None:
+        """
+        Best-effort: reuse the last indexed repo for chat sessions.
+
+        This avoids forcing engineers to re-index on every run and makes
+        "Start a new task" flow seamless after setup.
+        """
+        try:
+            index_data = self.orchestrator.get_cached_repository_index()
+        except Exception:
+            return
+
+        try:
+            repo_path = Path(index_data.get("repo_path", "")).resolve()
+        except Exception:
+            return
+
+        if not repo_path.exists() or not repo_path.is_dir():
+            return
+
+        self.indexed_repo = repo_path
+        self.indexed_branch = str(index_data.get("branch") or "main")
+
+    def _ask_menu_choice(self, prompt: str, choices: list[str], default: str) -> str:
+        """
+        Robust choice prompt for auto-started terminals.
+
+        Terminals auto-focused on workspace open can inject stray characters (whitespace,
+        escape sequences, etc). We parse very defensively:
+        - blank/whitespace => default
+        - if any allowed digit appears in the input => choose it
+        - otherwise => default (no noisy error loop)
+        """
+        raw = Prompt.ask(prompt, default=default)
+        value = (raw or "").strip()
+        if not value:
+            return default
+
+        # If the input contains a valid option anywhere (e.g. "1 ", "1\n", or stray chars),
+        # pick the first matching choice.
+        for ch in value:
+            if ch in choices:
+                return ch
+
+        return default
 
     def _start_background_job(self, name: str, fn) -> str:
         job_id = str(uuid4())
@@ -211,7 +257,9 @@ class ChatSession:
                 console.print("\n[yellow]Interrupted. Returning to main menu.[/]")
                 self.state = ConversationState.MAIN_MENU
             except Exception as exc:
-                console.print(f"[red]Error: {exc}[/]")
+                # Defensive: exceptions may contain Rich markup-like tokens (e.g. '[/]').
+                # Print without markup to avoid MarkupError masking the real issue.
+                console.print(f"Error: {exc}", style="red", markup=False)
                 console.print("[yellow]Returning to main menu.[/]")
                 self.state = ConversationState.MAIN_MENU
 
@@ -247,16 +295,51 @@ class ChatSession:
         console.print("  [cyan]5.[/] Exit")
         console.print()
 
-        choice = Prompt.ask("Choice", choices=["1", "2", "3", "4", "5"], default="1")
+        choice = self._ask_menu_choice("Choice", ["1", "2", "3", "4", "5"], "1")
 
         if choice == "1":
             self.index_only = False
-            # If we already have an indexed repo, skip indexing and go straight to task setup
-            if self.indexed_repo and self.indexed_repo.exists():
-                console.print()
-                console.print(f"[cyan]Using indexed repository: {self.indexed_repo}[/]")
+            # Always let the engineer choose a repo path, then reuse cached index if present.
+            console.print()
+            default_repo = str(self.indexed_repo) if self.indexed_repo else str(Path.cwd())
+            console.print(f"Repository path (press Tab for completion) [default: {default_repo}]:")
+            try:
+                repo_path_str = prompt_toolkit_prompt(
+                    "> ",
+                    completer=PathCompleter(only_directories=True, expanduser=True),
+                    default=default_repo,
+                ).strip()
+                if not repo_path_str:
+                    repo_path_str = default_repo
+            except (KeyboardInterrupt, EOFError):
+                console.print("[yellow]Cancelled[/]")
+                self.state = ConversationState.MAIN_MENU
+                return
+
+            requested = Path(repo_path_str).resolve()
+            if not requested.exists() or not requested.is_dir():
+                console.print(f"[red]Error: {requested} is not a valid directory[/]")
+                self.state = ConversationState.MAIN_MENU
+                return
+
+            repo_root = self.orchestrator.resolve_repo_root(requested)
+
+            # Ask for branch before deciding whether we can reuse a cached index.
+            branch_default = self.indexed_branch or "main"
+            branch = Prompt.ask("Branch", default=branch_default)
+
+            # Try to reuse an existing cached index for this repo.
+            try:
+                cached = self.orchestrator.get_repository_index_for_repo_and_branch(repo_root, branch)
+                self.indexed_repo = Path(cached.get("repo_path") or repo_root).resolve()
+                self.indexed_branch = str(cached.get("branch") or branch or "main")
+                console.print(f"[cyan]Using cached index for:[/] {self.indexed_repo} ({self.indexed_branch})")
                 self.state = ConversationState.TASK_SETUP
-            else:
+            except Exception:
+                # No cached index: go index now.
+                console.print(f"[yellow]No cached index for {repo_root} ({branch}). Indexing now...[/]")
+                self.indexed_repo = repo_root
+                self.indexed_branch = branch
                 self.state = ConversationState.INDEXING
         elif choice == "2":
             self._continue_task()
@@ -274,8 +357,8 @@ class ChatSession:
         console.print("[bold cyan]Repository Setup[/]")
         console.print()
 
-        # Ask for repository path with tab completion
-        default_path = str(Path.cwd())
+        # Ask for repository path with tab completion (reuse pre-selected repo when available)
+        default_path = str(self.indexed_repo) if self.indexed_repo else str(Path.cwd())
         console.print(f"Repository path (press Tab for completion) [default: {default_path}]:")
 
         try:
@@ -301,8 +384,9 @@ class ChatSession:
             self.state = ConversationState.MAIN_MENU
             return
 
-        # Ask for branch
-        branch = Prompt.ask("Branch", default="main")
+        # Ask for branch (reuse last branch if known)
+        branch_default = self.indexed_branch or "main"
+        branch = Prompt.ask("Branch", default=branch_default)
 
         # Show equivalent CLI command and index the repository
         command = f"./spec-agent index {shlex.quote(str(repo_path))}"
@@ -314,19 +398,27 @@ class ChatSession:
         console.print("[yellow]Indexing repository...[/]")
 
         try:
-            index_data = self.orchestrator.index_repository(repo_path=repo_path, branch=branch)
+            # In interactive chat, we always run the "full index" that includes the
+            # Serena semantic tree (when Serena is enabled). This avoids a second,
+            # confusing "background semantic tree export" step.
+            index_data = self.orchestrator.index_repository(
+                repo_path=repo_path,
+                branch=branch,
+                include_serena_semantic_tree=True,
+            )
             summary = index_data.get("repository_summary", {})
             git_info = index_data.get("git_info", {})
+            resolved_repo_path = Path(index_data.get("repo_path") or repo_path).resolve()
 
             console.print()
-            console.print(f"[bold green]Repository indexed successfully[/]\n")
+            console.print("[bold green]Repository indexed successfully[/]\n")
             
             # Merged Repository Info and Semantic Analysis Panel
             info_lines = []
             
             # Basic repository information
             info_lines.append(f"[bold cyan]Repository:[/] {index_data.get('repo_name', repo_path.name)}")
-            info_lines.append(f"[bold cyan]Path:[/] {repo_path}")
+            info_lines.append(f"[bold cyan]Path:[/] {resolved_repo_path}")
             info_lines.append(f"[bold cyan]Branch:[/] {branch}")
             
             # Git information
@@ -416,16 +508,16 @@ class ChatSession:
             else:
                 console.print("[dim]Basic language detection (Serena not enabled)[/]")
 
-            # Optional: run the expensive Serena semantic tree export in the background
-            if Confirm.ask("Export Serena semantic tree in background? (slow)", default=False):
-                console.print("[dim]Starting background export. You can continue using chat.[/]")
+            # If the semantic tree was produced, print a small stat line.
+            tree_payload = summary.get("serena_semantic_tree") or {}
+            stats = tree_payload.get("stats") if isinstance(tree_payload, dict) else None
+            if isinstance(stats, dict) and stats:
+                console.print(
+                    f"[dim]Serena semantic tree: indexed {stats.get('indexed_files', 0)} files "
+                    f"(failed {stats.get('failed_files', 0)}) in {stats.get('elapsed_seconds', '?')}s[/]"
+                )
 
-                def _job():
-                    return self.orchestrator.enrich_repository_index_with_serena_semantic_tree(repo_path)
-
-                self._start_background_job("Serena semantic tree export", _job)
-
-            self.indexed_repo = repo_path
+            self.indexed_repo = resolved_repo_path
             self.indexed_branch = branch
 
             # If just indexing, return to menu. Otherwise, proceed to task setup
@@ -437,7 +529,7 @@ class ChatSession:
                 self.state = ConversationState.TASK_SETUP
 
         except Exception as exc:
-            console.print(f"[red]Failed to index repository: {exc}[/]")
+            console.print(f"Failed to index repository: {exc}", style="red", markup=False)
             self.state = ConversationState.MAIN_MENU
 
     def _handle_task_setup(self) -> None:
@@ -476,7 +568,7 @@ class ChatSession:
             self.state = ConversationState.CLARIFYING
 
         except Exception as exc:
-            console.print(f"[red]Failed to create task: {exc}[/]")
+            console.print(f"Failed to create task: {exc}", style="red", markup=False)
             self.state = ConversationState.MAIN_MENU
 
     def _handle_clarifying(self) -> None:
@@ -532,6 +624,9 @@ class ChatSession:
         console.print()
         console.print("[green]✓[/] All questions processed!")
 
+        # Note: we infer/freeze scope AFTER preliminary plan approval (not here),
+        # because the engineer may reject the preliminary plan or adjust direction.
+
         # Proceed to planning
         self.state = ConversationState.PLANNING
 
@@ -548,7 +643,7 @@ class ChatSession:
         console.print("[yellow]Generating implementation plan...[/]")
 
         try:
-            plan_data = self.orchestrator.generate_plan(self.current_task.id)
+            self.orchestrator.generate_plan(self.current_task.id)
 
             # Reload the task to get updated metadata
             self.current_task = self.orchestrator._get_task(self.current_task.id)
@@ -557,7 +652,7 @@ class ChatSession:
             self.state = ConversationState.REVIEWING_PLAN
 
         except Exception as exc:
-            console.print(f"[red]Failed to generate plan: {exc}[/]")
+            console.print(f"Failed to generate plan: {exc}", style="red", markup=False)
             self.state = ConversationState.MAIN_MENU
 
     def _handle_plan_review(self) -> None:
@@ -573,6 +668,7 @@ class ChatSession:
         steps = plan_preview.get("steps", [])
         risks = plan_preview.get("risks", [])
         refactors = plan_preview.get("refactors", [])
+        stage = (self.current_task.metadata.get("plan_stage") or "").strip().upper()
 
         # Display steps (disable markup to avoid conflicts with LLM-generated content)
         if steps:
@@ -582,7 +678,7 @@ class ChatSession:
             step_text = "\n".join(step_lines) if step_lines else ""
             console.print(Panel.fit(
                 step_text,
-                title="Implementation Plan",
+                title="Final Plan (Frozen Scope)" if stage == "FINAL" else "Preliminary Plan",
                 border_style="blue"
             ), markup=False)
 
@@ -634,13 +730,16 @@ class ChatSession:
 
         # Show scoped/bounded impact if available (post-clarifications indexing)
         bounded_context = self.current_task.metadata.get("bounded_context", {}) or {}
-        bounded = bounded_context.get("manual") or bounded_context.get("plan_targets")
+        manual_bounded = bounded_context.get("manual")
+        plan_targets_bounded = bounded_context.get("plan_targets")
+        bounded = manual_bounded or plan_targets_bounded
         if bounded:
             console.print()
             aggregate = bounded.get("aggregate", {}) if isinstance(bounded, dict) else {}
             impact = bounded.get("impact", {}) if isinstance(bounded, dict) else {}
             resolution = bounded.get("plan_targets_resolution") if isinstance(bounded, dict) else None
 
+            scope_title = "Scoped Context (Bounded Index)" if manual_bounded else "Scoped Context (Plan Targets)"
             scope_lines = [
                 f"Files: {aggregate.get('file_count', 0)}",
                 f"Size: {aggregate.get('total_size_bytes', 0)} bytes",
@@ -649,7 +748,7 @@ class ChatSession:
             console.print(
                 Panel.fit(
                     "\n".join(scope_lines),
-                    title="Scoped Context (Bounded Index)",
+                    title=scope_title,
                     border_style="magenta",
                 ),
                 markup=False,
@@ -674,7 +773,8 @@ class ChatSession:
                     explain_lines.append(f"Unresolved: {', '.join(str(t) for t in unresolved_targets[:12])}{' ...' if len(unresolved_targets) > 12 else ''}")
                     explain_lines.append("")
                     explain_lines.append("Tip: run a bounded index on real paths (directories/files) you care about.")
-                    explain_lines.append(f"Example: ./spec-agent bounded-index {self.current_task.id} <path1> <path2>")
+                    explain_lines.append("Tip (chat): run scoped indexing on real paths (directories/files) you care about.")
+                    explain_lines.append(f"CLI example: ./spec-agent bounded-index {self.current_task.id} <path1> <path2>")
 
                 console.print(
                     Panel.fit(
@@ -712,42 +812,101 @@ class ChatSession:
         console.print()
         console.print("[bold]Plan Approval[/]")
         console.print()
-        console.print("  [cyan]1.[/] Approve plan and proceed to patches")
+        if stage == "FINAL":
+            console.print("  [cyan]1.[/] Approve final plan (export Markdown to docs/)")
+        else:
+            console.print("  [cyan]1.[/] Approve preliminary plan (generate final plan with frozen scope)")
         console.print("  [cyan]2.[/] Reject and regenerate plan")
         console.print("  [cyan]3.[/] View boundary specs (details)")
         console.print("  [cyan]4.[/] Return to main menu")
         console.print()
 
-        choice = Prompt.ask("Choice", choices=["1", "2", "3", "4"], default="1")
+        choice = self._ask_menu_choice("Choice", ["1", "2", "3", "4"], "1")
 
         if choice == "1":
-            # Approve the plan
             try:
+                if stage != "FINAL":
+                    # Approve preliminary plan: infer scope now, freeze it, then build final plan.
+                    console.print("[yellow]Approving preliminary plan: inferring frozen scope...[/]")
+                    inferred = self.orchestrator.infer_scope_targets(self.current_task.id)
+                    targets = inferred.get("targets") or []
+                    reason = inferred.get("reason") or "inferred"
+                    sample_files = inferred.get("sample_files") or []
+
+                    if not targets:
+                        console.print("[yellow]Could not infer a scope automatically. You can reject the plan and refine the request, or run bounded-index manually.[/]")
+                        return
+
+                    lines = [f"Reason: {reason}", "", "Targets:"] + [f"- {t}" for t in targets[:12]]
+                    if sample_files:
+                        lines += ["", "Matched files (sample):"] + [f"- {p}" for p in sample_files[:12]]
+                    console.print(Panel.fit("\n".join(lines), title="Inferred Frozen Scope", border_style="magenta"), markup=False)
+
+                    if not Confirm.ask("Freeze scope to these targets and generate the final plan?", default=True):
+                        console.print("[dim]Okay — scope not frozen. You can reject the preliminary plan or run bounded-index manually.[/]")
+                        return
+
+                    console.print("[yellow]Freezing scope (bounded index)...[/]")
+                    summary = self.orchestrator.bounded_index_task(self.current_task.id, list(targets))
+                    aggregate = (summary or {}).get("aggregate", {}) if isinstance(summary, dict) else {}
+                    file_count = aggregate.get("file_count", 0) if isinstance(aggregate, dict) else 0
+                    self.current_task = self.orchestrator._get_task(self.current_task.id)
+                    if not (isinstance(file_count, int) and file_count > 0):
+                        console.print("[yellow]Inferred scope matched 0 files; cannot generate final plan. Try rejecting/refining or run bounded-index manually.[/]")
+                        return
+
+                    console.print("[yellow]Generating final plan with frozen scope...[/]")
+                    self.orchestrator.build_final_plan_with_frozen_scope(self.current_task.id)
+                    self.current_task = self.orchestrator._get_task(self.current_task.id)
+                    # Don't add a trailing '[/]' here; the green tag is already closed after ✓.
+                    console.print("[green]✓[/] Final plan generated. Please review and approve.")
+                    self.state = ConversationState.REVIEWING_PLAN
+                    return
+
+                # FINAL stage: approve + export + optional patches
+                specs = self.orchestrator.get_boundary_specs(self.current_task.id)
+                pending = [s for s in (specs or []) if s.get("status") == "PENDING"]
+                if pending:
+                    console.print()
+                    console.print(
+                        f"[yellow]{len(pending)} boundary spec(s) are still pending.[/]\n"
+                        "[dim]Resolve or skip them before approving the final plan.[/]"
+                    )
+                    self.state = ConversationState.REVIEWING_SPECS
+                    return
+
                 self.orchestrator.approve_plan(self.current_task.id)
-                console.print("[green]✓[/] Plan approved!")
+                console.print("[green]✓[/] Final plan approved!")
 
-                # Generate patches and test suggestions after plan approval
                 console.print()
-                has_tests = bool((self.current_task.metadata.get("repository_summary") or {}).get("has_tests", False))
-                if has_tests:
-                    console.print("[cyan]Generating patches and test suggestions...[/]")
-                else:
-                    console.print("[cyan]Generating patches...[/]")
-                patch_result = self.orchestrator.generate_patches(self.current_task.id)
-                patch_count = patch_result.get("patch_count", 0)
-                test_count = patch_result.get("test_count", 0)
-                tests_skipped_reason = patch_result.get("tests_skipped_reason")
-                if tests_skipped_reason:
-                    console.print(f"[green]✓[/] Generated {patch_count} patch(es); test suggestions skipped ({tests_skipped_reason})")
-                else:
-                    console.print(f"[green]✓[/] Generated {patch_count} patch(es) and {test_count} test suggestion(s)")
+                exported = self.orchestrator.export_approved_plan_markdown(self.current_task.id)
+                console.print(f"[green]✓[/] Saved approved plan to: [cyan]{exported}[/]")
 
-                # Reload task to get updated metadata with patches
-                self.current_task = self.orchestrator._get_task(self.current_task.id)
+                generate_now = Confirm.ask("Generate patches now? (you can do this later)", default=False)
+                if generate_now:
+                    has_tests = bool((self.current_task.metadata.get("repository_summary") or {}).get("has_tests", False))
+                    if has_tests:
+                        console.print("[cyan]Generating patches and test suggestions...[/]")
+                    else:
+                        console.print("[cyan]Generating patches...[/]")
+                    patch_result = self.orchestrator.generate_patches(self.current_task.id)
+                    patch_count = patch_result.get("patch_count", 0)
+                    test_count = patch_result.get("test_count", 0)
+                    tests_skipped_reason = patch_result.get("tests_skipped_reason")
+                    if tests_skipped_reason:
+                        console.print(f"[green]✓[/] Generated {patch_count} patch(es); test suggestions skipped ({tests_skipped_reason})")
+                    else:
+                        console.print(f"[green]✓[/] Generated {patch_count} patch(es) and {test_count} test suggestion(s)")
 
-                self.state = ConversationState.REVIEWING_PATCHES
+                    # Reload task to get updated metadata with patches
+                    self.current_task = self.orchestrator._get_task(self.current_task.id)
+                    self.state = ConversationState.REVIEWING_PATCHES
+                else:
+                    console.print("[green]✓[/] Ready to generate patches later.")
+                    console.print(f"[dim]Run: ./spec-agent generate-patches {self.current_task.id}[/]")
+                    self.state = ConversationState.MAIN_MENU
             except Exception as exc:
-                console.print(f"[red]Error approving plan: {exc}[/]")
+                console.print(f"Error approving plan: {exc}", style="red", markup=False)
         elif choice == "2":
             # Reject: route back through clarifications so we can tighten requirements,
             # then regenerate the plan with better inputs.
@@ -764,7 +923,7 @@ class ChatSession:
                 console.print("[cyan]Returning to clarifying questions...[/]")
                 self.state = ConversationState.CLARIFYING
             except Exception as exc:
-                console.print(f"[red]Failed to restart clarifications: {exc}[/]")
+                console.print(f"Failed to restart clarifications: {exc}", style="red", markup=False)
                 console.print("[yellow]Falling back to plan regeneration...[/]")
                 self.state = ConversationState.PLANNING
         elif choice == "3":
@@ -803,10 +962,10 @@ class ChatSession:
             machine_spec = spec.get('machine_spec', {})
             console.print("[bold]Machine Spec:[/]")
             console.print(f"  Actors: {', '.join(machine_spec.get('actors', []))}")
-            console.print(f"  Interfaces:")
+            console.print("  Interfaces:")
             for interface in machine_spec.get('interfaces', []):
                 console.print(f"    • {interface}")
-            console.print(f"  Invariants:")
+            console.print("  Invariants:")
             for invariant in machine_spec.get('invariants', []):
                 console.print(f"    • {invariant}")
 
@@ -824,8 +983,8 @@ class ChatSession:
 
         if not specs:
             console.print()
-            console.print("[cyan]No boundary specifications needed. Proceeding to patches...[/]")
-            self.state = ConversationState.REVIEWING_PATCHES
+            console.print("[cyan]No boundary specifications needed. Returning to plan approval...[/]")
+            self.state = ConversationState.REVIEWING_PLAN
             return
 
         pending_specs = [s for s in specs if s.get("status") == "PENDING"]
@@ -833,7 +992,7 @@ class ChatSession:
         if not pending_specs:
             console.print()
             console.print("[green]✓[/] All boundary specs resolved!")
-            self.state = ConversationState.REVIEWING_PATCHES
+            self.state = ConversationState.REVIEWING_PLAN
             return
 
         for spec in pending_specs:
@@ -854,10 +1013,10 @@ class ChatSession:
             machine_spec = spec.get('machine_spec', {})
             console.print("[bold cyan]Machine Spec:[/]")
             console.print(f"[bold]Actors:[/] {', '.join(machine_spec.get('actors', []))}")
-            console.print(f"[bold]Interfaces:[/]")
+            console.print("[bold]Interfaces:[/]")
             for interface in machine_spec.get('interfaces', []):
                 console.print(f"  • {interface}")
-            console.print(f"[bold]Invariants:[/]")
+            console.print("[bold]Invariants:[/]")
             for invariant in machine_spec.get('invariants', []):
                 console.print(f"  • {invariant}")
             console.print()
@@ -869,7 +1028,7 @@ class ChatSession:
             console.print("  [cyan]4.[/] Skip all remaining specs")
             console.print()
 
-            choice = Prompt.ask("Choice", choices=["1", "2", "3", "4"], default="1")
+            choice = self._ask_menu_choice("Choice", ["1", "2", "3", "4"], "1")
 
             if choice == "1":
                 self.orchestrator.approve_spec(self.current_task.id, spec["id"])
@@ -888,7 +1047,8 @@ class ChatSession:
 
         console.print()
         console.print("[green]✓[/] All boundary specs resolved!")
-        self.state = ConversationState.REVIEWING_PATCHES
+        console.print("[cyan]Returning to plan approval...[/]")
+        self.state = ConversationState.REVIEWING_PLAN
 
     def _handle_patch_review(self) -> None:
         """Handle patch review and approval."""

@@ -32,7 +32,7 @@ except ImportError:
     httpx = None
 
 try:
-    from mcp import ClientSession, StdioServerParameters
+    from mcp import ClientSession
     from mcp.client.stdio import stdio_client
 except ImportError:
     ClientSession = None
@@ -158,28 +158,6 @@ def _call_serena_via_python_mcp(
     serena_cmd = os.getenv("SERENA_CMD", "serena")
     if not _command_exists(serena_cmd):
         serena_cmd = "uvx"
-        server_params = StdioServerParameters(
-            command=serena_cmd,
-            args=["--from", "git+https://github.com/oraios/serena", "serena", "mcp"],
-        )
-    else:
-        server_params = StdioServerParameters(
-            command=serena_cmd,
-            args=["mcp"],
-        )
-    
-    prompt = f"""Generate a code patch for the following task:
-
-Repository: {repo_path}
-Plan ID: {plan_id}
-Step: {step_description}
-
-Please provide:
-1. A unified diff showing the changes
-2. A rationale explaining why this change is correct
-3. Alternative approaches if applicable
-
-Focus on incremental changes (<30 lines of code)."""
     
     # This is a placeholder - adjust based on actual MCP client API
     # The actual implementation depends on Serena's MCP server interface

@@ -76,9 +76,6 @@ def _placeholder_response(repo_path: Path, plan_id: str, step_description: str) 
 
 def main() -> int:
     payload = json.loads(sys.stdin.read() or "{}")
-    repo_path = Path(payload.get("repo_path", "."))
-    plan_id = payload.get("plan_id", "unknown-plan")
-    step_description = payload.get("step_description", "unspecified step")
 
     # Check for explicit delegate first (required - no fallback)
     delegate_cmd = os.getenv("SERENA_PATCH_DELEGATE")

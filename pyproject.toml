@@ -41,4 +41,12 @@ packages = ["src/spec_agent"]
 pythonpath = ["src"]
 addopts = "-q"
 
+[tool.ruff]
+exclude = [
+    ".venv",
+    ".pytest_cache",
+    ".tmp",
+    "**/__pycache__",
+]
+
 

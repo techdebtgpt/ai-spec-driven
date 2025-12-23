@@ -58,25 +58,12 @@ def _call_serena_cli(repo_path: Path, plan_id: str, step_description: str) -> Di
     """
     serena_cmd = _find_serena_command()
     
-    # Build the instruction for Serena
-    instruction = f"""Generate a code patch for:
-
-Step: {step_description}
-Repository: {repo_path}
-Plan ID: {plan_id}
-
-Requirements:
-- Incremental change (<30 lines of code)
-- Include unified diff format
-- Provide rationale
-- Suggest alternatives if applicable"""
-    
     try:
         # Pattern 1: Try serena start-mcp-server with a wrapper
         # This is a fallback - proper MCP integration should use serena_mcp_integration.py
         try:
             # Check if we can at least verify Serena is available
-            result = subprocess.run(
+            subprocess.run(
                 serena_cmd + ["start-mcp-server", "--help"],
                 capture_output=True,
                 text=True,
@@ -99,7 +86,7 @@ Requirements:
         # Pattern 2: Try any direct CLI commands (if Serena adds them in future)
         # For now, Serena is MCP-only, so this will likely fail
         try:
-            result = subprocess.run(
+            subprocess.run(
                 serena_cmd + ["--help"],
                 capture_output=True,
                 text=True,

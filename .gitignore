@@ -13,5 +13,7 @@ build/
 .idea/
 .serena/
 assets/
+.tmp/
+.vscode/
 
 

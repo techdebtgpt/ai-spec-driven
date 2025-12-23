@@ -247,6 +247,7 @@ async def _detect_languages_async(repo_path: Path) -> Dict[str, any]:
                         sys.stderr.write(f"Warning: get_symbols_overview failed: {exc}\n")
                 
                 # Try to list directory to see file types
+                csproj_files = []
                 if "list_dir" in tools:
                     try:
                         dir_start = time.time()
@@ -340,7 +341,6 @@ async def _detect_languages_async(repo_path: Path) -> Dict[str, any]:
                     'composer.json': 'php',
                 }
                 
-                csproj_files = []
                 if "find_file" in tools:
                     find_start = time.time()
                     logger.info(f"Searching for project files with {len(project_file_patterns)} patterns...")
@@ -740,7 +740,7 @@ def detect_languages(repo_path: Path) -> Dict[str, any]:
     
     try:
         # Check if we're already in an async context
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
         # We're in an async context, need to use a thread
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as executor:

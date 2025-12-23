@@ -46,25 +46,6 @@ class TestSuggester:
         if not repo_path or not repo_path.exists():
             return (False, [], None)
         
-        # Common test file patterns
-        test_patterns = {
-            # Python
-            "pytest": ["test_*.py", "*_test.py", "tests/", "test/"],
-            "unittest": ["test_*.py", "*_test.py", "tests/", "test/"],
-            # JavaScript/TypeScript
-            "jest": ["*.test.js", "*.test.ts", "*.spec.js", "*.spec.ts", "__tests__/"],
-            "mocha": ["*.test.js", "*.test.ts", "*.spec.js", "*.spec.ts", "test/"],
-            # Java
-            "junit": ["*Test.java", "*Tests.java", "test/", "tests/"],
-            # Go
-            "go_test": ["*_test.go"],
-            # Rust
-            "rust_test": ["*_test.rs", "tests/"],
-            # C#
-            "nunit": ["*Tests.cs", "*Test.cs", "Tests/"],
-            "xunit": ["*Tests.cs", "*Test.cs", "Tests/"],
-        }
-        
         # Common test directory names
         test_dirs = ["tests", "test", "__tests__", "spec", "specs", "Tests", "Test"]
         
@@ -458,7 +439,7 @@ Return only valid JSON, no markdown."""
             elif not has_tests:
                 # No tests found - emphasize the need for test coverage
                 description = test_data.get("description", f"Verify behavior for: {step.description}")
-                description += f"\n\n⚠️ **No tests found in repository** - This is a new test that should be created to add test coverage."
+                description += "\n\n⚠️ **No tests found in repository** - This is a new test that should be created to add test coverage."
             else:
                 description = test_data.get("description", f"Verify behavior for: {step.description}")
 
@@ -559,10 +540,6 @@ Return only valid JSON, no markdown."""
         
         # Try to fix common JSON issues
         try:
-            # Fix unescaped newlines in strings (basic attempt)
-            # This is a heuristic - may not work for all cases
-            fixed_text = text
-            
             # Try to escape unescaped quotes in string values
             # This is tricky, so we'll use a more lenient approach
             # Use json5-like parsing or try to extract fields manually

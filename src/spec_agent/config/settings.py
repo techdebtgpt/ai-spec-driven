@@ -59,6 +59,17 @@ class AgentSettings:
 def get_settings() -> AgentSettings:
     settings = AgentSettings()
 
+    # Optional: isolate Spec Agent state (tasks/index/logs) per repo/branch/session.
+    # Example:
+    #   export SPEC_AGENT_STATE_DIR="$HOME/.spec_agent/cardstore-api/UB-10496"
+    raw_state_dir = os.getenv("SPEC_AGENT_STATE_DIR")
+    if raw_state_dir:
+        try:
+            settings.state_dir = Path(raw_state_dir).expanduser().resolve()
+        except Exception:
+            # Fall back to default if invalid path
+            pass
+
     serena_enabled = os.getenv("SPEC_AGENT_SERENA_ENABLED")
     if serena_enabled is not None:
         settings.serena_enabled = serena_enabled.lower() in {"1", "true", "yes"}
