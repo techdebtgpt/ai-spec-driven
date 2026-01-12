@@ -28,6 +28,13 @@ class Task:
     repo_path: Path
     branch: str
     description: str
+    # Human-friendly label shown in dashboards / integrations (Cursor/Copilot/Claude).
+    # If empty, callers should fall back to a derived value from `description`.
+    title: str = ""
+    # Short summary shown in task lists; keep `description` for the full request.
+    summary: str = ""
+    # Which editor/chat client is driving this task (e.g. cursor, copilot, claude, terminal).
+    client: str = ""
     status: TaskStatus = TaskStatus.CREATED
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
@@ -41,6 +48,9 @@ class Task:
             "id": self.id,
             "repo_path": str(self.repo_path),
             "branch": self.branch,
+            "title": self.title,
+            "summary": self.summary,
+            "client": self.client,
             "description": self.description,
             "status": self.status.value,
             "created_at": self.created_at.isoformat(),
@@ -54,6 +64,9 @@ class Task:
             id=raw["id"],
             repo_path=Path(raw["repo_path"]),
             branch=raw["branch"],
+            title=str(raw.get("title") or ""),
+            summary=str(raw.get("summary") or ""),
+            client=str(raw.get("client") or ""),
             description=raw["description"],
             status=TaskStatus(raw["status"]),
             created_at=datetime.fromisoformat(raw["created_at"]),

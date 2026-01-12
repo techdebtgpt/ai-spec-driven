@@ -33,6 +33,7 @@ serena = [
 
 [project.scripts]
 spec-agent = "spec_agent.cli.app:main"
+spec-agent-mcp = "spec_agent.mcp_server:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/spec_agent"]

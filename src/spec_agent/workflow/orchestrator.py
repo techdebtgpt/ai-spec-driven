@@ -249,7 +249,29 @@ class TaskOrchestrator:
             "serena_semantic_tree": tree_payload,
         }
 
-    def create_task_from_index(self, description: str) -> Task:
+    def _derive_title_summary(self, description: str) -> tuple[str, str]:
+        """
+        Derive a human-friendly title + short summary from a free-form description.
+
+        - Title: first non-empty line (trimmed, max 80 chars)
+        - Summary: first line (trimmed, max 140 chars)
+        """
+        raw = (description or "").strip()
+        if not raw:
+            return ("", "")
+        first_line = raw.splitlines()[0].strip()
+        title = first_line[:80].rstrip()
+        summary = first_line[:140].rstrip()
+        return (title, summary)
+
+    def create_task_from_index(
+        self,
+        description: str,
+        *,
+        title: str | None = None,
+        summary: str | None = None,
+        client: str | None = None,
+    ) -> Task:
         """
         Create a task using a previously indexed repository.
         """
@@ -258,10 +280,14 @@ class TaskOrchestrator:
         repo_path = Path(index_data["repo_path"])
         branch = index_data["branch"]
         
+        derived_title, derived_summary = self._derive_title_summary(description)
         task = Task(
             id=str(uuid4()),
             repo_path=repo_path,
             branch=branch,
+            title=((title or "").strip() or derived_title),
+            summary=((summary or "").strip() or derived_summary),
+            client=((client or "").strip()),
             description=description,
             status=TaskStatus.CLARIFYING,
         )
@@ -295,12 +321,25 @@ class TaskOrchestrator:
 
         return task
 
-    def create_task(self, repo_path: Path, branch: str, description: str) -> Task:
+    def create_task(
+        self,
+        repo_path: Path,
+        branch: str,
+        description: str,
+        *,
+        title: str | None = None,
+        summary: str | None = None,
+        client: str | None = None,
+    ) -> Task:
         resolved_repo_path = self._resolve_repo_root(repo_path.resolve())
+        derived_title, derived_summary = self._derive_title_summary(description)
         task = Task(
             id=str(uuid4()),
             repo_path=resolved_repo_path,
             branch=branch,
+            title=((title or "").strip() or derived_title),
+            summary=((summary or "").strip() or derived_summary),
+            client=((client or "").strip()),
             description=description,
             status=TaskStatus.CLARIFYING,
         )
@@ -527,6 +566,13 @@ class TaskOrchestrator:
 
         task.description = new_desc
         task.metadata["description_snapshot"] = new_desc
+        # If title/summary weren't explicitly set, keep them aligned with the description.
+        # We treat empty fields as "auto-derived".
+        derived_title, derived_summary = self._derive_title_summary(new_desc)
+        if not (task.title or "").strip():
+            task.title = derived_title
+        if not (task.summary or "").strip():
+            task.summary = derived_summary
 
         if reset_metadata:
             self._preserve_clarifications_history(task, reason=reason or "Task description changed")
@@ -1859,7 +1905,51 @@ class TaskOrchestrator:
             for spec in specs:
                 name = (spec.get("boundary_name") or "Unknown").strip()
                 status = (spec.get("status") or "").strip()
-                lines.append(f"- **{name}**{f' ({status})' if status else ''}")
+                human_description = (spec.get("human_description") or "").strip()
+                diagram_text = (spec.get("diagram_text") or "").rstrip()
+                machine_spec = spec.get("machine_spec") or {}
+                actors = machine_spec.get("actors") or []
+                interfaces = machine_spec.get("interfaces") or []
+                invariants = machine_spec.get("invariants") or []
+                plan_step = (spec.get("plan_step") or "").strip()
+
+                lines.append(f"### {name}{f' ({status})' if status else ''}")
+                lines.append("")
+
+                if plan_step:
+                    lines.append(f"- **Plan step**: {plan_step}")
+                    lines.append("")
+
+                if human_description:
+                    lines.append("**Description**")
+                    lines.append("")
+                    lines.append(human_description)
+                    lines.append("")
+
+                if diagram_text:
+                    lines.append("**Mermaid diagram**")
+                    lines.append("")
+                    lines.append("```mermaid")
+                    lines.append(diagram_text)
+                    lines.append("```")
+                    lines.append("")
+
+                lines.append("**Machine-readable contract**")
+                lines.append("")
+                lines.append("- Actors:")
+                lines.extend([f"  - {actor}" for actor in actors] or ["  - (none)"])
+                lines.append("- Interfaces:")
+                lines.extend([f"  - {interface}" for interface in interfaces] or ["  - (none)"])
+                lines.append("- Invariants:")
+                lines.extend([f"  - {invariant}" for invariant in invariants] or ["  - (none)"])
+                lines.append("")
+
+                lines.append("**Implementation constraints (for Cursor/Claude)**")
+                lines.append("")
+                lines.append("- Preserve the actor boundaries above (do not fold responsibilities across services).")
+                lines.append("- Ensure invariants hold across all happy-path and failure-path flows.")
+                lines.append("- If an interface is renamed/expanded, update all call sites and configuration consistently.")
+                lines.append("")
         else:
             lines.append("_None_")
         lines.append("")

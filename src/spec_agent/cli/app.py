@@ -12,6 +12,7 @@ from rich.table import Table
 
 from ..domain.models import ClarificationStatus, RefactorSuggestionStatus, TaskStatus
 from ..workflow.orchestrator import TaskOrchestrator
+from .dashboard import run_task_dashboard
 
 app = typer.Typer(add_completion=False, help="Spec-driven development agent CLI.")
 console = Console()
@@ -476,13 +477,24 @@ def manage_context(
 @app.command()
 def start(
     description: str = typer.Option(..., "--description", "-d", prompt=True),
+    title: Optional[str] = typer.Option(None, "--title", "-t", help="Short task title shown in dashboards."),
+    summary: Optional[str] = typer.Option(
+        None,
+        "--summary",
+        help="Short summary shown in task lists (defaults to first line of description).",
+    ),
+    client: Optional[str] = typer.Option(
+        None,
+        "--client",
+        help="Editor/chat client driving this task (e.g. cursor, copilot, claude, terminal).",
+    ),
 ) -> None:
     """
     Create a new task using the previously indexed repository.
     """
 
     orchestrator = _get_orchestrator()
-    task = orchestrator.create_task_from_index(description=description)
+    task = orchestrator.create_task_from_index(description=description, title=title, summary=summary, client=client)
 
     clarifications = task.metadata.get("clarifications", [])
 
@@ -577,7 +589,9 @@ def list_tasks(
         return
 
     table = Table(title="Spec Agent Tasks")
-    table.add_column("ID", style="bold", width=36, no_wrap=True)
+    table.add_column("Client", width=10)
+    table.add_column("Title", style="bold", width=34)
+    table.add_column("ID", style="dim", width=10, no_wrap=True)
     table.add_column("Repo")
     table.add_column("Branch")
     table.add_column("Status")
@@ -585,7 +599,9 @@ def list_tasks(
 
     for task in tasks:
         table.add_row(
-            str(UUID(task.id)),
+            (task.client or "—")[:10],
+            (task.title or task.description.splitlines()[0] if task.description else f"task-{task.id[:8]}")[:34],
+            task.id[:8],
             str(task.repo_path),
             task.branch,
             task.status.value,
@@ -593,6 +609,53 @@ def list_tasks(
         )
 
     console.print(table)
+
+
+@app.command("dashboard")
+def dashboard(
+    task_id: Optional[str] = typer.Option(None, "--task", help="Focus the dashboard on a specific task id."),
+    status: Optional[TaskStatus] = typer.Option(None, "--status", "-s", case_sensitive=False),
+    show_all: bool = typer.Option(False, "--all", help="Include completed/cancelled tasks."),
+    refresh: float = typer.Option(1.0, "--refresh", help="Refresh interval in seconds (min 0.2)."),
+) -> None:
+    """
+    Live dashboard showing active tasks and their workflow stage.
+
+    Exit with Ctrl+C.
+    """
+    orchestrator = _get_orchestrator()
+    run_task_dashboard(orchestrator, task_id=task_id, status=status, show_all=show_all, refresh_seconds=refresh)
+
+
+@app.command("web")
+def web_dashboard(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address for the web dashboard."),
+    port: int = typer.Option(8844, "--port", help="Port for the web dashboard."),
+    open_browser: bool = typer.Option(True, "--open/--no-open", help="Open the dashboard in your browser."),
+) -> None:
+    """
+    Web dashboard (mockup-style) powered by tasks/logs under the state dir.
+
+    Reads from `SPEC_AGENT_STATE_DIR` (defaults to ~/.spec_agent).
+    """
+    from ..web.server import run_dashboard_server
+
+    url = f"http://{host}:{int(port)}"
+    console.print(f"[bold cyan]Web dashboard:[/] {url}")
+    console.print("[dim]Press Ctrl+C to stop.[/]")
+
+    if open_browser:
+        try:
+            import webbrowser
+
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    try:
+        run_dashboard_server(host=host, port=int(port))
+    except KeyboardInterrupt:
+        return
 
 
 @app.command("task-edit")

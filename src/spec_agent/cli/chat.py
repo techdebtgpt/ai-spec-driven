@@ -16,6 +16,7 @@ from rich.table import Table
 
 from ..domain.models import Task, TaskStatus
 from ..workflow.orchestrator import TaskOrchestrator
+from .dashboard import run_task_dashboard
 
 
 console = Console()
@@ -292,10 +293,11 @@ class ChatSession:
         console.print("  [cyan]2.[/] Continue existing task")
         console.print("  [cyan]3.[/] View task history")
         console.print("  [cyan]4.[/] Index a repository")
-        console.print("  [cyan]5.[/] Exit")
+        console.print("  [cyan]5.[/] Live tasks dashboard")
+        console.print("  [cyan]6.[/] Exit")
         console.print()
 
-        choice = self._ask_menu_choice("Choice", ["1", "2", "3", "4", "5"], "1")
+        choice = self._ask_menu_choice("Choice", ["1", "2", "3", "4", "5", "6"], "1")
 
         if choice == "1":
             self.index_only = False
@@ -349,6 +351,12 @@ class ChatSession:
             self.index_only = True
             self.state = ConversationState.INDEXING
         elif choice == "5":
+            console.print()
+            console.print("[dim]Live dashboard — press Ctrl+C to return to the menu.[/]")
+            focus = self.current_task.id if self.current_task else None
+            run_task_dashboard(self.orchestrator, task_id=focus, show_all=False, refresh_seconds=1.0)
+            self.state = ConversationState.MAIN_MENU
+        elif choice == "6":
             self.state = ConversationState.EXITING
 
     def _handle_indexing(self) -> None:
@@ -1090,7 +1098,10 @@ class ChatSession:
                 "IMPLEMENTING": "green"
             }.get(task.status.value, "white")
 
-            console.print(f"  [cyan]{i}.[/] [{status_color}]{task.status.value}[/] - {task.description[:50]}")
+            title = (task.title or "").strip() or (task.description.splitlines()[0] if task.description else f"task-{task.id[:8]}")
+            console.print(
+                f"  [cyan]{i}.[/] [{status_color}]{task.status.value}[/] - {(task.client or '—')[:10]} - {title[:50]}"
+            )
 
         console.print()
         choice = Prompt.ask("Choice", default="1")
@@ -1142,6 +1153,8 @@ class ChatSession:
         console.print()
         table = Table(title="Task History")
         table.add_column("Status", style="bold")
+        table.add_column("Client")
+        table.add_column("Title")
         table.add_column("Description")
         table.add_column("Updated")
 
@@ -1155,6 +1168,8 @@ class ChatSession:
 
             table.add_row(
                 f"[{status_color}]{task.status.value}[/]",
+                (task.client or "—")[:10],
+                ((task.title or "").strip() or (task.description.splitlines()[0] if task.description else f"task-{task.id[:8]}"))[:40],
                 task.description[:60],
                 task.updated_at.strftime("%Y-%m-%d %H:%M")
             )

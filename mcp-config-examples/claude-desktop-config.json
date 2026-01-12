@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "spec-agent": {
+      "command": "/path/to/ai-spec-driven/.venv/bin/python",
+      "args": ["-m", "spec_agent.mcp_server"],
+      "env": {
+        "SPEC_AGENT_OPENAI_API_KEY": "your-api-key-here",
+        "SPEC_AGENT_OPENAI_MODEL": "gpt-4.1-mini"
+      }
+    }
+  }
+}
