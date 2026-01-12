@@ -81,6 +81,84 @@ spec-agent --help
 
 Note: The interactive chat session only starts when you run the `chat` command. Running `./spec-agent` without `chat` uses the standard CLI interface.
 
+## MCP Integration (Cursor / Claude Desktop)
+
+Spec Agent can be used as an MCP server, allowing AI assistants like Cursor and Claude to drive the entire spec-driven workflow.
+
+### Setup
+
+1. Install with MCP support:
+
+```bash
+pip install -e ".[serena]"  # includes mcp dependency
+```
+
+2. Configure your AI assistant (see below).
+
+3. Restart the assistant to load the MCP server.
+
+### Cursor Configuration
+
+Add to `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "spec-agent": {
+      "command": "/path/to/ai-spec-driven/.venv/bin/python",
+      "args": ["-m", "spec_agent.mcp_server"],
+      "env": {
+        "SPEC_AGENT_OPENAI_API_KEY": "your-api-key-here"
+      }
+    }
+  }
+}
+```
+
+### Claude Desktop Configuration
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
+
+```json
+{
+  "mcpServers": {
+    "spec-agent": {
+      "command": "/path/to/ai-spec-driven/.venv/bin/python",
+      "args": ["-m", "spec_agent.mcp_server"],
+      "env": {
+        "SPEC_AGENT_OPENAI_API_KEY": "your-api-key-here"
+      }
+    }
+  }
+}
+```
+
+### Available MCP Tools
+
+| Category | Tools |
+|----------|-------|
+| **Repository** | `index_repository`, `get_repository_summary` |
+| **Tasks** | `create_task`, `list_tasks`, `get_task_status` |
+| **Clarifications** | `get_clarifications`, `answer_clarification`, `skip_clarification` |
+| **Planning** | `generate_plan`, `get_boundary_specs`, `approve_spec`, `approve_all_specs`, `skip_spec`, `approve_plan` |
+| **Patches** | `generate_patches`, `list_patches`, `get_patch_details`, `get_next_pending_patch`, `approve_patch`, `reject_patch` |
+| **Workflow** | `get_workflow_status` |
+
+### Example Usage in Cursor/Claude
+
+Once configured, you can ask the AI assistant:
+
+> "Index this repository and create a task to add user authentication"
+
+The AI will automatically call the MCP tools to:
+1. Index the codebase
+2. Create a task with clarifying questions
+3. Generate an implementation plan
+4. Create boundary specs
+5. Generate and apply patches
+
+See `mcp-config-examples/` for more configuration examples.
+
 ## Command overview
 
 Run `./spec-agent --help` for the authoritative list. Common commands:
