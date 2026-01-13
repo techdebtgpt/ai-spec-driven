@@ -167,6 +167,12 @@ class Patch:
     alternatives: List[str] = field(default_factory=list)
     status: PatchStatus = PatchStatus.PENDING
     kind: PatchKind = PatchKind.IMPLEMENTATION
+    # When patches are applied outside spec-agent (e.g. Cursor/Claude edits), we
+    # record the real applied diff and provenance so dashboards reflect reality.
+    applied_via: str = ""  # e.g. "spec-agent", "cursor", "claude", "external"
+    applied_at: Optional[datetime] = None
+    applied_diff: Optional[str] = None
+    files_touched: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -178,6 +184,10 @@ class Patch:
             "alternatives": self.alternatives,
             "status": self.status.value,
             "kind": self.kind.value,
+            "applied_via": self.applied_via,
+            "applied_at": self.applied_at.isoformat() if self.applied_at else None,
+            "applied_diff": self.applied_diff,
+            "files_touched": list(self.files_touched),
         }
 
     @classmethod
@@ -191,6 +201,10 @@ class Patch:
             alternatives=raw.get("alternatives", []),
             status=PatchStatus(raw.get("status", PatchStatus.PENDING.value)),
             kind=PatchKind(raw.get("kind", PatchKind.IMPLEMENTATION.value)),
+            applied_via=str(raw.get("applied_via") or ""),
+            applied_at=datetime.fromisoformat(raw["applied_at"]) if raw.get("applied_at") else None,
+            applied_diff=raw.get("applied_diff"),
+            files_touched=list(raw.get("files_touched", [])),
         )
 
 

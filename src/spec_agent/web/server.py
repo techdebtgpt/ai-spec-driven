@@ -1439,14 +1439,16 @@ function renderDetails(task, step, detail) {
       el.appendChild(banner);
     }
 
-    // Bounded context (impacted files only)
+    // Impacted scope (prefer explicit targets; fall back to a small file sample)
     const bc = d.bounded_context || {};
+    const targets = (bc.targets || []);
     const files = (bc.files_sample || []);
     const total = (typeof bc.file_count === 'number') ? bc.file_count : files.length;
-    if (files.length) {
+    const list = targets.length ? targets : files;
+    if (list.length) {
       const sec = document.createElement('div');
       sec.className = 'sectionTitle';
-      sec.textContent = 'Bounded context (files)';
+      sec.textContent = targets.length ? 'Impacted targets (scope)' : 'Impacted files (sample)';
       el.appendChild(sec);
 
       const meta = document.createElement('div');
@@ -1454,28 +1456,12 @@ function renderDetails(task, step, detail) {
       meta.textContent = `${total} file(s) in scope`;
       el.appendChild(meta);
 
-      // Render a compact tree from impacted file paths
-      const groups = {};
-      files.forEach(p => {
-        const parts = (p || '').split('/');
-        const key = parts.length ? parts[0] : '(root)';
-        groups[key] = groups[key] || [];
-        groups[key].push(p);
-      });
-      Object.keys(groups).slice(0, 30).forEach(k => {
-        const g = document.createElement('div');
-        g.className = 'tree';
-        const gh = document.createElement('div');
-        gh.className = 'treeDir';
-        gh.textContent = k;
-        g.appendChild(gh);
-        groups[k].slice(0, 40).forEach(p => {
-          const f = document.createElement('div');
-          f.className = 'treeFile';
-          f.textContent = p;
-          g.appendChild(f);
-        });
-        el.appendChild(g);
+      // Render as a compact list (same style as Code generation "Files touched")
+      list.slice(0, 25).forEach(p => {
+        const row = document.createElement('div');
+        row.className = 'fileRow';
+        row.textContent = p;
+        el.appendChild(row);
       });
     }
 
@@ -1553,14 +1539,16 @@ function renderDetails(task, step, detail) {
       el.appendChild(hint);
     }
 
-    // Bounded context (impacted files sample)
+    // Impacted scope (prefer explicit targets; fall back to small file sample)
     const bc = d.bounded_context || {};
+    const targets = (bc.targets || []);
     const files = (bc.files_sample || []);
     const total = (typeof bc.file_count === 'number') ? bc.file_count : files.length;
-    if (files.length) {
+    const list = targets.length ? targets : files;
+    if (list.length) {
       const sec = document.createElement('div');
       sec.className = 'sectionTitle';
-      sec.textContent = 'Bounded context (files)';
+      sec.textContent = targets.length ? 'Impacted targets (scope)' : 'Impacted files (sample)';
       el.appendChild(sec);
 
       const meta = document.createElement('div');
@@ -1568,27 +1556,11 @@ function renderDetails(task, step, detail) {
       meta.textContent = `${total} file(s) in scope`;
       el.appendChild(meta);
 
-      const groups = {};
-      files.forEach(p => {
-        const parts = (p || '').split('/');
-        const key = parts.length ? parts[0] : '(root)';
-        groups[key] = groups[key] || [];
-        groups[key].push(p);
-      });
-      Object.keys(groups).slice(0, 30).forEach(k => {
-        const g = document.createElement('div');
-        g.className = 'tree';
-        const gh = document.createElement('div');
-        gh.className = 'treeDir';
-        gh.textContent = k;
-        g.appendChild(gh);
-        groups[k].slice(0, 40).forEach(p => {
-          const f = document.createElement('div');
-          f.className = 'treeFile';
-          f.textContent = p;
-          g.appendChild(f);
-        });
-        el.appendChild(g);
+      list.slice(0, 25).forEach(p => {
+        const row = document.createElement('div');
+        row.className = 'fileRow';
+        row.textContent = p;
+        el.appendChild(row);
       });
     }
 
@@ -1706,7 +1678,8 @@ function renderDetails(task, step, detail) {
       patches.slice(0, 20).forEach(p => {
         const row = document.createElement('div');
         row.className = 'patchRow' + (p.id === state.selectedPatchId ? ' selected' : '');
-        row.textContent = `${p.id.slice(0,8)} · ${p.status} · ${p.step_reference}`;
+        const via = (p.applied_via && String(p.applied_via).trim()) ? ` · ${p.applied_via}` : '';
+        row.textContent = `${p.id.slice(0,8)} · ${p.status}${via} · ${p.step_reference}`;
         row.onclick = () => {
           state.selectedPatchId = p.id;
           renderDetails(task, step, detail);
@@ -1973,6 +1946,10 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
     scoped = bounded_ctx.get("manual") or bounded_ctx.get("plan_targets") or {}
     if not isinstance(scoped, dict):
         scoped = {}
+    # Prefer showing "targets" (what we intentionally scoped to) rather than huge file samples.
+    raw_targets = list((scoped.get("targets") or {}).keys()) if isinstance(scoped.get("targets"), dict) else []
+    if not isinstance(raw_targets, list):
+        raw_targets = []
     scope = (scoped.get("scope") or {}) if isinstance(scoped, dict) else {}
     allowed_files = scope.get("allowed_files") if isinstance(scope, dict) else []
     if not isinstance(allowed_files, list):
@@ -1985,6 +1962,15 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
     if not files_sample and allowed_files:
         files_sample = list(allowed_files[:20])
 
+    # Keep the web UI tight: only show targets (or a very small file sample as fallback).
+    # Also hide obvious build artifacts and test outputs.
+    def _is_noise(rel: str) -> bool:
+        p = (rel or "").replace("\\", "/").lower()
+        return any(seg in p for seg in ("/bin/", "/obj/", "/node_modules/", "/dist/", "/build/"))
+
+    targets_clean = [t for t in raw_targets if t and not _is_noise(t)]
+    files_sample_clean = [f for f in files_sample if f and not _is_noise(f)]
+
     patches_raw = meta.get("patch_queue_state") or []
     patches: list[Dict[str, Any]] = []
     files_touched: list[str] = []
@@ -1992,7 +1978,8 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
         for p in patches_raw:
             if not isinstance(p, dict):
                 continue
-            diff = str(p.get("diff") or "")
+            applied_diff = p.get("applied_diff")
+            diff = str(applied_diff or p.get("diff") or "")
             for f in _extract_files_from_diff(diff):
                 if f not in files_touched:
                     files_touched.append(f)
@@ -2004,6 +1991,9 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
                     "step_reference": str(p.get("step_reference") or ""),
                     "diff": diff,
                     "rationale": str(p.get("rationale") or ""),
+                    "applied_via": str(p.get("applied_via") or ""),
+                    "applied_at": p.get("applied_at"),
+                    "has_applied_diff": bool(applied_diff),
                 }
             )
 
@@ -2028,7 +2018,8 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
             "plan_approved": plan_approved,
             "bounded_context": {
                 "file_count": len(allowed_files),
-                "files_sample": files_sample[:50],
+                "targets": targets_clean[:25],
+                "files_sample": files_sample_clean[:25],
             },
         },
         "APPROVAL": {
@@ -2040,7 +2031,8 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
             "plan_steps": plan_steps if isinstance(plan_steps, list) else [],
             "bounded_context": {
                 "file_count": len(allowed_files),
-                "files_sample": files_sample[:50],
+                "targets": targets_clean[:25],
+                "files_sample": files_sample_clean[:25],
             },
             "scenarios": scenarios,
             "risks": [str(r).strip() for r in risks if str(r).strip()][:20],

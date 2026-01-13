@@ -69,6 +69,10 @@ class Clarifier:
         # Parse JSON response
         questions = self._parse_llm_response(response)
 
+        # Ensure we always ask at least one explicit scope question so users can
+        # control frozen scope deterministically.
+        questions = self._ensure_scope_question(questions)
+
         # Build ClarificationItem objects
         return [
             ClarificationItem(id=str(uuid4()), task_id=task_id, question=question)
@@ -181,9 +185,27 @@ Generate clarifying questions that will help create a detailed, accurate impleme
         if len(description.split()) < 10:
             questions.insert(0, "Can you provide more details about what this change should accomplish?")
 
+        questions = self._ensure_scope_question(questions)
+
         return [
             ClarificationItem(id=str(uuid4()), task_id=task_id, question=question)
             for question in questions
         ]
+
+    @staticmethod
+    def _ensure_scope_question(questions: List[str]) -> List[str]:
+        """
+        Ensure there's at least one explicit "scope" question that can be used to
+        drive frozen scope/bounded indexing.
+        """
+        lowered = " ".join(str(q).lower() for q in (questions or []))
+        has_scope = any(k in lowered for k in ("impacted", "affected", "scope", "in scope", "out of scope", "files", "directories", "components", "modules"))
+        if has_scope:
+            return questions
+        scope_q = (
+            "Impacted files/components (scope): Which files, directories, or components should be in scope? "
+            "List exact paths or names (comma-separated) and what should be excluded."
+        )
+        return [scope_q, *(questions or [])]
 
 

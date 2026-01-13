@@ -1195,6 +1195,44 @@ def review_patches(
             break
 
 
+@app.command("sync-external")
+def sync_external(
+    task_id: str = typer.Argument(..., help="UUID of the task."),
+    patch_id: Optional[str] = typer.Option(None, "--patch-id", help="Optional patch UUID to mark as APPLIED."),
+    client: Optional[str] = typer.Option(None, "--client", help="Which editor applied the change (e.g. cursor, claude)."),
+    include_staged: bool = typer.Option(True, "--include-staged/--no-include-staged", help="Include staged changes in recorded diff."),
+) -> None:
+    """
+    Sync changes applied in an external editor (Cursor/Claude) back into spec-agent.
+
+    This captures `git diff` (and optionally `git diff --cached`) and stores it on the patch/task so
+    the web dashboard shows the actual diff and files touched.
+    """
+    orchestrator = _get_orchestrator()
+    try:
+        result = orchestrator.sync_external_patch(
+            task_id,
+            patch_id=patch_id,
+            client=client,
+            include_staged=include_staged,
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to sync external changes:[/] {exc}")
+        raise typer.Exit(code=1)
+
+    body = "\n".join(
+        [
+            f"Client: {result.get('client')}",
+            f"Patch:  {(patch_id[:8] if patch_id else '—')}",
+            f"Files:  {result.get('file_count', 0)}",
+            f"Diff:   {'yes' if result.get('has_diff') else 'no'}",
+        ]
+    )
+    console.print(Panel.fit(body, title="External changes synced"))
+    if result.get("git_status"):
+        console.print(Panel.fit(result["git_status"], title="git status --short"))
+
+
 @app.command("ask-patch")
 def ask_patch_question(
     task_id: str = typer.Argument(..., help="UUID of the task."),

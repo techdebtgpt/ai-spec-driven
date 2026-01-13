@@ -637,6 +637,32 @@ def approve_patch(task_id: str, patch_id: str) -> dict:
 
 
 @mcp.tool()
+def sync_external_patch(task_id: str, patch_id: str | None = None, client: str | None = None, include_staged: bool = True) -> dict:
+    """
+    Sync/record code changes applied in an external editor (Cursor/Claude) back into spec-agent.
+
+    Use this after you apply the patch changes in your editor (instead of using approve_patch),
+    so the task dashboard reflects the real diff + files touched.
+
+    Args:
+        task_id: UUID of the task
+        patch_id: Optional UUID of the patch to mark as applied
+        client: Optional client label (e.g. "cursor" or "claude")
+        include_staged: Include staged changes (git diff --cached) in the recorded diff
+
+    Returns:
+        Summary of synced diff and patch status update (if patch_id provided)
+    """
+    orchestrator = get_orchestrator()
+    return orchestrator.sync_external_patch(
+        task_id,
+        patch_id=patch_id,
+        client=client,
+        include_staged=include_staged,
+    )
+
+
+@mcp.tool()
 def reject_patch(task_id: str, patch_id: str) -> dict:
     """
     Reject a patch and regenerate the plan.

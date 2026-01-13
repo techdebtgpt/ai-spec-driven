@@ -24,6 +24,7 @@ from ..domain.models import (
     RefactorSuggestionStatus,
     Task,
     TaskStatus,
+    utcnow,
 )
 from ..persistence.store import JsonStore
 from ..services.context.indexer import ContextIndexer
@@ -1278,6 +1279,12 @@ class TaskOrchestrator:
 
         # Extract "strong" tokens from answers and map them to files, but constrain search
         # to candidate_roots to avoid exploding scope.
+        #
+        # IMPORTANT:
+        # - Prefer FILE matches over directory matches. Passing a directory to bounded-index
+        #   can explode the allowlist (e.g., hundreds of unrelated Models).
+        # - If boundary specs indicate a service-focused change (e.g. EncryptedService),
+        #   bias toward /Services/ and /Configuration/ and avoid /Models/.
         stopwords = {
             "the",
             "this",
@@ -1314,7 +1321,107 @@ class TaskOrchestrator:
             "dynamic",
             "report",
             "reports",
+            # Common config nouns that appear in many repos; keep them out of filename matching.
+            "endpoint",
+            "endpoints",
+            "url",
+            "urls",
+            "client",
+            "clients",
+            "secret",
+            "secrets",
+            "credential",
+            "credentials",
+            "environment",
+            "environments",
+            "env",
+            "dev",
+            "stage",
+            "staging",
+            "prod",
+            "production",
+            "aws",
+            "secretsmanager",
+            "manager",
+            "oauth",
+            "oauth2",
         }
+
+        specs = task.metadata.get("boundary_specs", []) or []
+        spec_text = " ".join(str(s.get("boundary_name") or "") for s in specs if isinstance(s, dict)).lower()
+
+        # Generic: if boundary specs mention a "*Service", bias scope toward service/config files
+        # and away from broad model folders.
+        service_focused = "service" in spec_text
+        service_name_hints: set[str] = set()
+
+        def _normalize_service_stem(raw: str) -> str:
+            # Keep alnum only, lowercased. "Encrypted_Service" -> "encryptedservice" after suffixing.
+            import re
+            return re.sub(r"[^a-z0-9]+", "", (raw or "").lower())
+
+        def _add_service_variants(stem: str) -> None:
+            s = _normalize_service_stem(stem)
+            if not s:
+                return
+            # Common C# patterns: FooService, IFooService, FooServiceConfiguration
+            service_name_hints.add(f"{s}service")
+            service_name_hints.add(f"i{s}service")
+            service_name_hints.add(f"{s}serviceconfiguration")
+            service_name_hints.add(f"{s}serviceconfig")
+
+        # Learn service names from boundary spec names (e.g., OAuth2-EncryptedService).
+        # We extract any token that ends with "service" and use its stem.
+        try:
+            import re
+            for s in specs:
+                if not isinstance(s, dict):
+                    continue
+                bn = str(s.get("boundary_name") or "")
+                for token in re.findall(r"[A-Za-z0-9_\\-]{3,}", bn):
+                    t = token.lower()
+                    if t.endswith("service") and len(t) > len("service"):
+                        service_focused = True
+                        stem = t[: -len("service")]
+                        _add_service_variants(stem)
+        except Exception:
+            pass
+
+        def _is_scope_question(q: str) -> bool:
+            ql = (q or "").lower()
+            return any(
+                k in ql
+                for k in (
+                    "impacted",
+                    "affected",
+                    "in scope",
+                    "out of scope",
+                    "scope",
+                    "files",
+                    "directories",
+                    "components",
+                    "modules",
+                )
+            )
+
+        # Authoritative scope answers: treat answers to "scope" questions as the source
+        # of truth for frozen scope, even if the tokens are short (e.g. "EncryptedService").
+        authoritative_answers: list[str] = []
+        other_answers: list[str] = []
+
+        for item in clarifications:
+            if not isinstance(item, dict):
+                continue
+            if (item.get("status") or "").strip().upper() != "ANSWERED":
+                continue
+            answer = (item.get("answer") or "").strip()
+            if not answer:
+                continue
+            question = (item.get("question") or "").strip()
+            if _is_scope_question(question):
+                authoritative_answers.append(answer)
+            else:
+                other_answers.append(answer)
 
         scope_candidates: set[str] = set()
         for item in clarifications:
@@ -1325,6 +1432,17 @@ class TaskOrchestrator:
             answer = (item.get("answer") or "").strip()
             if not answer:
                 continue
+            ans_l = answer.lower()
+
+            # Phrase-level boosts: any "<something> service" is a strong signal, but the
+            # individual adjective/noun alone is usually too broad.
+            try:
+                import re
+                for stem in re.findall(r"([a-z0-9][a-z0-9_-]{2,})\\s+service\\b", ans_l):
+                    service_focused = True
+                    _add_service_variants(stem)
+            except Exception:
+                pass
             tokens = re.findall(r"[A-Za-z0-9_.-]{3,}", answer)
             for tok in tokens:
                 t = tok.strip().strip(".,:;()[]{}\"'").lower()
@@ -1333,59 +1451,78 @@ class TaskOrchestrator:
                 # Heuristic: only keep "strong" tokens that are likely identifiers.
                 if not (len(t) >= 8 or any(ch in t for ch in ("_", ".", "-", "/")) or any(ch.isdigit() for ch in t)):
                     continue
+                # Avoid overly generic encryption tokens unless they include "service"
+                # or are long composite identifiers.
+                if t in {"encrypt", "encrypted", "encryption"}:
+                    continue
                 scope_candidates.add(t)
+
+        # If we detected service names, add them to scope candidates (generic).
+        if service_name_hints:
+            scope_candidates |= set(service_name_hints)
+
+        # NEW: Add candidates from authoritative scope answers (more permissive).
+        if authoritative_answers:
+            joined = "\n".join(authoritative_answers)
+            # Split on commas/newlines for explicit lists.
+            for part in re.split(r"[,\n;]+", joined):
+                p = (part or "").strip()
+                if not p:
+                    continue
+                # Normalize obvious path-like strings
+                p_norm = p.strip().strip("`").strip().strip("/").replace("\\", "/")
+                # Keep explicit relative paths/namespaces even if short
+                if "/" in p_norm or "." in p_norm:
+                    scope_candidates.add(p_norm.lower())
+                    continue
+                # Otherwise treat as identifier-ish (including CamelCase)
+                tok = re.sub(r"[^A-Za-z0-9_-]+", "", p_norm)
+                if tok:
+                    scope_candidates.add(tok.lower())
 
         if not scope_candidates:
             return []
 
-        resolved_targets: list[str] = []
-        max_matches_per_candidate = 10  # avoid exploding scope
-        max_results_per_candidate = 3
+        # Resolve extracted targets to real repo paths using the indexed directory tree.
+        # This makes scope consistent across architectures (C#, Python, JS, etc).
+        summary = task.metadata.get("repository_summary", {}) or {}
+        if not isinstance(summary, dict):
+            summary = {}
+        raw_targets = sorted(scope_candidates)[:40]
+        resolved = self._resolve_plan_targets_to_paths(repo_path, raw_targets, summary)
+        resolved_targets = list(resolved.get("resolved_targets") or [])
+        if not isinstance(resolved_targets, list):
+            resolved_targets = []
 
-        for candidate in sorted(scope_candidates):
-            candidate_underscore = candidate.replace("_", "")
-            patterns = [
-                f"**/*{candidate}*",
-                f"**/*{candidate_underscore}*",
-            ]
-
-            candidate_results: list[str] = []
-            # Search within roots first; fall back to repo-wide only if we have no roots.
-            search_roots = [repo_path / r for r in candidate_roots] if candidate_roots else [repo_path]
-            for root in search_roots:
-                if not root.exists():
+        final: list[str] = []
+        for rel in resolved_targets:
+            p = str(rel).replace("\\", "/").strip()
+            if not p:
+                continue
+            if any(noise in p.lower() for noise in ("/bin/", "/obj/", "/node_modules/", "/.git/")):
+                continue
+            abs_p = (repo_path / p).resolve()
+            # Allow files always. Allow directories only when service-focused AND they look like services/config.
+            if abs_p.exists() and abs_p.is_file():
+                if service_focused and "/models/" in p.lower():
                     continue
-                for pattern in patterns:
-                    try:
-                        matches = list(root.glob(pattern))
-                    except Exception:
-                        continue
+                final.append(p)
+            elif abs_p.exists() and abs_p.is_dir():
+                if not service_focused:
+                    continue
+                if not any(seg in p.lower() for seg in ("/services", "/configuration")):
+                    continue
+                final.append(p)
 
-                    # Too broad → ignore this pattern entirely.
-                    if len(matches) > max_matches_per_candidate:
-                        continue
-
-                    for match in matches:
-                        try:
-                            rel = str(match.resolve().relative_to(repo_path)).replace("\\", "/")
-                        except Exception:
-                            continue
-                        if any(noise in rel.lower() for noise in ("/bin/", "/obj/", "/node_modules/", "/.git/")):
-                            continue
-                        if rel not in candidate_results:
-                            candidate_results.append(rel)
-                        if len(candidate_results) >= max_results_per_candidate:
-                            break
-                    if len(candidate_results) >= max_results_per_candidate:
-                        break
-                if len(candidate_results) >= max_results_per_candidate:
-                    break
-
-            for rel in candidate_results:
-                if rel not in resolved_targets:
-                    resolved_targets.append(rel)
-
-        return resolved_targets[:20]
+        # De-dupe, stable.
+        seen: set[str] = set()
+        out: list[str] = []
+        for p in final:
+            if p in seen:
+                continue
+            seen.add(p)
+            out.append(p)
+        return out[:20]
 
     def generate_plan(
         self,
@@ -1705,12 +1842,8 @@ class TaskOrchestrator:
         sys.stderr.write(f"Final plan created with {len(plan.steps)} steps\n")
 
         def _progress(msg: str) -> None:
-            if progress is not None:
-                try:
-                    progress(str(msg))
-                    return
-                except Exception:
-                    pass
+            # This helper exists for parity with `generate_plan(progress=...)`,
+            # but `build_final_plan_with_frozen_scope` is currently non-interactive.
             sys.stderr.write(f"{msg}\n")
 
         _progress("Detecting boundaries (final plan)...")
@@ -2624,10 +2757,142 @@ class TaskOrchestrator:
         self._ensure_branch(task.repo_path, task.branch)
         self._apply_patch_diff(task.repo_path, patch.diff)
         patch.status = PatchStatus.APPLIED
+        patch.applied_via = "spec-agent"
+        patch.applied_at = utcnow()
+        patch.applied_diff = patch.diff
+        try:
+            patch.files_touched = self._extract_files_from_diff(patch.diff)
+        except Exception:
+            patch.files_touched = []
         self._persist_patch_queue(task, patches)
         self._snapshot_worktree_status(task)
         self.logger.record(task.id, "PATCH_APPROVED", {"patch_id": patch.id, "step": patch.step_reference})
         return patch
+
+    def sync_external_patch(
+        self,
+        task_id: str,
+        *,
+        patch_id: str | None = None,
+        client: str | None = None,
+        include_staged: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Record changes applied outside spec-agent (e.g. Cursor/Claude edits).
+
+        - Captures current git diff (+ optional staged diff)
+        - Optionally marks a specific patch as APPLIED and stores the actual applied diff
+        - Updates task metadata so the web dashboard reflects real code changes
+        """
+        task = self._get_task(task_id)
+        repo = task.repo_path
+
+        # Capture diffs
+        diff_parts: list[str] = []
+        try:
+            unstaged = subprocess.run(
+                ["git", "diff"],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=repo,
+            ).stdout
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"Failed to read git diff: {exc.stderr}") from exc
+        if (unstaged or "").strip():
+            diff_parts.append(unstaged.rstrip() + "\n")
+
+        staged = ""
+        if include_staged:
+            try:
+                staged = subprocess.run(
+                    ["git", "diff", "--cached"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    cwd=repo,
+                ).stdout
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(f"Failed to read staged git diff: {exc.stderr}") from exc
+            if (staged or "").strip():
+                if diff_parts:
+                    diff_parts.append("\n")
+                diff_parts.append(staged.rstrip() + "\n")
+
+        combined = "".join(diff_parts).strip()
+
+        status = self._get_git_status(repo)
+        files: list[str] = []
+        try:
+            if combined:
+                files = self._extract_files_from_diff(combined)
+        except Exception:
+            files = []
+        if not files and status:
+            # Fallback: parse porcelain
+            for line in status.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                # "XY path" or "XY old -> new"
+                parts = line.split()
+                if len(parts) >= 2:
+                    path = parts[-1]
+                    if path not in files:
+                        files.append(path)
+
+        # Always record an event even if empty (useful for debugging demos).
+        sync_event = {
+            "timestamp": datetime.now().isoformat(),
+            "client": (client or task.client or "external").strip() or "external",
+            "patch_id": patch_id,
+            "include_staged": include_staged,
+            "base_commit": self._current_commit(repo),
+            "git_status": status,
+            "files": files,
+            "diff": combined,
+        }
+        history = task.metadata.get("external_sync_history") or []
+        if not isinstance(history, list):
+            history = []
+        history.append(sync_event)
+        task.metadata["external_sync_history"] = history[-50:]
+
+        # If patch_id provided, mark that patch as applied and store the actual diff.
+        applied_patch: Patch | None = None
+        if patch_id:
+            patches = self._load_patch_queue(task)
+            patch = self._require_patch(patches, patch_id)
+            if patch.status == PatchStatus.PENDING:
+                patch.status = PatchStatus.APPLIED
+            patch.applied_via = (client or task.client or "external").strip() or "external"
+            patch.applied_at = utcnow()
+            patch.applied_diff = combined or None
+            patch.files_touched = files
+            self._persist_patch_queue(task, patches)
+            applied_patch = patch
+        else:
+            task.touch()
+            self.store.upsert_task(task)
+
+        # Update snapshot for manual edit detection.
+        self._snapshot_worktree_status(task)
+        self.logger.record(
+            task.id,
+            "EXTERNAL_PATCH_SYNCED",
+            {"patch_id": patch_id, "client": sync_event["client"], "files": files, "has_diff": bool(combined)},
+        )
+
+        return {
+            "task_id": task.id,
+            "patch_id": patch_id,
+            "client": sync_event["client"],
+            "has_diff": bool(combined),
+            "file_count": len(files),
+            "files": files,
+            "git_status": status,
+            "applied_patch_status": applied_patch.status.value if applied_patch else None,
+        }
 
     def reject_patch(self, task_id: str, patch_id: str) -> None:
         task = self._get_task(task_id)

@@ -134,6 +134,9 @@ class ChatSession:
         self.indexed_repo: Optional[Path] = None
         self.indexed_branch: str = "main"
         self.index_only: bool = False  # Track if we're just indexing vs starting a task
+        # When we already asked for repo/branch in the main menu and need to index due to
+        # missing cache, skip re-prompting inside the INDEXING handler.
+        self._indexing_preselected: bool = False
         self._bg_lock = Lock()
         self._bg_jobs: dict[str, dict] = {}
         self._web_dashboard_url: str | None = None
@@ -339,12 +342,14 @@ class ChatSession:
                 self.indexed_repo = Path(cached.get("repo_path") or repo_root).resolve()
                 self.indexed_branch = str(cached.get("branch") or branch or "main")
                 console.print(f"[cyan]Using cached index for:[/] {self.indexed_repo} ({self.indexed_branch})")
+                self._indexing_preselected = False
                 self.state = ConversationState.TASK_SETUP
             except Exception:
                 # No cached index: go index now.
                 console.print(f"[yellow]No cached index for {repo_root} ({branch}). Indexing now...[/]")
                 self.indexed_repo = repo_root
                 self.indexed_branch = branch
+                self._indexing_preselected = True
                 self.state = ConversationState.INDEXING
         elif choice == "2":
             self._continue_task()
@@ -352,6 +357,7 @@ class ChatSession:
             self._show_task_history()
         elif choice == "4":
             self.index_only = True
+            self._indexing_preselected = False
             self.state = ConversationState.INDEXING
         elif choice == "5":
             self._open_web_dashboard()
@@ -404,36 +410,43 @@ class ChatSession:
         console.print("[bold cyan]Repository Setup[/]")
         console.print()
 
-        # Ask for repository path with tab completion (reuse pre-selected repo when available)
-        default_path = str(self.indexed_repo) if self.indexed_repo else str(Path.cwd())
-        console.print(f"Repository path (press Tab for completion) [default: {default_path}]:")
+        # If we already asked for repo/branch in the main menu (start task flow), don't ask again.
+        if self._indexing_preselected and self.indexed_repo:
+            repo_path = self.indexed_repo
+            branch = self.indexed_branch or "main"
+            console.print(f"[dim]Using selected repo:[/] {repo_path}")
+            console.print(f"[dim]Using selected branch:[/] {branch}")
+        else:
+            # Ask for repository path with tab completion (reuse pre-selected repo when available)
+            default_path = str(self.indexed_repo) if self.indexed_repo else str(Path.cwd())
+            console.print(f"Repository path (press Tab for completion) [default: {default_path}]:")
 
-        try:
-            repo_path_str = prompt_toolkit_prompt(
-                "> ",
-                completer=PathCompleter(only_directories=True, expanduser=True),
-                default=default_path
-            ).strip()
+            try:
+                repo_path_str = prompt_toolkit_prompt(
+                    "> ",
+                    completer=PathCompleter(only_directories=True, expanduser=True),
+                    default=default_path
+                ).strip()
 
-            # Use default if empty
-            if not repo_path_str:
-                repo_path_str = default_path
+                # Use default if empty
+                if not repo_path_str:
+                    repo_path_str = default_path
 
-        except (KeyboardInterrupt, EOFError):
-            console.print("[yellow]Cancelled[/]")
-            self.state = ConversationState.MAIN_MENU
-            return
+            except (KeyboardInterrupt, EOFError):
+                console.print("[yellow]Cancelled[/]")
+                self.state = ConversationState.MAIN_MENU
+                return
 
-        repo_path = Path(repo_path_str).resolve()
+            repo_path = Path(repo_path_str).resolve()
 
-        if not repo_path.exists() or not repo_path.is_dir():
-            console.print(f"[red]Error: {repo_path} is not a valid directory[/]")
-            self.state = ConversationState.MAIN_MENU
-            return
+            if not repo_path.exists() or not repo_path.is_dir():
+                console.print(f"[red]Error: {repo_path} is not a valid directory[/]")
+                self.state = ConversationState.MAIN_MENU
+                return
 
-        # Ask for branch (reuse last branch if known)
-        branch_default = self.indexed_branch or "main"
-        branch = Prompt.ask("Branch", default=branch_default)
+            # Ask for branch (reuse last branch if known)
+            branch_default = self.indexed_branch or "main"
+            branch = Prompt.ask("Branch", default=branch_default)
 
         # Show equivalent CLI command and index the repository
         command = f"./spec-agent index {shlex.quote(str(repo_path))}"
@@ -456,6 +469,8 @@ class ChatSession:
             summary = index_data.get("repository_summary", {})
             git_info = index_data.get("git_info", {})
             resolved_repo_path = Path(index_data.get("repo_path") or repo_path).resolve()
+            # Clear the preselected indexing flag after a successful run.
+            self._indexing_preselected = False
 
             console.print()
             console.print("[bold green]Repository indexed successfully[/]\n")
@@ -886,10 +901,11 @@ class ChatSession:
                 console.print()
                 console.print("  [cyan]1.[/] Generate patches (next milestone)")
                 console.print("  [cyan]2.[/] Open the plan file")
-                console.print("  [cyan]3.[/] Return to main menu")
+                console.print("  [cyan]3.[/] Generate patches + apply in Cursor (MCP) + sync back")
+                console.print("  [cyan]4.[/] Return to main menu")
                 console.print()
 
-                next_choice = self._ask_menu_choice("Choice", ["1", "2", "3"], "3")
+                next_choice = self._ask_menu_choice("Choice", ["1", "2", "3", "4"], "4")
 
                 if next_choice == "2":
                     try:
@@ -926,6 +942,113 @@ class ChatSession:
                     # Reload task to get updated metadata with patches
                     self.current_task = self.orchestrator._get_task(self.current_task.id)
                     self.state = ConversationState.REVIEWING_PATCHES
+                elif next_choice == "3":
+                    # Option B: generate patches, then apply in Cursor (MCP) and sync back.
+                    has_tests = bool((self.current_task.metadata.get("repository_summary") or {}).get("has_tests", False))
+                    if has_tests:
+                        console.print("[cyan]Generating patches and test suggestions...[/]")
+                    else:
+                        console.print("[cyan]Generating patches...[/]")
+                    patch_result = self.orchestrator.generate_patches(self.current_task.id)
+                    patch_count = patch_result.get("patch_count", 0)
+                    test_count = patch_result.get("test_count", 0)
+                    tests_skipped_reason = patch_result.get("tests_skipped_reason")
+                    if tests_skipped_reason:
+                        console.print(f"[green]✓[/] Generated {patch_count} patch(es); test suggestions skipped ({tests_skipped_reason})")
+                    else:
+                        console.print(f"[green]✓[/] Generated {patch_count} patch(es) and {test_count} test suggestion(s)")
+
+                    patches = self.orchestrator.list_patches(self.current_task.id)
+                    pending = [p for p in patches if p.status.value == "PENDING"]
+                    example_patch = pending[0] if pending else (patches[0] if patches else None)
+
+                    console.print()
+                    console.print(Panel.fit(
+                        "\n".join(
+                            [
+                                "[bold]Cursor (MCP) apply flow[/]",
+                                "",
+                                "1) Open Cursor on the repo and apply the patch changes in the editor.",
+                                "2) After edits, run sync so Spec Agent records the real git diff:",
+                                "",
+                                f"   ./spec-agent sync-external {self.current_task.id}"
+                                + (f" --patch-id {example_patch.id}" if example_patch else "")
+                                + " --client cursor",
+                                "",
+                                "Tip: If you have Spec Agent MCP installed in Cursor, you can also call:",
+                                f"   sync_external_patch(task_id=\"{self.current_task.id}\", patch_id=\"{example_patch.id if example_patch else ''}\", client=\"cursor\")",
+                                "",
+                                "[bold]Copy/paste into Cursor chat (recommended):[/]",
+                                f"  \"Use spec-agent MCP tools. For task {self.current_task.id}, patch {example_patch.id if example_patch else '(none)'}: "
+                                f"{(example_patch.step_reference if example_patch else 'apply the next pending patch')}. "
+                                "Show me the patch diff (get_patch_details) and then APPLY the changes to the workspace files. "
+                                "Do NOT call approve_patch. After applying, call sync_external_patch with client=cursor.\"",
+                            ]
+                        ),
+                        title="Option B: Apply in Cursor + Sync",
+                    ))
+
+                    # Best-effort: open Cursor on macOS (non-fatal if it fails).
+                    try:
+                        import subprocess
+                        import sys
+                        repo_path = str(self.current_task.repo_path)
+                        if sys.platform == "darwin":
+                            subprocess.run(["open", "-a", "Cursor", repo_path], check=False)
+                    except Exception:
+                        pass
+
+                    # Auto-sync (best-effort): watch for git changes and sync as soon as Cursor edits files.
+                    try:
+                        import time
+                        import subprocess
+
+                        repo_path = str(self.current_task.repo_path)
+                        task_id = self.current_task.id
+                        patch_id = example_patch.id if example_patch else None
+
+                        def _git_status_short() -> str:
+                            try:
+                                r = subprocess.run(
+                                    ["git", "status", "--short"],
+                                    capture_output=True,
+                                    text=True,
+                                    check=True,
+                                    cwd=repo_path,
+                                )
+                                return (r.stdout or "").strip()
+                            except Exception:
+                                return ""
+
+                        baseline = _git_status_short()
+
+                        def _watch_and_sync():
+                            # Wait up to 20 minutes for Cursor edits (demo-friendly).
+                            deadline = time.time() + 20 * 60
+                            while time.time() < deadline:
+                                current = _git_status_short()
+                                if current != baseline and current.strip():
+                                    # Capture and persist the real diff on the patch/task.
+                                    return self.orchestrator.sync_external_patch(
+                                        task_id,
+                                        patch_id=patch_id,
+                                        client="cursor",
+                                        include_staged=True,
+                                    )
+                                time.sleep(2.0)
+                            return {"timeout": True}
+
+                        self._start_background_job(
+                            name=f"auto-sync (cursor) {task_id[:8]}",
+                            fn=_watch_and_sync,
+                        )
+                        console.print("[dim]Watching for Cursor edits… will auto-sync when changes are detected.[/]")
+                    except Exception:
+                        # Non-fatal; user can always run sync-external manually.
+                        pass
+
+                    # Return to main menu; patches are now generated and can be synced later.
+                    self.state = ConversationState.MAIN_MENU
                 else:
                     console.print("[green]✓[/] Next milestone: patch generation.")
                     console.print("[dim]You can generate patches later from the main menu.[/]")

@@ -141,7 +141,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 | **Tasks** | `create_task`, `list_tasks`, `get_task_status` |
 | **Clarifications** | `get_clarifications`, `answer_clarification`, `skip_clarification` |
 | **Planning** | `generate_plan`, `get_boundary_specs`, `approve_spec`, `approve_all_specs`, `skip_spec`, `approve_plan` |
-| **Patches** | `generate_patches`, `list_patches`, `get_patch_details`, `get_next_pending_patch`, `approve_patch`, `reject_patch` |
+| **Patches** | `generate_patches`, `list_patches`, `get_patch_details`, `get_next_pending_patch`, `approve_patch`, `sync_external_patch`, `reject_patch` |
 | **Workflow** | `get_workflow_status` |
 
 ### Example Usage in Cursor/Claude
@@ -158,6 +158,39 @@ The AI will automatically call the MCP tools to:
 5. Generate and apply patches
 
 See `mcp-config-examples/` for more configuration examples.
+
+## Demo: apply patches in Cursor/Claude, then sync back to the dashboard
+
+By default, Spec Agent can apply patches itself via `approve_patch`. For demos where you want
+Cursor/Claude to do the code edits (and Spec Agent simply *tracks* what changed), use the external
+sync flow:
+
+- **Generate patches** (Spec Agent creates diffs to review)
+- **Apply changes in your editor** (Cursor/Claude updates files)
+- **Sync back to Spec Agent** so the web dashboard shows the real diff + files touched
+
+### CLI flow
+
+1) Generate patches:
+
+- `./spec-agent generate-patches <task-id>`
+
+2) Apply the change in your editor (Cursor/Claude).
+
+3) Sync the result back to Spec Agent (optionally attach it to a specific patch):
+
+- `./spec-agent sync-external <task-id> --patch-id <patch-id> --client cursor`
+
+If you omit `--patch-id`, Spec Agent will still record the `git diff` in the task history.
+
+### MCP flow (Cursor / Claude Desktop)
+
+After applying changes in the editor, call:
+
+- `sync_external_patch(task_id, patch_id?, client?)`
+
+Then open the web dashboard: the **Code generation** step will display the synced diff and label
+the patch as applied via `cursor`/`claude`.
 
 ## Command overview
 
