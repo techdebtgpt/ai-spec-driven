@@ -1392,7 +1392,7 @@ class TaskOrchestrator:
         
         # Auto-freeze scope: infer targets and create final plan directly
         # This makes the flow more natural (skip preliminary plan step)
-        if auto_freeze_scope and task.metadata.get("plan_stage") != "FINAL":
+        if auto_freeze_scope:
             sys.stderr.write("Auto-freezing scope for final plan...\n")
             try:
                 inferred = self.infer_scope_targets(task_id)
@@ -1402,15 +1402,16 @@ class TaskOrchestrator:
                     # Run bounded index to freeze scope
                     self.bounded_index_task(task_id, list(inferred_targets))
                     task = self._get_task(task_id)  # Reload after bounded index
-                    task.metadata["plan_stage"] = "FINAL"
-                    sys.stderr.write("Scope frozen - plan is now FINAL\n")
-                else:
-                    sys.stderr.write("Could not infer scope targets, plan remains preliminary\n")
+                    sys.stderr.write("Scope frozen successfully\n")
             except Exception as exc:
                 LOG.warning("Auto-freeze scope failed: %s", exc)
-                sys.stderr.write(f"Auto-freeze scope failed: {exc}\n")
+                sys.stderr.write(f"Auto-freeze scope skipped: {exc}\n")
+            # Always mark as FINAL when auto_freeze_scope is enabled
+            # (even if scope inference fails, we want the simpler flow)
+            task.metadata["plan_stage"] = "FINAL"
+            sys.stderr.write("Plan is FINAL\n")
         
-        # Default stage if not otherwise set.
+        # Default stage if not otherwise set (only for auto_freeze_scope=False)
         task.metadata.setdefault("plan_stage", "PRELIMINARY")
 
         task.metadata["plan_preview"] = plan_preview

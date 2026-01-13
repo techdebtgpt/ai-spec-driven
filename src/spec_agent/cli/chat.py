@@ -686,7 +686,7 @@ class ChatSession:
             step_text = "\n".join(step_lines) if step_lines else ""
             console.print(Panel.fit(
                 step_text,
-                title="Final Plan (Frozen Scope)" if stage == "FINAL" else "Preliminary Plan",
+                title="Implementation Plan",
                 border_style="blue"
             ), markup=False)
 
@@ -820,10 +820,7 @@ class ChatSession:
         console.print()
         console.print("[bold]Plan Approval[/]")
         console.print()
-        if stage == "FINAL":
-            console.print("  [cyan]1.[/] Approve final plan (export Markdown to docs/)")
-        else:
-            console.print("  [cyan]1.[/] Approve preliminary plan (generate final plan with frozen scope)")
+        console.print("  [cyan]1.[/] Approve plan")
         console.print("  [cyan]2.[/] Reject and regenerate plan")
         console.print("  [cyan]3.[/] View boundary specs (details)")
         console.print("  [cyan]4.[/] Return to main menu")
