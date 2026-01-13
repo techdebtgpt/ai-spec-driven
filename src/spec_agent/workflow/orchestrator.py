@@ -2015,11 +2015,15 @@ class TaskOrchestrator:
                 repo_path=task.repo_path,
                 boundary_specs=specs,
                 skip_rationale_enhancement=skip_rationale_enhancement,
+                repo_context=context_summary,
             )
             sys.stderr.write(f"Generated {len(patches)} patches\n")
         except Exception as exc:
+            import traceback
             sys.stderr.write(f"Warning: Patch generation failed: {exc}\n")
+            sys.stderr.write(f"Traceback:\n{traceback.format_exc()}\n")
             sys.stderr.write("Continuing without patches.\n")
+            LOG.error("Patch generation failed", exc_info=True)
             patches = []  # Continue without patches
 
         # Generate test suggestions with patches (Epic 4.2)

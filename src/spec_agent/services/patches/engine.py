@@ -35,6 +35,7 @@ class PatchEngine:
         kind: PatchKind = PatchKind.IMPLEMENTATION,
         boundary_specs: List[BoundarySpec] | None = None,
         skip_rationale_enhancement: bool = False,
+        repo_context: Optional[dict] = None,
     ) -> List[Patch]:
         if self.llm_client:
             if repo_path is None:
@@ -45,6 +46,7 @@ class PatchEngine:
                 kind=kind,
                 boundary_specs=boundary_specs or [],
                 skip_rationale_enhancement=skip_rationale_enhancement,
+                repo_context=repo_context,
             )
 
         return [
@@ -135,6 +137,7 @@ class PatchEngine:
         kind: PatchKind,
         boundary_specs: List[BoundarySpec],
         skip_rationale_enhancement: bool = False,
+        repo_context: Optional[dict] = None,
     ) -> List[Patch]:
         """
         Generate patches using direct LLM calls.
@@ -154,6 +157,9 @@ class PatchEngine:
                 boundary_context = self._build_boundary_context(boundary_specs)
                 plan_context = self._build_plan_context(plan, step)
 
+                # Read target files from repository
+                file_contents = self._read_target_files(repo_path, step.target_files)
+
                 # Generate diff using LLM
                 diff, rationale, alternatives = self._generate_diff_with_llm(
                     step=step,
@@ -161,6 +167,8 @@ class PatchEngine:
                     boundary_context=boundary_context,
                     repo_path=repo_path,
                     kind=kind,
+                    file_contents=file_contents,
+                    repo_context=repo_context,
                 )
 
                 # Validate diff
@@ -206,6 +214,55 @@ class PatchEngine:
 
         return patches
 
+    def _read_target_files(self, repo_path: Path, target_files: List[str]) -> dict[str, str]:
+        """
+        Read target files from the repository.
+
+        Returns a dict mapping file paths to their contents.
+        """
+        file_contents = {}
+
+        for target in target_files:
+            if not target:
+                continue
+
+            # Try to find the file (handle various naming conventions)
+            potential_paths = [
+                repo_path / target,
+                repo_path / f"{target}.java",
+                repo_path / f"{target}.py",
+                repo_path / f"{target}.ts",
+                repo_path / f"{target}.js",
+            ]
+
+            # Also try searching for the file in common directories
+            for ext in ['.java', '.py', '.ts', '.js', '.go', '.rs']:
+                potential_paths.append(repo_path / "src" / "main" / "java" / f"{target.replace('.', '/')}{ext}")
+                potential_paths.append(repo_path / "src" / f"{target.replace('.', '/')}{ext}")
+
+            found_file = None
+            for path in potential_paths:
+                if path.exists() and path.is_file():
+                    found_file = path
+                    break
+
+            if found_file:
+                try:
+                    content = found_file.read_text(encoding='utf-8', errors='ignore')
+                    # Limit file size to avoid token limits
+                    if len(content) > 10000:
+                        content = content[:10000] + "\n... (file truncated)"
+                    file_contents[target] = content
+                    LOG.debug(f"Read {len(content)} chars from {found_file}")
+                except Exception as e:
+                    LOG.warning(f"Failed to read {found_file}: {e}")
+                    file_contents[target] = f"[Could not read file: {e}]"
+            else:
+                LOG.info(f"Target file '{target}' not found - will create new file")
+                file_contents[target] = "[New file - no existing content]"
+
+        return file_contents
+
     def _build_boundary_context(self, boundary_specs: List[BoundarySpec]) -> str:
         """Build context string from boundary specifications."""
         if not boundary_specs:
@@ -245,6 +302,8 @@ class PatchEngine:
         boundary_context: str,
         repo_path: Path,
         kind: PatchKind,
+        file_contents: dict[str, str],
+        repo_context: Optional[dict] = None,
     ) -> tuple[str, str, List[str]]:
         """
         Use LLM to generate a unified diff for the given plan step.
@@ -252,15 +311,35 @@ class PatchEngine:
         Returns:
             (diff, rationale, alternatives)
         """
+        # Build repo context section
+        repo_info = ""
+        if repo_context:
+            languages = repo_context.get("top_languages", [])
+            frameworks = repo_context.get("frameworks", [])
+            if languages:
+                repo_info += f"\nRepository language(s): {', '.join(str(l) for l in languages[:3])}"
+            if frameworks:
+                repo_info += f"\nFrameworks detected: {', '.join(frameworks[:5])}"
+
+        # Build file contents section
+        files_section = ""
+        if file_contents:
+            files_section = "\n\nCurrent file contents:\n"
+            for filename, content in file_contents.items():
+                files_section += f"\n--- File: {filename} ---\n"
+                files_section += f"{content}\n"
+                files_section += f"--- End of {filename} ---\n"
+
         # Build the prompt
         prompt = f"""You are a senior software engineer implementing a code change.
 
-{plan_context}{boundary_context}
+{plan_context}{boundary_context}{repo_info}
 
 Repository path: {repo_path}
 
 Your task is to generate a unified diff (git diff format) for this implementation step:
 {step.description}
+{files_section}
 
 Guidelines:
 1. Generate a valid unified diff in git format
@@ -272,6 +351,8 @@ Guidelines:
 7. Follow best practices for the language/framework being used
 8. Consider error handling and edge cases
 9. Respect any boundary specifications and constraints mentioned above
+10. If modifying an existing file, base your changes on the current file content shown above
+11. For new files (marked as "[New file - no existing content]"), create the entire file
 
 Respond with JSON in this exact format:
 {{
