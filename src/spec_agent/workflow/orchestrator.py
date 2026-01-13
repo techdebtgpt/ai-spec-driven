@@ -709,11 +709,36 @@ class TaskOrchestrator:
         # Always seed with common config/security terms.
         keywords |= {"oauth", "oauth2", "token", "secret", "secrets", "encrypt", "encrypted", "credential", "credentials", "appsettings"}
 
-        # Focus tokens: when the engineer answers "this is about encrypted service",
-        # we should bias scope toward that component and its tests, not the whole repo.
+        # Focus tokens: extract ALL meaningful words from clarification answers
+        # This ensures user-specified file/table/component names are respected.
         focus_tokens: set[str] = set()
+        
+        # Extract from all answered clarifications (not just "affected modules" question)
+        for item in clarifications:
+            if not isinstance(item, dict):
+                continue
+            status = (item.get("status") or "").strip().upper()
+            if status != "ANSWERED":
+                continue
+            answer = (item.get("answer") or "").strip()
+            if not answer:
+                continue
+            # Extract words that look like file/table/component names
+            words = re.findall(r"[A-Za-z0-9_.-]{3,}", answer)
+            for w in words:
+                w_lower = w.lower()
+                # Skip common noise words
+                if w_lower in {"the", "this", "that", "with", "from", "into", "only", "should", 
+                              "need", "have", "been", "will", "would", "could", "yes", "no",
+                              "and", "for", "are", "not", "use", "using", "used"}:
+                    continue
+                if len(w_lower) >= 3:
+                    focus_tokens.add(w_lower)
+                    # Also add underscore variations (transaction_fact, fynapse_table, etc.)
+                    focus_tokens.add(w_lower.replace("_", ""))
+        
+        # Legacy: also check for affected_answer specifically
         if affected_answer:
-            # Extract words and also a compact "joined" token.
             words = re.findall(r"[A-Za-z0-9]{3,}", affected_answer.lower())
             joined = re.sub(r"[^a-z0-9]+", "", affected_answer.lower())
             for w in words:
@@ -726,7 +751,6 @@ class TaskOrchestrator:
                 focus_tokens.add("encryptedservice")
             if "encryption" in focus_tokens and "service" in focus_tokens:
                 focus_tokens.add("encryptionservice")
-            # A few relevant stems
             for stem in ("encrypt", "encrypted", "encryption", "encryptionservice", "encryptedservice"):
                 if stem in joined:
                     focus_tokens.add(stem)
@@ -1220,11 +1244,155 @@ class TaskOrchestrator:
             "candidate_directory_count": len(directory_candidates),
         }
 
+    def _extract_scope_from_clarifications(self, task_id: str) -> List[str]:
+        """
+        Extract file/table/component names from clarification answers to use as scope.
+        
+        Returns a list of potential target paths/names mentioned by the user.
+        """
+        import re
+
+        task = self._get_task(task_id)
+        clarifications = task.metadata.get("clarifications", []) or []
+        repo_path = task.repo_path.resolve()
+
+        # We intentionally DO NOT require explicit user-provided paths here.
+        # Scope should be inferred generically across languages/architectures, using:
+        # - repo structure (top-level directories/modules)
+        # - semantic hints (when available elsewhere)
+        # - clarification tokens as search terms
+
+        # Candidate roots derived from repo tech/structure.
+        # Prefer summarizer-provided top_directories; otherwise use immediate children.
+        repo_summary = task.metadata.get("repository_summary", {}) or {}
+        top_dirs = []
+        if isinstance(repo_summary, dict):
+            top_dirs = list(repo_summary.get("top_directories") or [])
+        if not top_dirs:
+            try:
+                top_dirs = [p.name for p in repo_path.iterdir() if p.is_dir() and not p.name.startswith(".")]
+            except Exception:
+                top_dirs = []
+        # Keep a sane limit; sort for stability.
+        candidate_roots = sorted({str(d).strip("/").strip() for d in top_dirs if str(d).strip("/")})[:12]
+
+        # Extract "strong" tokens from answers and map them to files, but constrain search
+        # to candidate_roots to avoid exploding scope.
+        stopwords = {
+            "the",
+            "this",
+            "that",
+            "with",
+            "from",
+            "into",
+            "only",
+            "should",
+            "need",
+            "have",
+            "been",
+            "will",
+            "would",
+            "could",
+            "yes",
+            "no",
+            "and",
+            "for",
+            "are",
+            "not",
+            "use",
+            "using",
+            "used",
+            "table",
+            "tables",
+            "file",
+            "files",
+            "model",
+            "view",
+            "new",
+            "data",
+            "clean",
+            "dynamic",
+            "report",
+            "reports",
+        }
+
+        scope_candidates: set[str] = set()
+        for item in clarifications:
+            if not isinstance(item, dict):
+                continue
+            if (item.get("status") or "").strip().upper() != "ANSWERED":
+                continue
+            answer = (item.get("answer") or "").strip()
+            if not answer:
+                continue
+            tokens = re.findall(r"[A-Za-z0-9_.-]{3,}", answer)
+            for tok in tokens:
+                t = tok.strip().strip(".,:;()[]{}\"'").lower()
+                if t in stopwords:
+                    continue
+                # Heuristic: only keep "strong" tokens that are likely identifiers.
+                if not (len(t) >= 8 or any(ch in t for ch in ("_", ".", "-", "/")) or any(ch.isdigit() for ch in t)):
+                    continue
+                scope_candidates.add(t)
+
+        if not scope_candidates:
+            return []
+
+        resolved_targets: list[str] = []
+        max_matches_per_candidate = 10  # avoid exploding scope
+        max_results_per_candidate = 3
+
+        for candidate in sorted(scope_candidates):
+            candidate_underscore = candidate.replace("_", "")
+            patterns = [
+                f"**/*{candidate}*",
+                f"**/*{candidate_underscore}*",
+            ]
+
+            candidate_results: list[str] = []
+            # Search within roots first; fall back to repo-wide only if we have no roots.
+            search_roots = [repo_path / r for r in candidate_roots] if candidate_roots else [repo_path]
+            for root in search_roots:
+                if not root.exists():
+                    continue
+                for pattern in patterns:
+                    try:
+                        matches = list(root.glob(pattern))
+                    except Exception:
+                        continue
+
+                    # Too broad → ignore this pattern entirely.
+                    if len(matches) > max_matches_per_candidate:
+                        continue
+
+                    for match in matches:
+                        try:
+                            rel = str(match.resolve().relative_to(repo_path)).replace("\\", "/")
+                        except Exception:
+                            continue
+                        if any(noise in rel.lower() for noise in ("/bin/", "/obj/", "/node_modules/", "/.git/")):
+                            continue
+                        if rel not in candidate_results:
+                            candidate_results.append(rel)
+                        if len(candidate_results) >= max_results_per_candidate:
+                            break
+                    if len(candidate_results) >= max_results_per_candidate:
+                        break
+                if len(candidate_results) >= max_results_per_candidate:
+                    break
+
+            for rel in candidate_results:
+                if rel not in resolved_targets:
+                    resolved_targets.append(rel)
+
+        return resolved_targets[:20]
+
     def generate_plan(
         self,
         task_id: str,
         skip_rationale_enhancement: bool = False,
         auto_freeze_scope: bool = True,
+        progress: callable | None = None,
     ) -> Dict[str, List[str]]:
         """
         Generate an implementation plan for the task.
@@ -1242,7 +1410,27 @@ class TaskOrchestrator:
         base_summary = task.metadata.get("repository_summary", {})
         bounded_context = task.metadata.get("bounded_context", {}) or {}
         scoped_manual = bounded_context.get("manual")
-        # Prefer manual bounded index (post-clarifications) if present; otherwise fall back to plan-targets after plan creation.
+        
+        # STEP 1: Extract scope from clarifications BEFORE building the plan
+        # This ensures the LLM only sees relevant files
+        if auto_freeze_scope and not scoped_manual:
+            sys.stderr.write("Extracting scope from clarifications...\n")
+            clarification_targets = self._extract_scope_from_clarifications(task_id)
+            if clarification_targets:
+                sys.stderr.write(f"Found {len(clarification_targets)} files from clarifications\n")
+                for t in clarification_targets[:5]:
+                    sys.stderr.write(f"  - {t}\n")
+                # Run bounded index on these targets
+                try:
+                    self.bounded_index_task(task_id, clarification_targets)
+                    task = self._get_task(task_id)  # Reload
+                    bounded_context = task.metadata.get("bounded_context", {}) or {}
+                    scoped_manual = bounded_context.get("manual")
+                    sys.stderr.write("Scoped index created from clarifications\n")
+                except Exception as exc:
+                    sys.stderr.write(f"Bounded index failed: {exc}\n")
+        
+        # Prefer manual bounded index (post-clarifications) if present
         context_summary = dict(base_summary)
         if scoped_manual:
             context_summary["scoped_context"] = scoped_manual
@@ -1264,10 +1452,22 @@ class TaskOrchestrator:
         if answered_lines:
             augmented_description = f"{augmented_description}\n\nClarifications (answered):\n" + "\n".join(answered_lines)
         
+        def _progress(msg: str) -> None:
+            # Progress is primarily for chat UX. If not provided, fall back to stderr
+            # for CLI friendliness.
+            if progress is not None:
+                try:
+                    progress(str(msg))
+                    return
+                except Exception:
+                    # Never let progress rendering break plan generation.
+                    pass
+            sys.stderr.write(f"{msg}\n")
+
         # Show progress
-        sys.stderr.write("Building plan...\n")
+        _progress("Building plan...")
         plan = self.plan_builder.build_plan(task.id, augmented_description, context_summary)
-        sys.stderr.write(f"Plan created with {len(plan.steps)} steps\n")
+        _progress(f"Plan created with {len(plan.steps)} steps")
         
         # Defensive: if no tests are detected in the repo and the change request
         # doesn't explicitly ask for tests, strip any test-related plan steps that
@@ -1285,17 +1485,17 @@ class TaskOrchestrator:
                 plan.steps = filtered
 
         # Create BoundaryManager with LLM client and context for this plan
-        sys.stderr.write("Detecting boundaries...\n")
+        _progress("Detecting boundaries...")
         boundary_manager = BoundaryManager(
             llm_client=self.llm_client,
             context_summary=context_summary
         )
         specs = boundary_manager.required_specs(plan)
-        sys.stderr.write(f"Found {len(specs)} boundary specs\n")
+        _progress(f"Found {len(specs)} boundary specs")
 
-        sys.stderr.write("Generating refactor suggestions...\n")
+        _progress("Generating refactor suggestions...")
         refactors = self.refactor_advisor.suggest(plan)
-        sys.stderr.write("Plan generation complete!\n")
+        _progress("Plan generation complete!")
 
         previous_statuses = {
             spec.get("boundary_name"): spec.get("status", BoundarySpecStatus.PENDING.value)
@@ -1393,23 +1593,23 @@ class TaskOrchestrator:
         # Auto-freeze scope: infer targets and create final plan directly
         # This makes the flow more natural (skip preliminary plan step)
         if auto_freeze_scope:
-            sys.stderr.write("Auto-freezing scope for final plan...\n")
+            _progress("Auto-freezing scope for final plan...")
             try:
                 inferred = self.infer_scope_targets(task_id)
                 inferred_targets = inferred.get("targets") or []
                 if inferred_targets:
-                    sys.stderr.write(f"Inferred {len(inferred_targets)} scope targets\n")
+                    _progress(f"Inferred {len(inferred_targets)} scope targets")
                     # Run bounded index to freeze scope
                     self.bounded_index_task(task_id, list(inferred_targets))
                     task = self._get_task(task_id)  # Reload after bounded index
-                    sys.stderr.write("Scope frozen successfully\n")
+                    _progress("Scope frozen successfully")
             except Exception as exc:
                 LOG.warning("Auto-freeze scope failed: %s", exc)
-                sys.stderr.write(f"Auto-freeze scope skipped: {exc}\n")
+                _progress(f"Auto-freeze scope skipped: {exc}")
             # Always mark as FINAL when auto_freeze_scope is enabled
             # (even if scope inference fails, we want the simpler flow)
             task.metadata["plan_stage"] = "FINAL"
-            sys.stderr.write("Plan is FINAL\n")
+            _progress("Plan is FINAL")
         
         # Default stage if not otherwise set (only for auto_freeze_scope=False)
         task.metadata.setdefault("plan_stage", "PRELIMINARY")
@@ -1504,7 +1704,16 @@ class TaskOrchestrator:
         plan = self.plan_builder.build_plan(task.id, augmented_description, second_pass_context)
         sys.stderr.write(f"Final plan created with {len(plan.steps)} steps\n")
 
-        sys.stderr.write("Detecting boundaries (final plan)...\n")
+        def _progress(msg: str) -> None:
+            if progress is not None:
+                try:
+                    progress(str(msg))
+                    return
+                except Exception:
+                    pass
+            sys.stderr.write(f"{msg}\n")
+
+        _progress("Detecting boundaries (final plan)...")
         boundary_manager = BoundaryManager(
             llm_client=self.llm_client,
             context_summary=second_pass_context,
@@ -1512,7 +1721,7 @@ class TaskOrchestrator:
         specs = boundary_manager.required_specs(plan)
         sys.stderr.write(f"Found {len(specs)} boundary specs (final plan)\n")
 
-        sys.stderr.write("Generating refactor suggestions (final plan)...\n")
+        _progress("Generating refactor suggestions (final plan)...")
         refactors = self.refactor_advisor.suggest(plan)
 
         # Preserve preliminary plan for auditability.
@@ -1858,8 +2067,51 @@ class TaskOrchestrator:
         plans_dir.mkdir(parents=True, exist_ok=True)
 
         if output_path is None:
-            raw_title = (task.description or "").strip() or f"task-{task.id}"
+            # Prefer the short task title (derived at task creation time) for nicer filenames.
+            raw_title = (task.title or "").strip() or (task.description or "").strip() or f"task-{task.id}"
             title_line = raw_title.splitlines()[0].strip() if raw_title else f"task-{task.id}"
+
+            # Make the exported filename short and demo-friendly.
+            # Heuristics:
+            # - remove common filler prefixes (natural language)
+            # - cap to a small number of words
+            # - keep it generic across tech stacks
+            def _short_title_for_filename(value: str) -> str:
+                import re
+
+                s = (value or "").strip()
+                if not s:
+                    return f"task-{task.id}"
+
+                # Normalize spacing and remove markdown/backticks.
+                s = re.sub(r"[`*_#]", "", s)
+                s = re.sub(r"\s+", " ", s).strip()
+
+                lower = s.lower()
+                prefixes = [
+                    "in this repo",
+                    "in this repository",
+                    "i need to",
+                    "i need",
+                    "i want to",
+                    "i want",
+                    "please",
+                    "can you",
+                    "help me",
+                    "need to",
+                    "want to",
+                ]
+                for p in prefixes:
+                    if lower.startswith(p):
+                        s = s[len(p) :].strip(" :,-")
+                        break
+
+                # Cap to N words for a short slug.
+                words = [w for w in s.split(" ") if w]
+                capped = " ".join(words[:10])  # ~10 words is usually < 60 chars after slugify
+                return capped or f"task-{task.id}"
+
+            title_line = _short_title_for_filename(title_line)
 
             def _slugify(value: str) -> str:
                 import re
@@ -1869,7 +2121,7 @@ class TaskOrchestrator:
                 s = re.sub(r"-{2,}", "-", s).strip("-")
                 return s or f"task-{task.id}"
 
-            slug = _slugify(title_line)[:80].rstrip("-")
+            slug = _slugify(title_line)[:50].rstrip("-")
             candidate = plans_dir / f"{slug}.md"
             if candidate.exists():
                 candidate = plans_dir / f"{slug}-{task.id[:8]}.md"
@@ -1878,17 +2130,59 @@ class TaskOrchestrator:
         def _fmt_list(items: list[str]) -> str:
             return "\n".join(f"- {item}" for item in items) if items else "_None_"
 
+        def _infer_step_scenario(description: str, notes: str | None = None, *, has_tests: bool = True) -> list[str]:
+            """
+            Create a small, human-readable Given/When/Then scenario for a plan step.
+
+            This is intentionally heuristic: it converts high-level plan text into a
+            quick "what success looks like" summary to guide later test creation.
+            """
+            desc = (description or "").strip()
+            if not desc:
+                return []
+
+            desc_l = desc.lower()
+            notes_clean = (notes or "").strip()
+
+            given = "Given the codebase is indexed and the current behavior is understood"
+
+            if desc_l.startswith("implement"):
+                when = f"When we {desc_l}"
+                then = "Then the new component exists and is ready to be integrated"
+            elif desc_l.startswith("update") or desc_l.startswith("refactor"):
+                when = f"When we {desc_l}"
+                then = "Then the existing flow uses the updated configuration path"
+            elif "test" in desc_l and has_tests:
+                when = f"When we {desc_l}"
+                then = "Then automated tests validate both happy-path and failure cases"
+            elif desc_l.startswith("document"):
+                when = f"When we {desc_l}"
+                then = "Then the team can maintain the setup confidently without tribal knowledge"
+            else:
+                when = f"When we {desc_l}"
+                then = "Then the change is implemented with clear acceptance criteria"
+
+            lines = [
+                f"Given: {given}",
+                f"When:  {when}",
+                f"Then:  {then}",
+            ]
+            if notes_clean:
+                lines.append(f"And:   {notes_clean}")
+            return lines
+
         lines: list[str] = []
-        title = (task.description or "").strip().splitlines()[0].strip() if (task.description or "").strip() else "Spec Agent Plan"
+        # Use the short task title for a more natural, demo-friendly plan heading.
+        title = (task.title or "").strip() or (
+            (task.description or "").strip().splitlines()[0].strip() if (task.description or "").strip() else "Spec Agent Plan"
+        )
         if len(title) > 120:
             title = title[:117].rstrip() + "..."
         lines.append(f"# {title}")
         lines.append("")
-        lines.append(f"- **Task ID**: `{task.id}`")
+        # Keep header demo-friendly: avoid internal IDs; keep only stable repo context.
         lines.append(f"- **Repo**: `{repo_path}`")
         lines.append(f"- **Branch**: `{task.branch}`")
-        if task.metadata.get("plan_approved_at"):
-            lines.append(f"- **Approved at**: `{task.metadata.get('plan_approved_at')}`")
         lines.append("")
         lines.append("## Change request")
         lines.append("")
@@ -1901,10 +2195,17 @@ class TaskOrchestrator:
         if isinstance(scoped_files, int):
             lines.append("## Scope")
             lines.append("")
-            lines.append(f"- **Total files (scoped)**: {scoped_files} (repo: {repo_files})")
-            targets = list(((bounded.get("targets") or {}) if isinstance(bounded, dict) else {}).keys())
-            if targets:
-                lines.append(f"- **Targets**: {', '.join(f'`{t}`' for t in targets[:25])}{' …' if len(targets) > 25 else ''}")
+            lines.append(f"- **Scoped files**: {scoped_files} (repo: {repo_files})")
+            # Show a compact, human-readable scope summary instead of dumping many roots.
+            impact = (bounded.get('impact') or {}) if isinstance(bounded, dict) else {}
+            top_dirs = impact.get("top_directories") or []
+            files_sample = impact.get("files_sample") or []
+            if top_dirs:
+                lines.append(f"- **Areas**: {', '.join(f'`{d}`' for d in top_dirs[:8])}{' …' if len(top_dirs) > 8 else ''}")
+            if files_sample:
+                lines.append("- **Key files (sample)**:")
+                for p in files_sample[:12]:
+                    lines.append(f"  - `{p}`")
             lines.append("")
 
         lines.append("## Plan steps")
@@ -1926,9 +2227,66 @@ class TaskOrchestrator:
             lines.append("_No plan steps generated._")
         lines.append("")
 
+        # Scenarios are intentionally exported even when tests aren't present yet:
+        # they serve as acceptance criteria and can be translated into tests later.
+        repo_summary = task.metadata.get("repository_summary", {}) or {}
+        has_tests = bool(repo_summary.get("has_tests", False)) if isinstance(repo_summary, dict) else False
+        scenario_lines: list[str] = []
+        for idx, step in enumerate(steps, start=1):
+            if isinstance(step, dict):
+                desc = (step.get("description") or "").strip()
+                notes = step.get("notes")
+            else:
+                desc = str(step).strip()
+                notes = None
+            if not desc:
+                continue
+            scenario = _infer_step_scenario(desc, notes, has_tests=has_tests)
+            if not scenario:
+                continue
+            if scenario_lines:
+                scenario_lines.append("")  # spacer
+            scenario_lines.append(f"### Step {idx}: {desc}")
+            scenario_lines.extend([f"- {line}" for line in scenario])
+
+        if scenario_lines:
+            lines.append("## Scenarios (Given / When / Then)")
+            lines.append("")
+            lines.extend(scenario_lines)
+            lines.append("")
+
         lines.append("## Risks")
         lines.append("")
         lines.append(_fmt_list([str(r) for r in risks if str(r).strip()]))
+        lines.append("")
+
+        # Add a generic test plan section based on detected tech stack.
+        lines.append("## Test plan")
+        lines.append("")
+        top_langs = (repo_summary.get("top_languages") or []) if isinstance(repo_summary, dict) else []
+        langs_norm = " ".join(str(x).lower() for x in top_langs)
+        test_lines: list[str] = []
+        test_lines.append("Run the repository’s standard test/validation command(s) for this tech stack.")
+        if "python" in langs_norm:
+            test_lines.append("Python: run `pytest` (and optionally `ruff check .`) in the repo.")
+        if any(t in langs_norm for t in ("javascript", "typescript", "node")):
+            test_lines.append("Node: run `npm test` / `pnpm test` (whichever the repo uses).")
+        if any(t in langs_norm for t in ("go",)):
+            test_lines.append("Go: run `go test ./...`.")
+        if any(t in langs_norm for t in ("java", "kotlin")):
+            test_lines.append("JVM: run the repo’s Gradle/Maven test task.")
+        if any(t in langs_norm for t in ("sql", "dbt", "jinja", "yaml")):
+            test_lines.append("Data/SQL: run the repo’s dbt/SQL validation (e.g. `dbt build` / `dbt test`) if applicable.")
+        if not has_tests:
+            test_lines.append("If no automated tests exist, do a quick manual verification on a small sample dataset and validate output schema/row counts.")
+        lines.append(_fmt_list(test_lines))
+        if scenario_lines and not has_tests:
+            lines.append("")
+            lines.append("### Suggested test scenarios (from plan steps)")
+            lines.append("")
+            lines.append(
+                "Use the Scenarios section above as acceptance criteria; convert each Step scenario into unit/integration tests when the repo adds a test harness."
+            )
         lines.append("")
 
         lines.append("## Refactor suggestions")

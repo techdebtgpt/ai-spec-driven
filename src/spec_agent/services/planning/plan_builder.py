@@ -73,11 +73,12 @@ class PlanBuilder:
 Your task is to analyze a change request and generate a high-level implementation plan.
 
 The plan should include:
-1. **Steps**: 3-7 high-level implementation steps, each identifying affected modules/components
+1. **Steps**: 3-7 high-level implementation steps, each identifying affected files/modules
 2. **Risks**: Potential issues or concerns (technical debt, breaking changes, performance, etc.)
 3. **Refactorings**: Opportunities to improve code quality while making changes
 
-Focus on architectural and component-level changes, not specific file paths.
+IMPORTANT: When a "Scoped Files" list is provided, you MUST use those exact file paths as targets.
+Only target files from the scoped list - do not add files outside the scope.
 If the repository has no existing tests (or no test harness is detected) and the change request
 does not explicitly require adding tests, do NOT add plan steps about creating tests.
 Return ONLY valid JSON in this exact format:
@@ -86,7 +87,7 @@ Return ONLY valid JSON in this exact format:
   "steps": [
     {
       "description": "Clear, actionable step description",
-      "target_modules": ["Module or component name"],
+      "target_modules": ["Exact file path from scoped list"],
       "notes": "Optional implementation notes or warnings"
     }
   ],
@@ -118,25 +119,35 @@ Do not include any explanatory text before or after the JSON."""
 
         scoped = context_summary.get("scoped_context") or {}
         scoped_hint = ""
+        scoped_files_list = ""
         total_files_line = f"- Total Files: {context_summary.get('file_count', 'unknown')}"
         if isinstance(scoped, dict) and scoped:
             agg = scoped.get("aggregate") or {}
-            scoped_files = agg.get("file_count")
-            if isinstance(scoped_files, int):
+            scoped_file_count = agg.get("file_count")
+            if isinstance(scoped_file_count, int):
                 repo_files = context_summary.get("file_count", "unknown")
-                total_files_line = f"- Total Files (scoped): {scoped_files} (repo: {repo_files})"
+                total_files_line = f"- Total Files (scoped): {scoped_file_count} (repo: {repo_files})"
 
             impact = scoped.get("impact") or {}
             targets = list((scoped.get("targets") or {}).keys())
             top_dirs = impact.get("top_directories") or []
             namespaces = impact.get("namespaces") or []
-            scoped_hint = "\n\nScoped Context (post-clarifications):\n"
+            files_sample = impact.get("files_sample") or []
+            
+            scoped_hint = "\n\nScoped Context (from clarifications):\n"
             if targets:
-                scoped_hint += f"- Targets: {', '.join(targets[:8])}{' ...' if len(targets) > 8 else ''}\n"
+                scoped_hint += f"- Scope targets: {', '.join(targets[:8])}{' ...' if len(targets) > 8 else ''}\n"
             if top_dirs:
-                scoped_hint += f"- Impacted directories: {', '.join(top_dirs[:10])}\n"
+                scoped_hint += f"- Directories: {', '.join(top_dirs[:10])}\n"
             if namespaces:
-                scoped_hint += f"- Impacted namespaces: {', '.join(namespaces[:10])}\n"
+                scoped_hint += f"- Namespaces: {', '.join(namespaces[:10])}\n"
+            
+            # Include actual file paths for the LLM to use as targets
+            if files_sample:
+                scoped_files_list = "\n\nScoped Files (USE THESE AS TARGETS):\n"
+                for f in files_sample[:20]:
+                    scoped_files_list += f"- {f}\n"
+                scoped_files_list += "\nIMPORTANT: Only use files from this list as target_modules in your plan steps."
 
         return f"""Change Request: {description}
 
@@ -146,10 +157,11 @@ Repository Context:
 - Tests: {tests_str}
 - Legacy Hotspots (large files): {hotspots_str}
 - Key Modules: {modules_str}
-{scoped_hint}
+{scoped_hint}{scoped_files_list}
 
 Guidance:
 - If tests are not detected and the change request does not explicitly ask to add tests, omit test-related steps and suggestions.
+- If a Scoped Files list is provided, ONLY use those files as target_modules in your plan.
 
 Generate a high-level implementation plan for this change request."""
 

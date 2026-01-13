@@ -651,7 +651,11 @@ class ChatSession:
         console.print("[yellow]Generating implementation plan...[/]")
 
         try:
-            self.orchestrator.generate_plan(self.current_task.id)
+            def progress(msg: str) -> None:
+                # Render plan progress in the same "note" style used elsewhere.
+                console.print(f"[dim]{msg}[/]")
+
+            self.orchestrator.generate_plan(self.current_task.id, progress=progress)
 
             # Reload the task to get updated metadata
             self.current_task = self.orchestrator._get_task(self.current_task.id)
@@ -736,83 +740,32 @@ class ChatSession:
             )
             console.print(f"  → {spec_names}", style="dim")
 
-        # Show scoped/bounded impact if available (post-clarifications indexing)
+        # Show scoped files as a dedicated panel (like other sections), but compact.
         bounded_context = self.current_task.metadata.get("bounded_context", {}) or {}
         manual_bounded = bounded_context.get("manual")
         plan_targets_bounded = bounded_context.get("plan_targets")
         bounded = manual_bounded or plan_targets_bounded
         if bounded:
-            console.print()
             aggregate = bounded.get("aggregate", {}) if isinstance(bounded, dict) else {}
             impact = bounded.get("impact", {}) if isinstance(bounded, dict) else {}
-            resolution = bounded.get("plan_targets_resolution") if isinstance(bounded, dict) else None
-
-            scope_title = "Scoped Context (Bounded Index)" if manual_bounded else "Scoped Context (Plan Targets)"
-            scope_lines = [
-                f"Files: {aggregate.get('file_count', 0)}",
-                f"Size: {aggregate.get('total_size_bytes', 0)} bytes",
-                f"Languages: {', '.join(aggregate.get('top_languages', [])) or 'unknown'}",
-            ]
-            console.print(
-                Panel.fit(
-                    "\n".join(scope_lines),
-                    title=scope_title,
-                    border_style="magenta",
-                ),
-                markup=False,
-            )
-
-            # If we have an empty scope, explain why (plan targets are logical module names).
-            if aggregate.get("file_count", 0) == 0 and isinstance(resolution, dict):
-                raw_targets = resolution.get("raw_targets") or []
-                resolved_targets = resolution.get("resolved_targets") or []
-                unresolved_targets = resolution.get("unresolved_targets") or []
-
-                explain_lines = [
-                    "This scoped index is empty because plan targets are module labels (e.g. 'Api', 'Data')",
-                    "and don't necessarily correspond to real directories/files under the indexed repo path.",
-                ]
-                if raw_targets:
-                    explain_lines.append("")
-                    explain_lines.append(f"Plan targets: {', '.join(str(t) for t in raw_targets[:12])}{' ...' if len(raw_targets) > 12 else ''}")
-                if resolved_targets:
-                    explain_lines.append(f"Resolved to paths: {', '.join(str(t) for t in resolved_targets[:12])}{' ...' if len(resolved_targets) > 12 else ''}")
-                if unresolved_targets:
-                    explain_lines.append(f"Unresolved: {', '.join(str(t) for t in unresolved_targets[:12])}{' ...' if len(unresolved_targets) > 12 else ''}")
-                    explain_lines.append("")
-                    explain_lines.append("Tip: run a bounded index on real paths (directories/files) you care about.")
-                    explain_lines.append("Tip (chat): run scoped indexing on real paths (directories/files) you care about.")
-                    explain_lines.append(f"CLI example: ./spec-agent bounded-index {self.current_task.id} <path1> <path2>")
-
-                console.print(
-                    Panel.fit(
-                        "\n".join(explain_lines),
-                        title="Why Files=0",
-                        border_style="yellow",
-                    ),
-                    markup=False,
-                )
-
-            impact_lines = []
-            top_dirs = impact.get("top_directories") or []
-            namespaces = impact.get("namespaces") or []
+            file_count = aggregate.get("file_count", 0)
             files_sample = impact.get("files_sample") or []
-            if top_dirs:
-                impact_lines.append(f"Top directories: {', '.join(top_dirs[:10])}")
-            if namespaces:
-                impact_lines.append(f"Namespaces: {', '.join(namespaces[:10])}")
-            if files_sample:
-                impact_lines.append("")
-                impact_lines.append("Impacted files (sample):")
-                for p in files_sample[:12]:
-                    impact_lines.append(f"- {p}")
 
-            if impact_lines:
+            if isinstance(file_count, int) and file_count > 0:
+                console.print()
+                scope_source = "scoped index" if manual_bounded else "plan targets"
+
+                scope_lines = [f"Scope: {file_count} file(s) ({scope_source})"]
+                if files_sample:
+                    scope_lines.append("")
+                    scope_lines.append("Impacted files (sample):")
+                    scope_lines.extend([f"- {p}" for p in files_sample[:12]])
+
                 console.print(
                     Panel.fit(
-                        "\n".join(impact_lines),
-                        title="Impacted Modules / Files (Scoped)",
-                        border_style="magenta",
+                        "\n".join(scope_lines),
+                        title="Impacted files (scope)",
+                        border_style="green",
                     ),
                     markup=False,
                 )
@@ -882,14 +835,40 @@ class ChatSession:
                     return
 
                 self.orchestrator.approve_plan(self.current_task.id)
-                console.print("[green]✓[/] Final plan approved!")
+                console.print("[green]✓[/] Plan approved!")
 
                 console.print()
                 exported = self.orchestrator.export_approved_plan_markdown(self.current_task.id)
-                console.print(f"[green]✓[/] Saved approved plan to: [cyan]{exported}[/]")
+                console.print(f"[green]✓[/] Plan exported to: [cyan]{exported}[/]")
 
-                generate_now = Confirm.ask("Generate patches now? (you can do this later)", default=False)
-                if generate_now:
+                console.print()
+                console.print("[bold]Plan exported. What would you like to do next?[/]")
+                console.print()
+                console.print("  [cyan]1.[/] Generate patches (next milestone)")
+                console.print("  [cyan]2.[/] Open the plan file")
+                console.print("  [cyan]3.[/] Return to main menu")
+                console.print()
+
+                next_choice = self._ask_menu_choice("Choice", ["1", "2", "3"], "3")
+
+                if next_choice == "2":
+                    try:
+                        import subprocess
+                        import sys
+
+                        # Best-effort: open the file in the OS default app.
+                        if sys.platform == "darwin":
+                            subprocess.run(["open", str(exported)], check=False)
+                        elif sys.platform.startswith("linux"):
+                            subprocess.run(["xdg-open", str(exported)], check=False)
+                        else:
+                            console.print(f"[dim]Plan file path:[/] {exported}")
+                    except Exception:
+                        console.print(f"[dim]Plan file path:[/] {exported}")
+                    self.state = ConversationState.MAIN_MENU
+                    return
+
+                if next_choice == "1":
                     has_tests = bool((self.current_task.metadata.get("repository_summary") or {}).get("has_tests", False))
                     if has_tests:
                         console.print("[cyan]Generating patches and test suggestions...[/]")
@@ -908,8 +887,8 @@ class ChatSession:
                     self.current_task = self.orchestrator._get_task(self.current_task.id)
                     self.state = ConversationState.REVIEWING_PATCHES
                 else:
-                    console.print("[green]✓[/] Ready to generate patches later.")
-                    console.print(f"[dim]Run: ./spec-agent generate-patches {self.current_task.id}[/]")
+                    console.print("[green]✓[/] Next milestone: patch generation.")
+                    console.print(f"[dim]CLI: ./spec-agent generate-patches {self.current_task.id}[/]")
                     self.state = ConversationState.MAIN_MENU
             except Exception as exc:
                 console.print(f"Error approving plan: {exc}", style="red", markup=False)
