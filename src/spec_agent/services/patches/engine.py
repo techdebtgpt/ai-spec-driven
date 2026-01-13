@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4
 
-from ...domain.models import BoundarySpec, Patch, PatchKind, Plan
+from ...domain.models import Patch, PatchKind, Plan
 from ..integrations.serena_client import SerenaToolClient, SerenaToolError
 from ..review.rationale_enhancer import RationaleEnhancer
 
@@ -27,22 +27,20 @@ class PatchEngine:
         self.rationale_enhancer = RationaleEnhancer(llm_client=llm_client)
 
     def draft_patches(
-        self, 
-        plan: Plan, 
-        repo_path: Path | None = None, 
+        self,
+        plan: Plan,
+        repo_path: Path | None = None,
         *,
         kind: PatchKind = PatchKind.IMPLEMENTATION,
-        boundary_specs: List[BoundarySpec] | None = None,
         skip_rationale_enhancement: bool = False,
     ) -> List[Patch]:
         if self.serena_client:
             if repo_path is None:
                 raise ValueError("repo_path is required when Serena integration is enabled.")
             return self._draft_with_serena(
-                plan, 
-                repo_path, 
-                kind=kind, 
-                boundary_specs=boundary_specs or [],
+                plan,
+                repo_path,
+                kind=kind,
                 skip_rationale_enhancement=skip_rationale_enhancement,
             )
 
@@ -52,12 +50,11 @@ class PatchEngine:
         ]
 
     def _draft_with_serena(
-        self, 
-        plan: Plan, 
-        repo_path: Path, 
-        *, 
+        self,
+        plan: Plan,
+        repo_path: Path,
+        *,
         kind: PatchKind,
-        boundary_specs: List[BoundarySpec],
         skip_rationale_enhancement: bool = False,
     ) -> List[Patch]:
         import sys
@@ -66,16 +63,10 @@ class PatchEngine:
         for index, step in enumerate(plan.steps, start=1):
             sys.stderr.write(f"Generating patch {index}/{total_steps}: {step.description[:50]}...\n")
             try:
-                # Find relevant boundary specs for this step
-                relevant_specs = [
-                    spec for spec in boundary_specs
-                    if spec.status.value == "APPROVED"  # Only use approved specs
-                ]
                 proposal = self.serena_client.request_patch(
-                    repo_path, 
-                    step.description, 
-                    plan.id,
-                    boundary_specs=relevant_specs
+                    repo_path,
+                    step.description,
+                    plan.id
                 )
                 
                 # Validate that we got a real diff (not empty or error)
@@ -117,7 +108,6 @@ class PatchEngine:
                         patch=patch,
                         plan_step=step,
                         plan=plan,
-                        boundary_specs=relevant_specs,
                     )
                 except Exception as exc:
                     LOG.warning("Rationale enhancement failed for patch %s: %s", patch.id, exc)
@@ -132,7 +122,7 @@ class PatchEngine:
         rationale = f"{kind.value.title()} patch {index}: {description}"
         alternatives = [
             "Manual refactor before applying patch.",
-            "Defer change until boundary spec is approved.",
+            "Defer change until after plan review.",
         ]
         return Patch(
             id=str(uuid4()),

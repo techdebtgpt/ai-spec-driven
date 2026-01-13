@@ -128,23 +128,21 @@ class TestSuggester:
         return (has_tests, test_file_paths[:10], test_framework)  # Limit to 10 for performance
 
     def suggest(
-        self, 
+        self,
         plan: Plan,
         patches: Optional[List[Patch]] = None,
-        boundary_specs: Optional[List[BoundarySpec]] = None,
         repo_context: Optional[dict] = None,
         repo_path: Optional[Path] = None,
     ) -> List[TestSuggestion]:
         """
         Suggest test cases based on the plan and patches.
-        
+
         Args:
             plan: The implementation plan
             patches: Optional list of patches to analyze for test suggestions
-            boundary_specs: Optional boundary specifications to consider
             repo_context: Optional repository context (language, test framework, etc.)
             repo_path: Optional repository path for test file detection
-            
+
         Returns:
             List of test suggestions
         """
@@ -177,7 +175,6 @@ class TestSuggester:
                         step=step,
                         plan=plan,
                         patch=related_patch,
-                        boundary_specs=boundary_specs or [],
                         repo_context=repo_context,
                         has_tests=has_tests,
                         test_file_paths=test_file_paths,
@@ -326,7 +323,6 @@ namespace Tests
         step: PlanStep,
         plan: Plan,
         patch: Optional[Patch],
-        boundary_specs: List[BoundarySpec],
         repo_context: Optional[dict],
         has_tests: bool = True,
         test_file_paths: Optional[List[str]] = None,
@@ -343,13 +339,7 @@ Code Change:
 
 Rationale: {patch.rationale}
 """
-        
-        boundary_context = ""
-        if boundary_specs:
-            boundary_context = "\nBoundary Specifications:\n"
-            for spec in boundary_specs:
-                boundary_context += f"- {spec.boundary_name}: {spec.human_description}\n"
-        
+
         repo_info = ""
         if repo_context:
             primary_lang = repo_context.get("primary_language", "unknown")
@@ -369,7 +359,7 @@ Rationale: {patch.rationale}
 
 Plan Step: {step.description}
 {step.notes if step.notes else ""}
-{patch_context}{boundary_context}{repo_info}
+{patch_context}{repo_info}
 
 Provide test suggestions that include:
 

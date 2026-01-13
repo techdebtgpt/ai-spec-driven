@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 
-from ...domain.models import BoundarySpec, Patch, Plan, PlanStep
+from ...domain.models import Patch, Plan, PlanStep
 
 LOG = logging.getLogger(__name__)
 
@@ -29,59 +29,39 @@ class RationaleEnhancer:
         patch: Patch,
         plan_step: PlanStep,
         plan: Plan,
-        boundary_specs: List[BoundarySpec],
         repo_context: Optional[dict] = None,
     ) -> Patch:
         """
         Enhance a patch's rationale with design decisions, trade-offs, and constraints.
-        
+
         Args:
             patch: The patch to enhance
             plan_step: The plan step this patch implements
             plan: The full plan context
-            boundary_specs: Relevant boundary specifications
             repo_context: Optional repository context summary
-            
+
         Returns:
             Enhanced patch with improved rationale and alternatives
         """
         if self.llm_client:
             try:
                 LOG.info("Enhancing rationale using LLM for patch %s", patch.id)
-                return self._enhance_with_llm(patch, plan_step, plan, boundary_specs, repo_context)
+                return self._enhance_with_llm(patch, plan_step, plan, repo_context)
             except Exception as exc:
                 LOG.warning("LLM rationale enhancement failed: %s, using template", exc)
-                return self._enhance_template(patch, plan_step, plan, boundary_specs)
+                return self._enhance_template(patch, plan_step, plan)
         else:
             LOG.debug("No LLM client available, using template rationale")
-            return self._enhance_template(patch, plan_step, plan, boundary_specs)
+            return self._enhance_template(patch, plan_step, plan)
 
     def _enhance_with_llm(
         self,
         patch: Patch,
         plan_step: PlanStep,
         plan: Plan,
-        boundary_specs: List[BoundarySpec],
         repo_context: Optional[dict],
     ) -> Patch:
         """Enhance rationale using LLM analysis."""
-        # Build context for LLM
-        boundary_context = ""
-        if boundary_specs:
-            boundary_context = "\n\nBoundary Specifications:\n"
-            for spec in boundary_specs:
-                boundary_context += f"- {spec.boundary_name}: {spec.human_description}\n"
-                if spec.machine_spec:
-                    actors = spec.machine_spec.get("actors", [])
-                    interfaces = spec.machine_spec.get("interfaces", [])
-                    invariants = spec.machine_spec.get("invariants", [])
-                    if actors:
-                        boundary_context += f"  Actors: {', '.join(actors)}\n"
-                    if interfaces:
-                        boundary_context += f"  Interfaces: {', '.join(interfaces)}\n"
-                    if invariants:
-                        boundary_context += f"  Invariants: {', '.join(invariants[:3])}\n"
-
         plan_context = f"Plan: {plan.task_id}\n"
         plan_context += f"Step: {plan_step.description}\n"
         if plan_step.notes:
@@ -98,7 +78,7 @@ class RationaleEnhancer:
 
         prompt = f"""Analyze this code change and provide a comprehensive rationale.
 
-{plan_context}{boundary_context}{repo_info}
+{plan_context}{repo_info}
 
 Code Change (unified diff):
 ```
@@ -194,14 +174,13 @@ Return only valid JSON, no markdown, no explanations."""
 
         except Exception as exc:
             LOG.error("Failed to enhance rationale with LLM: %s", exc)
-            return self._enhance_template(patch, plan_step, plan, boundary_specs)
+            return self._enhance_template(patch, plan_step, plan)
 
     def _enhance_template(
         self,
         patch: Patch,
         plan_step: PlanStep,
         plan: Plan,
-        boundary_specs: List[BoundarySpec],
     ) -> Patch:
         """Enhance rationale using template-based approach."""
         # Build template rationale
@@ -211,16 +190,7 @@ Return only valid JSON, no markdown, no explanations."""
         rationale_parts.append(f"This change implements the plan step: {plan_step.description}")
         if plan_step.notes:
             rationale_parts.append(f"Additional context: {plan_step.notes}")
-        
-        if boundary_specs:
-            rationale_parts.append("\n**Constraints from boundary specifications:**")
-            for spec in boundary_specs:
-                rationale_parts.append(f"- {spec.boundary_name}: Must respect {spec.human_description}")
-                if spec.machine_spec:
-                    invariants = spec.machine_spec.get("invariants", [])
-                    if invariants:
-                        rationale_parts.append(f"  Invariants: {', '.join(invariants[:2])}")
-        
+
         if plan.risks:
             rationale_parts.append("\n**Risks considered:**")
             for risk in plan.risks[:3]:

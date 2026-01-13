@@ -80,9 +80,6 @@ The MCP server exposes these tools for spec-driven development:
 
 ### Planning
 - `generate_plan` - Generate implementation plan
-- `get_boundary_specs` - Get boundary specifications
-- `approve_spec` / `skip_spec` - Resolve specs
-- `approve_all_specs` - Approve all specs at once
 - `approve_plan` - Approve the plan
 
 ### Patch Generation

@@ -12,8 +12,6 @@ import json
 
 from ..config.settings import AgentSettings, get_settings
 from ..domain.models import (
-    BoundarySpec,
-    BoundarySpecStatus,
     ClarificationStatus,
     Patch,
     PatchKind,
@@ -34,7 +32,6 @@ from ..services.llm.openai_client import OpenAILLMClient
 from ..services.planning.clarifier import Clarifier
 from ..services.planning.plan_builder import PlanBuilder
 from ..services.patches.engine import PatchEngine
-from ..services.specs.boundary_manager import BoundaryManager
 from ..services.planning.refactor_advisor import RefactorAdvisor
 from ..services.tests.suggester import TestSuggester
 from ..tracing.reasoning_log import ReasoningLog
@@ -59,8 +56,6 @@ class TaskOrchestrator:
         self.clarifier = Clarifier(llm_client=self.llm_client)
         self.semantic_indexer = SemanticIndexer(llm_client=self.llm_client, settings=self.settings)
         self.plan_builder = PlanBuilder(llm_client=self.llm_client)
-        # Note: BoundaryManager created per-use in generate_plan with context
-        self.boundary_manager = BoundaryManager()
         self.refactor_advisor = RefactorAdvisor()
         self.serena_client = self._maybe_create_serena_client()
         self.patch_engine = PatchEngine(
@@ -1269,30 +1264,9 @@ class TaskOrchestrator:
                     filtered.append(step)
                 plan.steps = filtered
 
-        # Create BoundaryManager with LLM client and context for this plan
-        sys.stderr.write("Detecting boundaries...\n")
-        boundary_manager = BoundaryManager(
-            llm_client=self.llm_client,
-            context_summary=context_summary
-        )
-        specs = boundary_manager.required_specs(plan)
-        sys.stderr.write(f"Found {len(specs)} boundary specs\n")
-
         sys.stderr.write("Generating refactor suggestions...\n")
         refactors = self.refactor_advisor.suggest(plan)
         sys.stderr.write("Plan generation complete!\n")
-
-        previous_statuses = {
-            spec.get("boundary_name"): spec.get("status", BoundarySpecStatus.PENDING.value)
-            for spec in task.metadata.get("boundary_specs", [])
-        }
-        for spec in specs:
-            prev_status = previous_statuses.get(spec.boundary_name)
-            if prev_status:
-                try:
-                    spec.status = BoundarySpecStatus(prev_status)
-                except ValueError:
-                    LOG.debug("Ignoring unknown spec status '%s' for %s", prev_status, spec.boundary_name)
 
         # Serialize preliminary plan artifacts.
         plan_preview = {
@@ -1301,21 +1275,6 @@ class TaskOrchestrator:
             "risks": plan.risks,
             "refactors": plan.refactor_suggestions,
         }
-        serialized_specs = [
-            {
-                "id": spec.id,
-                "task_id": spec.task_id,
-                "boundary_name": spec.boundary_name,
-                "human_description": spec.human_description,
-                "diagram_text": spec.diagram_text,
-                "machine_spec": spec.machine_spec,
-                "status": spec.status.value,
-                "plan_step": spec.plan_step,
-            }
-            for spec in specs
-        ]
-
-        pending_specs = [spec["boundary_name"] for spec in serialized_specs if spec["status"] == BoundarySpecStatus.PENDING.value]
 
         # Resolve plan targets to paths and build a frozen scoped index (allowlist).
         # Note: the final plan regeneration happens when the preliminary plan is approved
@@ -1378,15 +1337,13 @@ class TaskOrchestrator:
         task.metadata.setdefault("plan_stage", "PRELIMINARY")
 
         task.metadata["plan_preview"] = plan_preview
-        task.metadata["boundary_specs"] = serialized_specs
-        task.metadata["pending_specs"] = pending_specs
         task.metadata["refactor_suggestions"] = [item.to_dict() for item in refactors]
         task.metadata["plan_approved"] = False
         task.metadata.pop("plan_approved_at", None)
         for key in ("patch_queue", "patch_queue_state", "test_suggestions"):
             task.metadata.pop(key, None)
 
-        task.status = TaskStatus.SPEC_PENDING if pending_specs else TaskStatus.PLANNING
+        task.status = TaskStatus.PLANNING
         self._snapshot_worktree_status(task)
         task.touch()
         self.store.upsert_task(task)
@@ -1396,7 +1353,6 @@ class TaskOrchestrator:
             "PLAN_GENERATED",
             {
                 "plan": plan_preview,
-                "pending_specs": pending_specs,
                 "refactor_suggestions": task.metadata["refactor_suggestions"],
                 "plan_targets_indexed": bool(
                     (plan_targets_resolution or {}).get("resolved_targets")
@@ -1409,7 +1365,6 @@ class TaskOrchestrator:
 
         return_payload = {
             "plan": plan_preview,
-            "pending_specs": pending_specs,
             "refactor_suggestions": task.metadata["refactor_suggestions"],
             # Prefer manual bounded index when available; otherwise show plan-targets scope.
             "bounded_context": (task.metadata.get("bounded_context", {}) or {}).get("manual")
@@ -1467,14 +1422,6 @@ class TaskOrchestrator:
         plan = self.plan_builder.build_plan(task.id, augmented_description, second_pass_context)
         sys.stderr.write(f"Final plan created with {len(plan.steps)} steps\n")
 
-        sys.stderr.write("Detecting boundaries (final plan)...\n")
-        boundary_manager = BoundaryManager(
-            llm_client=self.llm_client,
-            context_summary=second_pass_context,
-        )
-        specs = boundary_manager.required_specs(plan)
-        sys.stderr.write(f"Found {len(specs)} boundary specs (final plan)\n")
-
         sys.stderr.write("Generating refactor suggestions (final plan)...\n")
         refactors = self.refactor_advisor.suggest(plan)
 
@@ -1488,28 +1435,8 @@ class TaskOrchestrator:
             "risks": plan.risks,
             "refactors": plan.refactor_suggestions,
         }
-        serialized_specs = [
-            {
-                "id": spec.id,
-                "task_id": spec.task_id,
-                "boundary_name": spec.boundary_name,
-                "human_description": spec.human_description,
-                "diagram_text": spec.diagram_text,
-                "machine_spec": spec.machine_spec,
-                "status": spec.status.value,
-                "plan_step": spec.plan_step,
-            }
-            for spec in specs
-        ]
-        pending_specs = [
-            spec["boundary_name"]
-            for spec in serialized_specs
-            if spec["status"] == BoundarySpecStatus.PENDING.value
-        ]
 
         task.metadata["plan_preview"] = plan_preview
-        task.metadata["boundary_specs"] = serialized_specs
-        task.metadata["pending_specs"] = pending_specs
         task.metadata["refactor_suggestions"] = [item.to_dict() for item in refactors]
         task.metadata["plan_stage"] = "FINAL"
         task.metadata["plan_approved"] = False
@@ -1517,12 +1444,12 @@ class TaskOrchestrator:
         for key in ("patch_queue", "patch_queue_state", "test_suggestions"):
             task.metadata.pop(key, None)
 
-        task.status = TaskStatus.SPEC_PENDING if pending_specs else TaskStatus.PLANNING
+        task.status = TaskStatus.PLANNING
         self._snapshot_worktree_status(task)
         task.touch()
         self.store.upsert_task(task)
 
-        return {"status": "FINAL_BUILT", "plan": plan_preview, "pending_specs": pending_specs}
+        return {"status": "FINAL_BUILT", "plan": plan_preview}
 
     def bounded_index_task(
         self,
@@ -1571,208 +1498,12 @@ class TaskOrchestrator:
             )
         return summary
 
-    # ------------------------------------------------------------------ Boundary Specs
-    def get_boundary_specs(self, task_id: str) -> List[Dict]:
-        """
-        Get all boundary specs for a task.
-        """
-        task = self._get_task(task_id)
-        return task.metadata.get("boundary_specs", [])
-
-    def approve_spec(self, task_id: str, spec_id: str) -> Dict:
-        """
-        Approve a boundary specification.
-        """
-        task = self._get_task(task_id)
-        specs = task.metadata.get("boundary_specs", [])
-
-        found_spec = None
-        for spec in specs:
-            if spec["id"] == spec_id:
-                spec["status"] = "APPROVED"
-                found_spec = spec
-                break
-
-        if not found_spec:
-            raise ValueError(f"Boundary spec not found: {spec_id}")
-
-        task.metadata["boundary_specs"] = specs
-        self._update_pending_specs(task)
-        task.touch()
-        self.store.upsert_task(task)
-
-        self.logger.record(
-            task.id,
-            "SPEC_APPROVED",
-            {"spec_id": spec_id, "boundary_name": found_spec.get("boundary_name")}
-        )
-
-        return {"spec_id": spec_id, "status": "APPROVED"}
-
-    def skip_spec(self, task_id: str, spec_id: str) -> Dict:
-        """
-        Skip (override) a boundary specification.
-        """
-        task = self._get_task(task_id)
-        specs = task.metadata.get("boundary_specs", [])
-
-        found_spec = None
-        for spec in specs:
-            if spec["id"] == spec_id:
-                spec["status"] = "SKIPPED"
-                found_spec = spec
-                break
-
-        if not found_spec:
-            raise ValueError(f"Boundary spec not found: {spec_id}")
-
-        task.metadata["boundary_specs"] = specs
-        self._update_pending_specs(task)
-        task.touch()
-        self.store.upsert_task(task)
-
-        self.logger.record(
-            task.id,
-            "SPEC_SKIPPED",
-            {"spec_id": spec_id, "boundary_name": found_spec.get("boundary_name")}
-        )
-
-        return {"spec_id": spec_id, "status": "SKIPPED"}
-
-    def approve_all_specs(self, task_id: str) -> Dict[str, Any]:
-        """
-        Approve all remaining pending boundary specs for a task.
-        """
-        specs = self.get_boundary_specs(task_id)
-        pending_ids = [
-            s.get("id")
-            for s in (specs or [])
-            if (s.get("status") or "") == BoundarySpecStatus.PENDING.value and s.get("id")
-        ]
-        for spec_id in pending_ids:
-            self.approve_spec(task_id, str(spec_id))
-        return {"approved_count": len(pending_ids), "approved_spec_ids": pending_ids}
-
-    def skip_all_specs(self, task_id: str) -> Dict[str, Any]:
-        """
-        Skip all remaining pending boundary specs for a task.
-        """
-        specs = self.get_boundary_specs(task_id)
-        pending_ids = [
-            s.get("id")
-            for s in (specs or [])
-            if (s.get("status") or "") == BoundarySpecStatus.PENDING.value and s.get("id")
-        ]
-        for spec_id in pending_ids:
-            self.skip_spec(task_id, str(spec_id))
-        return {"skipped_count": len(pending_ids), "skipped_spec_ids": pending_ids}
-
-    def update_spec_fields(
-        self,
-        task_id: str,
-        spec_id: str,
-        *,
-        description: Optional[str] = None,
-        diagram_text: Optional[str] = None,
-        machine_spec: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        task = self._get_task(task_id)
-        specs = task.metadata.get("boundary_specs", [])
-        target = None
-        for spec in specs:
-            if spec["id"] == spec_id:
-                target = spec
-                break
-
-        if not target:
-            raise ValueError(f"Boundary spec not found: {spec_id}")
-
-        if description is not None:
-            target["human_description"] = description
-        if diagram_text is not None:
-            target["diagram_text"] = diagram_text
-        if machine_spec is not None:
-            target["machine_spec"] = machine_spec
-
-        # Editing a spec re-opens approval
-        target["status"] = BoundarySpecStatus.PENDING.value
-        task.metadata["boundary_specs"] = specs
-        self._update_pending_specs(task)
-        task.touch()
-        self.store.upsert_task(task)
-        self.logger.record(
-            task.id,
-            "SPEC_UPDATED",
-            {"spec_id": spec_id, "description_changed": description is not None},
-        )
-        return target
-
-    def regenerate_spec(self, task_id: str, spec_id: str) -> Dict[str, Any]:
-        """
-        Regenerate a boundary spec from its associated plan step using the BoundaryManager.
-        """
-        task = self._get_task(task_id)
-        specs = task.metadata.get("boundary_specs", [])
-        target = None
-        for spec in specs:
-            if spec["id"] == spec_id:
-                target = spec
-                break
-
-        if not target:
-            raise ValueError(f"Boundary spec not found: {spec_id}")
-
-        plan_step_description = target.get("plan_step")
-        if not plan_step_description:
-            raise ValueError("This boundary spec is not linked to a plan step and cannot be regenerated automatically.")
-
-        plan_preview = task.metadata.get("plan_preview", {})
-        plan_steps = [
-            PlanStep.from_dict(step) if isinstance(step, dict) else PlanStep(description=str(step))
-            for step in plan_preview.get("steps", [])
-        ]
-        plan_step = next((step for step in plan_steps if step.description == plan_step_description), None)
-        if not plan_step:
-            raise ValueError("Unable to locate the original plan step for this boundary spec.")
-
-        boundary_manager = BoundaryManager(
-            llm_client=self.llm_client,
-            context_summary=task.metadata.get("repository_summary"),
-        )
-        new_spec = boundary_manager.generate_spec_for_step(task.id, plan_step)
-
-        target.update(
-            {
-                "boundary_name": new_spec.boundary_name,
-                "human_description": new_spec.human_description,
-                "diagram_text": new_spec.diagram_text,
-                "machine_spec": new_spec.machine_spec,
-                "status": BoundarySpecStatus.PENDING.value,
-                "plan_step": plan_step.description,
-            }
-        )
-        task.metadata["boundary_specs"] = specs
-        self._update_pending_specs(task)
-        task.touch()
-        self.store.upsert_task(task)
-        self.logger.record(task.id, "SPEC_REGENERATED", {"spec_id": spec_id})
-        return target
-
+    # ------------------------------------------------------------------ Plan Approval
     def approve_plan(self, task_id: str) -> Dict:
         """
         Approve the entire implementation plan.
-
-        This approves the plan at a high level rather than requiring
-        approval of individual boundary specifications.
         """
         task = self._get_task(task_id)
-
-        unresolved = [
-            spec for spec in task.metadata.get("boundary_specs", [])
-            if spec.get("status") == BoundarySpecStatus.PENDING.value
-        ]
-        if unresolved:
-            raise ValueError("All boundary specs must be approved or skipped before approving the plan.")
 
         # Mark plan as approved
         task.metadata["plan_approved"] = True
@@ -1974,10 +1705,9 @@ class TaskOrchestrator:
         if not task.metadata.get("plan_approved", False):
             raise ValueError("Plan must be approved before generating patches")
 
-        # Retrieve plan and boundary specs from metadata
+        # Retrieve plan from metadata
         context_summary = task.metadata.get("repository_summary", {})
         plan_preview = task.metadata.get("plan_preview", {})
-        boundary_specs_data = task.metadata.get("boundary_specs", [])
 
         # Reconstruct plan object from stored data
         from ..domain.models import Plan, PlanStep
@@ -1992,28 +1722,11 @@ class TaskOrchestrator:
             refactor_suggestions=plan_preview.get("refactors", [])
         )
 
-        # Reconstruct boundary specs from stored data
-        from ..domain.models import BoundarySpecStatus
-        specs = [
-            BoundarySpec(
-                id=spec_data["id"],
-                task_id=spec_data.get("task_id", task_id),
-                boundary_name=spec_data["boundary_name"],
-                human_description=spec_data["human_description"],
-                diagram_text=spec_data["diagram_text"],
-                machine_spec=spec_data["machine_spec"],
-                status=BoundarySpecStatus(spec_data["status"]),
-                plan_step=spec_data.get("plan_step"),
-            )
-            for spec_data in boundary_specs_data
-        ]
-
         sys.stderr.write("Generating patches...\n")
         try:
             patches = self.patch_engine.draft_patches(
                 plan,
                 repo_path=task.repo_path,
-                boundary_specs=specs,
                 skip_rationale_enhancement=skip_rationale_enhancement,
             )
             sys.stderr.write(f"Generated {len(patches)} patches\n")
@@ -2033,7 +1746,6 @@ class TaskOrchestrator:
             tests = self.test_suggester.suggest(
                 plan=plan,
                 patches=patches,
-                boundary_specs=specs,
                 repo_context=context_summary,
                 repo_path=task.repo_path,
             )
@@ -2842,14 +2554,6 @@ class TaskOrchestrator:
     def acknowledge_manual_edits(self, task_id: str) -> None:
         task = self._get_task(task_id)
         self._snapshot_worktree_status(task)
-
-    def _update_pending_specs(self, task: Task) -> None:
-        specs = task.metadata.get("boundary_specs", [])
-        task.metadata["pending_specs"] = [
-            spec.get("boundary_name")
-            for spec in specs
-            if spec.get("status") == BoundarySpecStatus.PENDING.value
-        ]
 
     def _detect_manual_edits(self, task: Task) -> bool:
         current = self._get_git_status(task.repo_path)
