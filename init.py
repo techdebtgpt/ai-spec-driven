@@ -8,7 +8,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 
 def _upsert_env_entries(entries: Dict[str, str]) -> Optional[Path]:
@@ -81,7 +81,9 @@ def ensure_serena_env(venv_path: Path, project_root: Path) -> None:
 
     env_path = _upsert_env_entries(env_entries)
     if env_path:
-        print(f"Configured Serena integration at {env_path}")
+        # Keep setup output clean; only mention in verbose mode.
+        if os.getenv("SPEC_AGENT_SETUP_VERBOSE") == "1":
+            print(f"Configured Serena integration at {env_path}")
 
 
 def ensure_openai_env_from_envvars() -> None:
@@ -98,35 +100,73 @@ def ensure_openai_env_from_envvars() -> None:
     }
     env_path = _upsert_env_entries(entries)
     if env_path:
-        print(f"Captured OpenAI defaults from environment at {env_path}")
+        if os.getenv("SPEC_AGENT_SETUP_VERBOSE") == "1":
+            print(f"Captured OpenAI defaults from environment at {env_path}")
 
 
 def main():
+    verbose = "--verbose" in sys.argv or "-v" in sys.argv
+    quiet = not verbose
+    if verbose:
+        os.environ["SPEC_AGENT_SETUP_VERBOSE"] = "1"
+
+    def _print_step(msg: str) -> None:
+        print(msg)
+
+    def _print_ok(msg: str) -> None:
+        print(f"✓ {msg}")
+
+    def _run(cmd: Sequence[str], *, cwd: Path | None = None, label: str | None = None) -> None:
+        """
+        Run a command. In quiet mode, suppress stdout/stderr unless it fails.
+        """
+        if label:
+            _print_step(label)
+        try:
+            if quiet:
+                subprocess.run(
+                    list(cmd),
+                    check=True,
+                    cwd=str(cwd) if cwd else None,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                subprocess.run(list(cmd), check=True, cwd=str(cwd) if cwd else None)
+        except subprocess.CalledProcessError as exc:
+            # Re-run in verbose mode to surface the real error output.
+            if quiet:
+                print("✗ Failed. Re-running with full output for troubleshooting:\n")
+                subprocess.run(list(cmd), check=False, cwd=str(cwd) if cwd else None)
+            raise exc
+
     # Get the project root directory
     project_root = Path(__file__).parent.resolve()
     venv_path = project_root / ".venv"
     
-    print("Initializing Spec-Driven Development Agent...")
+    _print_step("Initializing Spec Agent...")
+    if quiet:
+        _print_step("(Tip: re-run with --verbose to see full install logs)")
     print()
     
     # Check Python version
-    print("Checking Python version...")
+    _print_step("Checking Python version...")
     if sys.version_info < (3, 11):
         print(f"Error: Python 3.11+ is required. Found Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
         sys.exit(1)
     
     python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    print(f"Found Python {python_version}")
+    _print_ok(f"Found Python {python_version}")
     print()
     
     # Create virtual environment if it doesn't exist
     if venv_path.exists():
-        print("Virtual environment already exists, skipping creation...")
+        _print_ok("Virtual environment already exists")
     else:
-        print("Creating virtual environment...")
+        _print_step("Creating virtual environment...")
         try:
-            subprocess.run([sys.executable, "-m", "venv", str(venv_path)], check=True)
-            print("Virtual environment created")
+            _run([sys.executable, "-m", "venv", str(venv_path)], label=None)
+            _print_ok("Virtual environment created")
         except subprocess.CalledProcessError as e:
             print(f"Error creating virtual environment: {e}")
             sys.exit(1)
@@ -141,72 +181,67 @@ def main():
         activate_cmd = "source .venv/bin/activate"
     
     # Upgrade pip
-    print("Upgrading pip...")
+    _print_step("Upgrading pip...")
     try:
-        subprocess.run([str(pip_path), "install", "--upgrade", "pip", "--quiet"], check=True)
-        print("pip upgraded")
+        args = [str(pip_path), "install", "--upgrade", "pip"]
+        if quiet:
+            args.append("--quiet")
+        _run(args, cwd=project_root, label=None)
+        _print_ok("pip upgraded")
     except subprocess.CalledProcessError as e:
         print(f"Warning: Could not upgrade pip: {e}")
     print()
     
     # Install the package with dev and serena dependencies
-    print("Installing spec-agent with dev and serena dependencies...")
+    _print_step("Installing dependencies (dev + serena)...")
     try:
-        subprocess.run([str(pip_path), "install", "-e", f"{project_root}[dev,serena]"], check=True, cwd=project_root)
-        print("Installation complete")
+        install_cmd = [str(pip_path), "install", "-e", f"{project_root}[dev,serena]"]
+        if quiet:
+            install_cmd.append("--quiet")
+        _run(install_cmd, cwd=project_root, label=None)
+        _print_ok("Installation complete")
     except subprocess.CalledProcessError as e:
         print(f"Error installing package: {e}")
         sys.exit(1)
     print()
     
     # Verify MCP library is installed (should be via serena dependencies, but double-check)
-    print("Verifying Serena dependencies...")
+    _print_step("Verifying Serena dependencies...")
     try:
-        subprocess.run(
-            [str(pip_path), "show", "mcp"],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=project_root,
-        )
-        print("✓ MCP library verified (required for Serena integration)")
+        _run([str(pip_path), "show", "mcp"], cwd=project_root, label=None)
+        _print_ok("MCP library verified (required for Serena integration)")
     except subprocess.CalledProcessError:
         # MCP not found, try to install it
-        print("MCP library not found, installing...")
+        _print_step("MCP library not found, installing...")
         try:
-            subprocess.run([str(pip_path), "install", "mcp>=1.12.3"], check=True, cwd=project_root)
-            print("✓ MCP library installed")
+            cmd = [str(pip_path), "install", "mcp>=1.12.3"]
+            if quiet:
+                cmd.append("--quiet")
+            _run(cmd, cwd=project_root, label=None)
+            _print_ok("MCP library installed")
         except subprocess.CalledProcessError as e:
             print(f"Warning: Could not install MCP library: {e}")
             print("Serena integration will not be available without MCP")
     print()
     
     # Verify installation
-    print("Verifying installation...")
+    _print_step("Verifying installation...")
     spec_agent_path = venv_path / ("Scripts" if sys.platform == "win32" else "bin") / "spec-agent"
     
     if spec_agent_path.exists():
-        print("spec-agent command is available")
+        _print_ok("spec-agent command is available")
         ensure_serena_env(venv_path, project_root)
         ensure_openai_env_from_envvars()
         print()
-        print("Setup complete! You can now use spec-agent.")
+        _print_ok("Setup complete! You can now use spec-agent.")
         print()
-        print("Serena Integration:")
-        print("  ✓ MCP library installed (required for Serena)")
-        print("  ✓ Serena environment configured")
-        print("  Note: To use Serena, you also need 'uv' installed:")
-        print("    curl -LsSf https://astral.sh/uv/install.sh | sh")
-        print("    Or: brew install uv")
+        print("Next:")
+        print(f"- Activate venv: {activate_cmd}")
+        print("- Help: spec-agent --help")
+        print("- Example: spec-agent start --description \"Your task description\"")
         print()
-        print("To activate the virtual environment in your current shell, run:")
-        print(f"  {activate_cmd}")
-        print()
-        print("To see available commands, run:")
-        print("  spec-agent --help")
-        print()
-        print("Example usage:")
-        print('  spec-agent start /path/to/repo --branch main --description "Your task description"')
+        print("Optional:")
+        print("- Serena requires `uv` installed (e.g. `brew install uv`)")
     else:
         print("Warning: spec-agent command not found. You may need to activate the venv:")
         print(f"  {activate_cmd}")
