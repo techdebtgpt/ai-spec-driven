@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+import sys
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Iterable, Optional
@@ -266,7 +268,7 @@ def _build_details_panel(task: Task | None, *, last_log: TaskLogSummary | None) 
     details = [
         ("Client", task.client or "—"),
         ("Title", title),
-        ("Task", task.id),
+        ("Reference", task.id[:8]),
         ("Repo", str(task.repo_path)),
         ("Branch", task.branch),
         ("Status", task.status.value),
@@ -337,10 +339,30 @@ def run_task_dashboard(
     """
     Live dashboard for tasks.
 
-    Exit with Ctrl+C.
+    Exit with Ctrl+C (or type 'q' + Enter).
     """
 
     refresh_seconds = max(0.2, float(refresh_seconds or 1.0))
+
+    stop_event = threading.Event()
+
+    def _listen_for_quit() -> None:
+        """
+        Best-effort quit handling for environments where Ctrl+C isn't convenient.
+        Uses line-based input: type 'q' then Enter.
+        """
+        try:
+            while not stop_event.is_set():
+                line = sys.stdin.readline()
+                if not line:
+                    return
+                if line.strip().lower() in {"q", "quit", "exit"}:
+                    stop_event.set()
+                    return
+        except Exception:
+            return
+
+    threading.Thread(target=_listen_for_quit, daemon=True).start()
 
     def _select(tasks: list[Task]) -> Task | None:
         if not tasks:
@@ -354,6 +376,8 @@ def run_task_dashboard(
 
     with Live(console=console, auto_refresh=False, screen=True) as live:
         while True:
+            if stop_event.is_set():
+                break
             try:
                 tasks = orchestrator.list_tasks(status=status)
                 if not show_all:

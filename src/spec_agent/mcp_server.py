@@ -122,7 +122,7 @@ def get_repository_summary() -> dict:
 
 
 @mcp.tool()
-def create_task(description: str, title: Optional[str] = None) -> dict:
+def create_task(description: str, title: Optional[str] = None, client: Optional[str] = None) -> dict:
     """
     Create a new development task from the indexed repository.
 
@@ -132,6 +132,7 @@ def create_task(description: str, title: Optional[str] = None) -> dict:
     Args:
         description: Detailed description of what changes you want to make
         title: Optional short title for the task
+        client: Optional editor/chat client driving this task (e.g. cursor, claude, terminal)
 
     Returns:
         Task ID and any clarifying questions that need answers
@@ -140,7 +141,7 @@ def create_task(description: str, title: Optional[str] = None) -> dict:
     task = orchestrator.create_task_from_index(
         description=description,
         title=title,
-        client="mcp",
+        client=client or "mcp",
     )
 
     clarifications = task.metadata.get("clarifications", [])

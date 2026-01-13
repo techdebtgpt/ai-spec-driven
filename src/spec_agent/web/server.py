@@ -5,6 +5,7 @@ import threading
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -48,6 +49,346 @@ def _task_summary(task: Task) -> str:
     desc = (task.description or "").strip()
     return desc.splitlines()[0].strip() if desc else ""
 
+
+def _render_plan_markdown(task: Task) -> str:
+    """
+    Render a demo-friendly markdown view of the approved plan using task metadata.
+
+    We do this in the web dashboard because exported plan files can live outside the
+    dashboard process' accessible filesystem.
+    """
+    meta = task.metadata if isinstance(task.metadata, dict) else {}
+    plan_preview = meta.get("plan_preview") or {}
+    if not isinstance(plan_preview, dict):
+        plan_preview = {}
+
+    steps = plan_preview.get("steps") or []
+    risks = plan_preview.get("risks") or []
+    refactors = plan_preview.get("refactors") or []
+
+    title = (task.title or "").strip() or (task.description or "").strip().splitlines()[0].strip() if (task.description or "").strip() else "Plan"
+    if len(title) > 120:
+        title = title[:117].rstrip() + "..."
+
+    lines: list[str] = []
+    lines.append(f"# {title}")
+    lines.append("")
+    lines.append(f"- **Repo**: `{task.repo_path}`")
+    lines.append(f"- **Branch**: `{task.branch}`")
+    lines.append("")
+
+    desc = (task.description or "").strip()
+    lines.append("## Change request")
+    lines.append("")
+    lines.append(desc or "_(missing description)_")
+    lines.append("")
+
+    # Acceptance criteria (derived for demo friendliness)
+    ac = _derive_acceptance_criteria(task, meta.get("clarifications") or [], steps if isinstance(steps, list) else [])
+    if ac:
+        lines.append("## Acceptance criteria")
+        lines.append("")
+        lines.extend([f"- {c}" for c in ac[:20]])
+        lines.append("")
+
+    # Impacted files (sample) if bounded context exists
+    bounded_ctx = meta.get("bounded_context") or {}
+    if isinstance(bounded_ctx, dict):
+        scoped = bounded_ctx.get("manual") or bounded_ctx.get("plan_targets") or {}
+        if isinstance(scoped, dict):
+            impact = scoped.get("impact") or {}
+            if isinstance(impact, dict):
+                files_sample = impact.get("files_sample") or []
+                if isinstance(files_sample, list) and files_sample:
+                    lines.append("## Impacted files (sample)")
+                    lines.append("")
+                    lines.extend([f"- `{p}`" for p in files_sample[:50]])
+                    lines.append("")
+
+    lines.append("## Plan steps")
+    lines.append("")
+    if isinstance(steps, list) and steps:
+        for idx, step in enumerate(steps, start=1):
+            if isinstance(step, dict):
+                d = (step.get("description") or "").strip() or "(missing step description)"
+                lines.append(f"{idx}. {d}")
+                targets = step.get("target_files") or []
+                if targets:
+                    lines.append(f"   - Targets: {', '.join(f'`{t}`' for t in targets)}")
+                notes = (step.get("notes") or "").strip()
+                if notes:
+                    lines.append(f"   - Notes: {notes}")
+            else:
+                lines.append(f"{idx}. {str(step)}")
+    else:
+        lines.append("_No plan steps generated._")
+    lines.append("")
+
+    # Scenarios (Given / When / Then) – helpful for future tests.
+    has_tests = bool((meta.get("repository_summary") or {}).get("has_tests", False)) if isinstance(meta.get("repository_summary"), dict) else False
+
+    def _infer_step_scenario(description: str, notes: str | None = None) -> list[str]:
+        desc2 = (description or "").strip()
+        if not desc2:
+            return []
+        desc_l = desc2.lower()
+        given = "Given the codebase is indexed and the current behavior is understood"
+        if desc_l.startswith("implement"):
+            when = f"When we {desc_l}"
+            then = "Then the new component exists and is ready to be integrated"
+        elif desc_l.startswith("update") or desc_l.startswith("refactor"):
+            when = f"When we {desc_l}"
+            then = "Then the existing flow uses the updated configuration path"
+        elif "test" in desc_l and has_tests:
+            when = f"When we {desc_l}"
+            then = "Then automated tests validate both happy-path and failure cases"
+        elif desc_l.startswith("document"):
+            when = f"When we {desc_l}"
+            then = "Then the team can maintain the setup confidently without tribal knowledge"
+        else:
+            when = f"When we {desc_l}"
+            then = "Then the change is implemented with clear acceptance criteria"
+        out = [f"Given: {given}", f"When:  {when}", f"Then:  {then}"]
+        n = (notes or "").strip()
+        if n:
+            out.append(f"And:   {n}")
+        return out
+
+    scenario_lines: list[str] = []
+    if isinstance(steps, list):
+        for idx, step in enumerate(steps, start=1):
+            if isinstance(step, dict):
+                d = (step.get("description") or "").strip()
+                notes = step.get("notes")
+            else:
+                d = str(step).strip()
+                notes = None
+            if not d:
+                continue
+            sc = _infer_step_scenario(d, notes if isinstance(notes, str) else None)
+            if not sc:
+                continue
+            if scenario_lines:
+                scenario_lines.append("")
+            scenario_lines.append(f"### Step {idx}: {d}")
+            scenario_lines.extend([f"- {line}" for line in sc])
+
+    if scenario_lines:
+        lines.append("## Scenarios (Given / When / Then)")
+        lines.append("")
+        lines.extend(scenario_lines)
+        lines.append("")
+
+    # Test plan (simple, demo-friendly)
+    if has_tests:
+        lines.append("## Test plan")
+        lines.append("")
+        lines.append("- Run the existing automated test suite.")
+        lines.append("- Add or update tests to cover the new/changed behavior.")
+        lines.append("- Validate at least one happy-path and one failure-path scenario.")
+        lines.append("")
+    else:
+        lines.append("## Test plan")
+        lines.append("")
+        lines.append("- Run basic smoke checks for the changed flow.")
+        lines.append("- If the repo has a preferred test framework, add a minimal regression test for the key behavior.")
+        lines.append("")
+
+    if isinstance(risks, list) and risks:
+        lines.append("## Risks")
+        lines.append("")
+        lines.extend([f"- {str(r).strip()}" for r in risks if str(r).strip()] or ["_None_"])
+        lines.append("")
+
+    if isinstance(refactors, list) and refactors:
+        lines.append("## Refactor suggestions")
+        lines.append("")
+        lines.extend([f"- {str(r).strip()}" for r in refactors if str(r).strip()] or ["_None_"])
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _derive_acceptance_criteria(task: Task, clarifications: list[dict], plan_steps: list[object]) -> list[str]:
+    """
+    Derive human-friendly acceptance criteria.
+
+    Priority:
+    1) Explicit `task.metadata["acceptance_criteria"]` (if provided)
+    2) Plan steps (Then/outcome lines inferred from the plan)
+    3) High-signal clarified constraints (avoid low-signal answers like "I don't know")
+    """
+    meta = task.metadata if isinstance(task.metadata, dict) else {}
+
+    # 1) Explicit
+    meta_ac = meta.get("acceptance_criteria")
+    if isinstance(meta_ac, list):
+        explicit = [str(x).strip() for x in meta_ac if str(x).strip()]
+        if explicit:
+            return explicit[:20]
+
+    has_tests = bool((meta.get("repository_summary") or {}).get("has_tests", False)) if isinstance(meta.get("repository_summary"), dict) else False
+
+    def _infer_step_scenario(description: str, notes: str | None = None) -> list[str]:
+        desc = (description or "").strip()
+        if not desc:
+            return []
+        desc_l = desc.lower()
+        notes_clean = (notes or "").strip()
+        given = "Given the codebase is indexed and the current behavior is understood"
+        if desc_l.startswith("implement"):
+            when = f"When we {desc_l}"
+            then = "Then the new component exists and is ready to be integrated"
+        elif desc_l.startswith("update") or desc_l.startswith("refactor"):
+            when = f"When we {desc_l}"
+            then = "Then the existing flow uses the updated configuration path"
+        elif "test" in desc_l and has_tests:
+            when = f"When we {desc_l}"
+            then = "Then automated tests validate both happy-path and failure cases"
+        elif desc_l.startswith("document"):
+            when = f"When we {desc_l}"
+            then = "Then the team can maintain the setup confidently without tribal knowledge"
+        else:
+            when = f"When we {desc_l}"
+            then = "Then the change is implemented with clear acceptance criteria"
+        out = [f"Given: {given}", f"When:  {when}", f"Then:  {then}"]
+        if notes_clean:
+            out.append(f"And:   {notes_clean}")
+        return out
+
+    # 2) From plan steps (best default; derived from description)
+    derived: list[str] = []
+    if isinstance(plan_steps, list) and plan_steps:
+        for step in plan_steps[:8]:
+            if isinstance(step, dict):
+                desc = (step.get("description") or "").strip()
+                notes = step.get("notes")
+                notes_s = str(notes).strip() if isinstance(notes, str) else None
+            else:
+                desc = str(step).strip()
+                notes_s = None
+            if not desc:
+                continue
+            scenario = _infer_step_scenario(desc, notes_s)
+            then_lines = [l for l in scenario if l.startswith("Then:")]
+            if then_lines:
+                # "Then:  X" -> "X"
+                then_text = then_lines[0].split("Then:", 1)[1].strip()
+                if then_text:
+                    derived.append(then_text)
+            else:
+                # fallback to the step description
+                derived.append(desc)
+        # De-dupe while preserving order
+        seen = set()
+        deduped = []
+        for item in derived:
+            key = item.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item.strip())
+        if deduped:
+            return deduped[:10]
+
+    # 3) High-signal clarification constraints only (fallback)
+    low_signal = {
+        "all",
+        "you tell me",
+        "idk",
+        "i don't know",
+        "i dont know",
+        "dont know",
+        "no",
+        "no i think",
+        "not sure",
+        "maybe",
+        "i think",
+        "i am knew so i need to know",
+        "i need to know",
+    }
+    constraints: list[str] = []
+    for it in clarifications:
+        if not isinstance(it, dict):
+            continue
+        if str(it.get("status") or "").strip().upper() != "ANSWERED":
+            continue
+        answer = str(it.get("answer") or "").strip()
+        if not answer:
+            continue
+        a_l = answer.lower().strip()
+        if a_l in low_signal:
+            continue
+        # Heuristic: include only answers that look like a requirement/constraint.
+        looks_like_constraint = any(tok in a_l for tok in ("must", "should", "at least", "no ", "only ", "min", "maximum", "max ")) or any(ch.isdigit() for ch in a_l)
+        if not looks_like_constraint:
+            continue
+        constraints.append(answer if len(answer) <= 140 else answer[:140].rstrip() + "…")
+
+    # De-dupe
+    seen = set()
+    out: list[str] = []
+    for c in constraints:
+        k = c.lower().strip()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(c)
+    return out[:10]
+
+
+def _derive_scenarios(task: Task, plan_steps: list[object]) -> list[dict]:
+    """
+    Derive Given/When/Then scenarios from plan steps for UI display.
+    """
+    meta = task.metadata if isinstance(task.metadata, dict) else {}
+    has_tests = bool((meta.get("repository_summary") or {}).get("has_tests", False)) if isinstance(meta.get("repository_summary"), dict) else False
+
+    def _infer_step_scenario(description: str, notes: str | None = None) -> list[str]:
+        desc = (description or "").strip()
+        if not desc:
+            return []
+        desc_l = desc.lower()
+        notes_clean = (notes or "").strip()
+        given = "Given the codebase is indexed and the current behavior is understood"
+        if desc_l.startswith("implement"):
+            when = f"When we {desc_l}"
+            then = "Then the new component exists and is ready to be integrated"
+        elif desc_l.startswith("update") or desc_l.startswith("refactor"):
+            when = f"When we {desc_l}"
+            then = "Then the existing flow uses the updated configuration path"
+        elif "test" in desc_l and has_tests:
+            when = f"When we {desc_l}"
+            then = "Then automated tests validate both happy-path and failure cases"
+        elif desc_l.startswith("document"):
+            when = f"When we {desc_l}"
+            then = "Then the team can maintain the setup confidently without tribal knowledge"
+        else:
+            when = f"When we {desc_l}"
+            then = "Then the change is implemented with clear acceptance criteria"
+        out = [f"Given: {given}", f"When:  {when}", f"Then:  {then}"]
+        if notes_clean:
+            out.append(f"And:   {notes_clean}")
+        return out
+
+    scenarios: list[dict] = []
+    if not isinstance(plan_steps, list):
+        return scenarios
+    for idx, step in enumerate(plan_steps[:10], start=1):
+        if isinstance(step, dict):
+            desc = (step.get("description") or "").strip()
+            notes = step.get("notes")
+            notes_s = str(notes).strip() if isinstance(notes, str) else None
+        else:
+            desc = str(step).strip()
+            notes_s = None
+        if not desc:
+            continue
+        lines = _infer_step_scenario(desc, notes_s)
+        if not lines:
+            continue
+        scenarios.append({"index": idx, "title": desc, "lines": lines})
+    return scenarios
 
 def _latest_logs(logs: Iterable[LogEntry], *, limit: int) -> list[LogEntry]:
     items: list[LogEntry] = []
@@ -284,6 +625,7 @@ _INDEX_HTML = """<!doctype html>
           <button class="pill" data-range="5m">5m</button>
           <button class="pill" data-range="1h">1h</button>
           <button class="pill active" data-range="today">Today</button>
+          <button class="pill" data-range="all">All time</button>
         </div>
       </div>
       <div id="taskList" class="taskList"></div>
@@ -313,6 +655,72 @@ _INDEX_HTML = """<!doctype html>
 """
 
 
+def _plan_html(task_id: str) -> str:
+    """
+    Full-page plan view for demos: renders the plan markdown in a dedicated page.
+    """
+    safe_task_id = (task_id or "").replace('"', "").replace("'", "").strip()
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Plan</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body class="planBody">
+  <div class="topbar">
+    <div class="brand">
+      <div class="logo">R</div>
+      <div class="name">RiSpec</div>
+    </div>
+    <div class="status">
+      <a class="backLink" href="/">← Back to dashboard</a>
+    </div>
+  </div>
+
+  <main class="planWrap">
+    <div class="planHeader">
+      <div class="planTitle" id="planTitle">Plan</div>
+      <div class="planSubtitle" id="planSubtitle">Loading…</div>
+      <div class="planActions">
+        <a class="pillLink" id="downloadLink" target="_blank" rel="noreferrer">Open / download markdown</a>
+      </div>
+    </div>
+    <pre class="diff planContent" id="planContent">Loading…</pre>
+  </main>
+
+  <script>
+    const TASK_ID = "{safe_task_id}";
+    const download = document.getElementById('downloadLink');
+    download.href = `/api/plan-markdown/${{encodeURIComponent(TASK_ID)}}`;
+
+    fetch(`/api/task/${{encodeURIComponent(TASK_ID)}}`, {{ cache: 'no-store' }})
+      .then(r => r.ok ? r.json() : Promise.reject(new Error('task not found')))
+      .then(data => {{
+        const t = data.task || {{}};
+        const clientLabel = (t.client && String(t.client).trim()) ? t.client : 'CLI';
+        document.getElementById('planTitle').textContent = t.title ? t.title : 'Plan';
+        document.getElementById('planSubtitle').textContent = `${{clientLabel}} · ${{t.repo_path || '—'}} · ${{t.branch || '—'}}`;
+      }})
+      .catch(() => {{
+        document.getElementById('planSubtitle').textContent = 'Task not found';
+      }});
+
+    fetch(`/api/plan-markdown/${{encodeURIComponent(TASK_ID)}}`, {{ cache: 'no-store' }})
+      .then(r => r.ok ? r.text() : Promise.reject(new Error('plan not found')))
+      .then(txt => {{
+        document.getElementById('planContent').textContent = txt || '—';
+      }})
+      .catch(() => {{
+        document.getElementById('planContent').textContent = 'Plan markdown not available.';
+      }});
+  </script>
+</body>
+</html>
+"""
+
+
 _STYLES_CSS = """
 :root{
   --bg:#070a12;
@@ -336,6 +744,46 @@ body{
               var(--bg);
   color:var(--text);
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+}
+.planBody{
+  overflow:auto;
+}
+.backLink{
+  color: var(--muted);
+  text-decoration:none;
+  font-size:13px;
+}
+.backLink:hover{color:#e2e8f0}
+.planWrap{
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 16px;
+}
+.planHeader{
+  border:1px solid var(--border);
+  background:rgba(10,16,32,.55);
+  border-radius:12px;
+  padding:14px;
+  margin-top: 14px;
+}
+.planTitle{font-size:16px; font-weight:800; color:#f1f5f9}
+.planSubtitle{margin-top:6px; font-size:12px; color:var(--muted)}
+.planActions{margin-top:10px}
+.pillLink{
+  display:inline-block;
+  font-size:12px;
+  padding:6px 10px;
+  border-radius:999px;
+  border:1px solid var(--border);
+  background:rgba(148,163,184,.08);
+  color:#e2e8f0;
+  text-decoration:none;
+}
+.pillLink:hover{border-color:rgba(59,130,246,.35)}
+.planContent{
+  margin-top: 14px;
+  max-height: none;
+  width: 100%;
 }
 .topbar{
   height:56px;
@@ -494,6 +942,47 @@ body{
   text-transform:uppercase;
   color:var(--muted);
 }
+.taskHero{
+  border:1px solid var(--border);
+  background:rgba(10,16,32,.55);
+  border-radius:12px;
+  padding:14px;
+}
+.taskHeroTop{display:flex; align-items:flex-start; justify-content:space-between; gap:12px}
+.taskHeroTitle{font-weight:800; font-size:16px; color:#f1f5f9}
+.taskHeroDesc{margin-top:8px; color:var(--muted); font-size:13px; line-height:1.5}
+.prio{
+  font-size:11px;
+  font-weight:800;
+  color:#fecaca;
+  background:rgba(239,68,68,.12);
+  border:1px solid rgba(239,68,68,.28);
+  border-radius:999px;
+  padding:3px 10px;
+  flex:0 0 auto;
+}
+.acItem{
+  border:1px solid var(--border);
+  background:rgba(10,16,32,.35);
+  border-radius:10px;
+  padding:10px 12px;
+  margin-top:10px;
+  display:flex;
+  gap:10px;
+  align-items:flex-start;
+  font-size:13px;
+}
+.acN{
+  width:22px;height:22px;border-radius:999px;
+  background:rgba(59,130,246,.18);
+  border:1px solid rgba(59,130,246,.30);
+  display:grid; place-items:center;
+  color:#dbeafe;
+  font-weight:800;
+  flex:0 0 auto;
+  font-size:12px;
+}
+.acText{flex:1 1 auto; color:#e2e8f0}
 .qcard{
   border:1px solid var(--border);
   background:rgba(10,16,32,.55);
@@ -501,10 +990,23 @@ body{
   padding:12px;
   margin-top:10px;
 }
-.qhead{font-size:13px; font-weight:650}
+.qhead{font-size:13px; font-weight:650; display:flex; gap:10px; align-items:flex-start}
+.qbadge{
+  font-size:11px;
+  font-weight:800;
+  color:#e2e8f0;
+  background:rgba(124,58,237,.18);
+  border:1px solid rgba(124,58,237,.35);
+  border-radius:999px;
+  padding:2px 8px;
+  flex:0 0 auto;
+  margin-top:1px;
+}
+.qtext{flex:1 1 auto; line-height:1.35}
 .qans{margin-top:10px; font-size:13px}
 .qans.ok{color:#bbf7d0}
 .qans.muted{color:var(--muted)}
+.qans .qicon{margin-right:8px}
 .tree{
   border:1px solid var(--border);
   background:rgba(10,16,32,.45);
@@ -591,6 +1093,7 @@ let state = {
   selectedTaskId: null,
   selectedStepKey: null,
   selectedPatchId: null,
+  selectedTaskData: null,
   filter: 'all',
   range: 'today',
   lastNow: null,
@@ -602,6 +1105,7 @@ function parseRangeToMinutes(range) {
   if (range === '5m') return 5;
   if (range === '1h') return 60;
   if (range === 'today') return 24 * 60;
+  if (range === 'all') return 0; // special: all time
   return 60;
 }
 
@@ -653,6 +1157,7 @@ function renderTasks() {
     })
     .filter(t => {
       // range filter: based on updated_at
+      if (!maxMin || maxMin <= 0) return true;
       const m = minutesAgo(t.updated_at, nowIso);
       return m <= maxMin;
     })
@@ -687,7 +1192,8 @@ function renderTasks() {
     dot.className = 'dot2 ' + statusDot(t);
     const title = document.createElement('div');
     title.className = 'taskTitle';
-    title.textContent = `${t.client ? t.client : '—'} · ${t.title}`;
+    const clientLabel = (t.client && String(t.client).trim()) ? t.client : 'CLI';
+    title.textContent = `${clientLabel} · ${t.title}`;
     left.appendChild(dot);
     left.appendChild(title);
 
@@ -715,7 +1221,12 @@ function renderTasks() {
 }
 
 function renderWorkflow(task, workflow) {
-  $('workflowSubtitle').textContent = task ? `${task.client || '—'} · ${task.title}` : 'Select a task';
+  if (task) {
+    const clientLabel = (task.client && String(task.client).trim()) ? task.client : 'CLI';
+    $('workflowSubtitle').textContent = `${clientLabel} · ${task.title}`;
+  } else {
+    $('workflowSubtitle').textContent = 'Select a task';
+  }
   const stepsEl = $('workflowSteps');
   stepsEl.innerHTML = '';
 
@@ -733,7 +1244,10 @@ function renderWorkflow(task, workflow) {
     el.onclick = () => {
       state.selectedStepKey = step.key;
       renderWorkflow(task, workflow);
-      renderDetails(task, step, null);
+      // Prefer cached step details if we have them; otherwise show a loading state.
+      const cached = (state.selectedTaskData && state.selectedTaskData.step_details) ? state.selectedTaskData.step_details : {};
+      const detail = (cached && cached[step.key]) ? cached[step.key] : null;
+      renderDetails(task, step, detail);
     };
 
     const rail = document.createElement('div');
@@ -822,17 +1336,55 @@ function renderDetails(task, step, detail) {
 
   // Step-specific rendering (mockup-style)
   if (step.key === 'TASK_SPECIFICATION') {
-    const card = document.createElement('div');
-    card.className = 'card';
+    const hero = document.createElement('div');
+    hero.className = 'taskHero';
+
+    const top = document.createElement('div');
+    top.className = 'taskHeroTop';
+
+    const left = document.createElement('div');
     const title = document.createElement('div');
-    title.className = 'cardTitle';
-    title.textContent = d.title || task.title;
+    title.className = 'taskHeroTitle';
+    title.textContent = d.title || task.title || 'Task';
     const desc = document.createElement('div');
-    desc.className = 'cardBody';
+    desc.className = 'taskHeroDesc';
     desc.textContent = d.description || task.description || '—';
-    card.appendChild(title);
-    card.appendChild(desc);
-    el.appendChild(card);
+    left.appendChild(title);
+    left.appendChild(desc);
+
+    top.appendChild(left);
+
+    if (d.priority) {
+      const pr = document.createElement('span');
+      pr.className = 'prio';
+      pr.textContent = String(d.priority).toUpperCase();
+      top.appendChild(pr);
+    }
+
+    hero.appendChild(top);
+    el.appendChild(hero);
+
+    const criteria = d.acceptance_criteria || [];
+    if (criteria.length) {
+      const sec = document.createElement('div');
+      sec.className = 'sectionTitle';
+      sec.textContent = 'Acceptance criteria';
+      el.appendChild(sec);
+
+      criteria.slice(0, 20).forEach((c, idx) => {
+        const row = document.createElement('div');
+        row.className = 'acItem';
+        const n = document.createElement('span');
+        n.className = 'acN';
+        n.textContent = String(idx + 1);
+        const txt = document.createElement('span');
+        txt.className = 'acText';
+        txt.textContent = String(c);
+        row.appendChild(n);
+        row.appendChild(txt);
+        el.appendChild(row);
+      });
+    }
     return;
   }
 
@@ -843,19 +1395,39 @@ function renderDetails(task, step, detail) {
     summary.textContent = `${d.answered || 0} answered · ${d.pending || 0} pending`;
     el.appendChild(summary);
 
-    items.forEach(it => {
+    items.forEach((it, idx) => {
       const q = document.createElement('div');
       q.className = 'qcard';
       const qh = document.createElement('div');
       qh.className = 'qhead';
-      qh.textContent = `${it.id || ''}  ${it.question || ''}`.trim();
+      const badge = document.createElement('span');
+      badge.className = 'qbadge';
+      badge.textContent = `Q${idx + 1}`;
+      const qt = document.createElement('span');
+      qt.className = 'qtext';
+      // Hide clarification IDs in the UI (keep it human-friendly).
+      qt.textContent = `${it.question || ''}`.trim();
+      qh.appendChild(badge);
+      qh.appendChild(qt);
       const ans = document.createElement('div');
       ans.className = 'qans ' + (it.status === 'ANSWERED' ? 'ok' : 'muted');
-      ans.textContent = it.status === 'ANSWERED' ? (it.answer || '—') : '(pending)';
+      const icon = document.createElement('span');
+      icon.className = 'qicon';
+      icon.textContent = it.status === 'ANSWERED' ? '✓' : '○';
+      const at = document.createElement('span');
+      at.textContent = it.status === 'ANSWERED' ? (it.answer || '—') : '(pending)';
+      ans.appendChild(icon);
+      ans.appendChild(at);
       q.appendChild(qh);
       q.appendChild(ans);
       el.appendChild(q);
     });
+
+    const footer = document.createElement('div');
+    footer.className = 'small';
+    footer.style.marginTop = '12px';
+    footer.textContent = `${d.answered || 0} answered · ${d.pending || 0} pending`;
+    el.appendChild(footer);
     return;
   }
 
@@ -867,18 +1439,24 @@ function renderDetails(task, step, detail) {
       el.appendChild(banner);
     }
 
-    // Bounded context
+    // Bounded context (impacted files only)
     const bc = d.bounded_context || {};
-    const allowed = (bc.allowed_files || []);
-    if (allowed.length) {
+    const files = (bc.files_sample || []);
+    const total = (typeof bc.file_count === 'number') ? bc.file_count : files.length;
+    if (files.length) {
       const sec = document.createElement('div');
       sec.className = 'sectionTitle';
       sec.textContent = 'Bounded context (files)';
       el.appendChild(sec);
 
-      // Group by top-level directory
+      const meta = document.createElement('div');
+      meta.className = 'small';
+      meta.textContent = `${total} file(s) in scope`;
+      el.appendChild(meta);
+
+      // Render a compact tree from impacted file paths
       const groups = {};
-      allowed.forEach(p => {
+      files.forEach(p => {
         const parts = (p || '').split('/');
         const key = parts.length ? parts[0] : '(root)';
         groups[key] = groups[key] || [];
@@ -929,6 +1507,164 @@ function renderDetails(task, step, detail) {
     banner.className = d.plan_approved ? 'banner' : 'banner warn';
     banner.textContent = d.plan_approved ? 'Plan approved' : 'Plan not approved yet';
     el.appendChild(banner);
+
+    // Show plan in a structured UI (same style as planning), and keep markdown as an optional link.
+    if (d.plan_markdown_path) {
+      const sec = document.createElement('div');
+      sec.className = 'sectionTitle';
+      sec.textContent = 'Final plan document';
+      el.appendChild(sec);
+
+      const card = document.createElement('div');
+      card.className = 'card';
+
+      const small = document.createElement('div');
+      small.className = 'small';
+      const fileName = String(d.plan_markdown_path).split('/').slice(-1)[0];
+      small.textContent = fileName;
+
+      const actions = document.createElement('div');
+      actions.style.marginTop = '6px';
+      const link = document.createElement('a');
+      link.href = `/api/plan-markdown/${encodeURIComponent(task.id)}`;
+      link.target = '_blank';
+      link.rel = 'noreferrer';
+      link.textContent = 'Open / download markdown';
+      actions.appendChild(link);
+
+      const spacer = document.createElement('span');
+      spacer.textContent = '  ·  ';
+      spacer.style.color = 'var(--muted)';
+      actions.appendChild(spacer);
+
+      const full = document.createElement('a');
+      full.href = `/plan/${encodeURIComponent(task.id)}`;
+      full.textContent = 'View full page';
+      actions.appendChild(full);
+
+      card.appendChild(small);
+      card.appendChild(actions);
+
+      el.appendChild(card);
+    } else {
+      const hint = document.createElement('div');
+      hint.className = 'small';
+      hint.textContent = 'No exported plan document found yet.';
+      el.appendChild(hint);
+    }
+
+    // Bounded context (impacted files sample)
+    const bc = d.bounded_context || {};
+    const files = (bc.files_sample || []);
+    const total = (typeof bc.file_count === 'number') ? bc.file_count : files.length;
+    if (files.length) {
+      const sec = document.createElement('div');
+      sec.className = 'sectionTitle';
+      sec.textContent = 'Bounded context (files)';
+      el.appendChild(sec);
+
+      const meta = document.createElement('div');
+      meta.className = 'small';
+      meta.textContent = `${total} file(s) in scope`;
+      el.appendChild(meta);
+
+      const groups = {};
+      files.forEach(p => {
+        const parts = (p || '').split('/');
+        const key = parts.length ? parts[0] : '(root)';
+        groups[key] = groups[key] || [];
+        groups[key].push(p);
+      });
+      Object.keys(groups).slice(0, 30).forEach(k => {
+        const g = document.createElement('div');
+        g.className = 'tree';
+        const gh = document.createElement('div');
+        gh.className = 'treeDir';
+        gh.textContent = k;
+        g.appendChild(gh);
+        groups[k].slice(0, 40).forEach(p => {
+          const f = document.createElement('div');
+          f.className = 'treeFile';
+          f.textContent = p;
+          g.appendChild(f);
+        });
+        el.appendChild(g);
+      });
+    }
+
+    // Execution plan (same visual style as planning)
+    const steps = d.plan_steps || [];
+    if (steps.length) {
+      const sec2 = document.createElement('div');
+      sec2.className = 'sectionTitle';
+      sec2.textContent = 'Execution plan';
+      el.appendChild(sec2);
+      steps.forEach((s, idx) => {
+        const li = document.createElement('div');
+        li.className = 'planItem';
+        const n = document.createElement('span');
+        n.className = 'planN';
+        n.textContent = String(idx + 1);
+        const txt = document.createElement('span');
+        txt.textContent = (s.description || String(s)).trim();
+        li.appendChild(n);
+        li.appendChild(txt);
+        el.appendChild(li);
+      });
+    }
+
+    // Scenarios (compact, no long scrolling markdown)
+    const scenarios = d.scenarios || [];
+    if (scenarios.length) {
+      const sec3 = document.createElement('div');
+      sec3.className = 'sectionTitle';
+      sec3.textContent = 'Scenarios (Given / When / Then)';
+      el.appendChild(sec3);
+      scenarios.slice(0, 8).forEach(sc => {
+        const box = document.createElement('div');
+        box.className = 'qcard';
+        const h = document.createElement('div');
+        h.className = 'qhead';
+        h.textContent = `Step ${sc.index}: ${sc.title}`;
+        const body = document.createElement('div');
+        body.className = 'small';
+        body.style.marginTop = '8px';
+        body.style.whiteSpace = 'pre-line';
+        body.textContent = (sc.lines || []).join('\n');
+        box.appendChild(h);
+        box.appendChild(body);
+        el.appendChild(box);
+      });
+    }
+
+    // Risks + refactor suggestions (from plan preview / markdown)
+    const risks = d.risks || [];
+    if (risks.length) {
+      const sec4 = document.createElement('div');
+      sec4.className = 'sectionTitle';
+      sec4.textContent = 'Risks';
+      el.appendChild(sec4);
+      risks.slice(0, 20).forEach(r => {
+        const row = document.createElement('div');
+        row.className = 'fileRow';
+        row.textContent = r;
+        el.appendChild(row);
+      });
+    }
+
+    const ref = d.refactors || [];
+    if (ref.length) {
+      const sec5 = document.createElement('div');
+      sec5.className = 'sectionTitle';
+      sec5.textContent = 'Refactor suggestions';
+      el.appendChild(sec5);
+      ref.slice(0, 20).forEach(r => {
+        const row = document.createElement('div');
+        row.className = 'fileRow';
+        row.textContent = r;
+        el.appendChild(row);
+      });
+    }
     return;
   }
 
@@ -1005,6 +1741,7 @@ async function loadTask(taskId) {
   const res = await fetch(`/api/task/${encodeURIComponent(taskId)}`, { cache: 'no-store' });
   if (!res.ok) return;
   const data = await res.json();
+  state.selectedTaskData = data;
   renderWorkflow(data.task, data.workflow);
   renderDetails(data.task, null, null);
 }
@@ -1040,6 +1777,7 @@ async function tick() {
       const res = await fetch(`/api/task/${encodeURIComponent(state.selectedTaskId)}`, { cache: 'no-store' });
       if (res.ok) {
         const tdata = await res.json();
+        state.selectedTaskData = tdata;
         renderWorkflow(tdata.task, tdata.workflow);
         if (state.selectedStepKey) {
           const step = (tdata.workflow || []).find(s => s.key === state.selectedStepKey);
@@ -1076,11 +1814,12 @@ class _DashboardApi:
         tasks, logs = self._load()
         now = _utcnow()
 
-        # filter by time window based on task.updated_at
-        cutoff = now.timestamp() - float(minutes * 60)
+        # Filter by time window based on task.updated_at.
+        # minutes <= 0 means "all time".
+        cutoff = None if minutes <= 0 else (now.timestamp() - float(minutes * 60))
         filtered_tasks: list[Task] = []
         for t in tasks:
-            if t.updated_at.timestamp() < cutoff:
+            if cutoff is not None and t.updated_at.timestamp() < cutoff:
                 continue
             if filter_bucket and filter_bucket != "all":
                 if _task_bucket(t.status) != filter_bucket:
@@ -1131,6 +1870,36 @@ class _DashboardApi:
             "activity": [_serialize_log(e) for e in _latest_logs([l for l in logs if l.task_id == task_id], limit=30)],
         }
 
+    def plan_markdown(self, task_id: str) -> Dict[str, Any]:
+        """
+        Serve the exported plan markdown (if present) for a task.
+        """
+        tasks, _ = self._load()
+        task = next((t for t in tasks if t.id == task_id), None)
+        if not task:
+            raise KeyError("task not found")
+        meta = task.metadata if isinstance(task.metadata, dict) else {}
+        path_str = str(meta.get("plan_markdown_path") or "").strip()
+
+        # Always provide markdown for the dashboard:
+        # - Prefer the exported file if readable
+        # - Otherwise, fall back to rendering from stored task metadata
+        content = ""
+        if path_str:
+            try:
+                p = Path(path_str)
+                if p.exists() and p.is_file():
+                    content = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                content = ""
+
+        if not content:
+            content = _render_plan_markdown(task)
+
+        if len(content) > 200_000:
+            content = content[:200_000] + "\n\n… (truncated)\n"
+        return {"path": path_str or None, "content": content}
+
 
 def _extract_files_from_diff(diff: str) -> list[str]:
     """
@@ -1171,17 +1940,33 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
             answered += 1
         elif status == "PENDING" or status == "":
             pending += 1
+        # Do not expose internal clarification IDs in the web UI payload.
         items.append(
             {
-                "id": str(it.get("id") or ""),
                 "question": str(it.get("question") or ""),
                 "answer": str(it.get("answer") or ""),
                 "status": status or "PENDING",
             }
         )
 
+    # Optional priority (demo-friendly, can be set by client)
+    priority = None
+    pr = meta.get("priority")
+    if isinstance(pr, str) and pr.strip():
+        priority = pr.strip()
+
     plan_preview = meta.get("plan_preview") or {}
     plan_steps = (plan_preview.get("steps") or []) if isinstance(plan_preview, dict) else []
+    risks = (plan_preview.get("risks") or []) if isinstance(plan_preview, dict) else []
+    refactors = (plan_preview.get("refactors") or []) if isinstance(plan_preview, dict) else []
+    if not isinstance(risks, list):
+        risks = []
+    if not isinstance(refactors, list):
+        refactors = []
+
+    acceptance_criteria = _derive_acceptance_criteria(task, clarifications, plan_steps if isinstance(plan_steps, list) else [])
+    scenarios = _derive_scenarios(task, plan_steps if isinstance(plan_steps, list) else [])
+
     bounded_ctx = meta.get("bounded_context") or {}
     if not isinstance(bounded_ctx, dict):
         bounded_ctx = {}
@@ -1192,6 +1977,13 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
     allowed_files = scope.get("allowed_files") if isinstance(scope, dict) else []
     if not isinstance(allowed_files, list):
         allowed_files = []
+    impact = (scoped.get("impact") or {}) if isinstance(scoped, dict) else {}
+    files_sample = impact.get("files_sample") or []
+    if not isinstance(files_sample, list):
+        files_sample = []
+    # Fallback: if no impact sample is present, show a small slice of allowed files.
+    if not files_sample and allowed_files:
+        files_sample = list(allowed_files[:20])
 
     patches_raw = meta.get("patch_queue_state") or []
     patches: list[Dict[str, Any]] = []
@@ -1216,19 +2008,44 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
             )
 
     plan_approved = bool(meta.get("plan_approved", False))
+    plan_md_path = str(meta.get("plan_markdown_path") or "").strip()
+    # Generate a preview from task metadata to avoid filesystem issues.
+    raw = _render_plan_markdown(task)
+    if len(raw) > 12_000:
+        raw = raw[:12_000] + "\n\n… (preview truncated)\n"
+    plan_md_preview: str | None = raw
 
     return {
         "TASK_SPECIFICATION": {
             "title": _task_title(task),
             "description": (task.description or "").strip(),
+            "acceptance_criteria": acceptance_criteria[:20],
+            "priority": priority,
         },
         "CLARIFYING": {"answered": answered, "pending": pending, "items": items},
         "PLANNING": {
             "plan_steps": plan_steps if isinstance(plan_steps, list) else [],
             "plan_approved": plan_approved,
-            "bounded_context": {"allowed_files": allowed_files, "targets": scope.get("targets") if isinstance(scope, dict) else []},
+            "bounded_context": {
+                "file_count": len(allowed_files),
+                "files_sample": files_sample[:50],
+            },
         },
-        "APPROVAL": {"plan_approved": plan_approved, "approved_at": meta.get("plan_approved_at")},
+        "APPROVAL": {
+            "plan_approved": plan_approved,
+            "approved_at": meta.get("plan_approved_at"),
+            "plan_markdown_path": plan_md_path or None,
+            "plan_markdown_preview": plan_md_preview,
+            # Render approval in the same structured UI as planning (no giant markdown scroll).
+            "plan_steps": plan_steps if isinstance(plan_steps, list) else [],
+            "bounded_context": {
+                "file_count": len(allowed_files),
+                "files_sample": files_sample[:50],
+            },
+            "scenarios": scenarios,
+            "risks": [str(r).strip() for r in risks if str(r).strip()][:20],
+            "refactors": [str(r).strip() for r in refactors if str(r).strip()][:20],
+        },
         "CODEGEN": {"patches": patches, "files_touched": files_touched},
     }
 
@@ -1254,6 +2071,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/" or path == "/index.html":
             self._send(200, _INDEX_HTML.encode("utf-8"), content_type="text/html; charset=utf-8")
+            return
+        if path.startswith("/plan/"):
+            task_id = path.split("/plan/", 1)[1].strip("/")
+            self._send(200, _plan_html(task_id).encode("utf-8"), content_type="text/html; charset=utf-8")
             return
         if path == "/styles.css":
             self._send(200, _STYLES_CSS.encode("utf-8"), content_type="text/css; charset=utf-8")
@@ -1283,6 +2104,18 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": "task not found"})
             except Exception as exc:
                 self._send_json(500, {"error": str(exc)})
+            return
+
+        if path.startswith("/api/plan-markdown/"):
+            task_id = path.split("/api/plan-markdown/", 1)[1].strip("/")
+            try:
+                payload = self.server.api.plan_markdown(task_id)  # type: ignore[attr-defined]
+                body = (payload.get("content") or "").encode("utf-8")
+                self._send(200, body, content_type="text/markdown; charset=utf-8")
+            except KeyError:
+                self._send(404, b"Not Found", content_type="text/plain; charset=utf-8")
+            except Exception as exc:
+                self._send(500, str(exc).encode("utf-8"), content_type="text/plain; charset=utf-8")
             return
 
         self._send(404, b"Not Found", content_type="text/plain; charset=utf-8")

@@ -498,7 +498,8 @@ def start(
 
     clarifications = task.metadata.get("clarifications", [])
 
-    console.print(f"[bold green]Created task[/] {task.id}")
+    # Avoid dumping full UUIDs in the default UI output.
+    console.print(f"[bold green]Created task[/] {task.id[:8]}")
 
     if clarifications:
         table = Table(title="Clarification Questions")

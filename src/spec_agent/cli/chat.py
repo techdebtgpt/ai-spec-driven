@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 from threading import Lock, Thread
 from uuid import uuid4
+import socket
 
 from prompt_toolkit import prompt as prompt_toolkit_prompt
 from prompt_toolkit.completion import PathCompleter
@@ -17,6 +18,7 @@ from rich.table import Table
 from ..domain.models import Task, TaskStatus
 from ..workflow.orchestrator import TaskOrchestrator
 from .dashboard import run_task_dashboard
+from ..web.server import run_dashboard_server
 
 
 console = Console()
@@ -134,6 +136,7 @@ class ChatSession:
         self.index_only: bool = False  # Track if we're just indexing vs starting a task
         self._bg_lock = Lock()
         self._bg_jobs: dict[str, dict] = {}
+        self._web_dashboard_url: str | None = None
         self._maybe_load_cached_index()
 
     def _maybe_load_cached_index(self) -> None:
@@ -293,7 +296,7 @@ class ChatSession:
         console.print("  [cyan]2.[/] Continue existing task")
         console.print("  [cyan]3.[/] View task history")
         console.print("  [cyan]4.[/] Index a repository")
-        console.print("  [cyan]5.[/] Live tasks dashboard")
+        console.print("  [cyan]5.[/] Open dashboard (web)")
         console.print("  [cyan]6.[/] Exit")
         console.print()
 
@@ -351,13 +354,49 @@ class ChatSession:
             self.index_only = True
             self.state = ConversationState.INDEXING
         elif choice == "5":
-            console.print()
-            console.print("[dim]Live dashboard — press Ctrl+C to return to the menu.[/]")
-            focus = self.current_task.id if self.current_task else None
-            run_task_dashboard(self.orchestrator, task_id=focus, show_all=False, refresh_seconds=1.0)
+            self._open_web_dashboard()
             self.state = ConversationState.MAIN_MENU
         elif choice == "6":
             self.state = ConversationState.EXITING
+
+    def _open_web_dashboard(self) -> None:
+        """
+        Start the web dashboard in the background and open it in the browser.
+        """
+        import webbrowser
+
+        if self._web_dashboard_url:
+            console.print(f"[dim]Dashboard already running:[/] {self._web_dashboard_url}")
+            try:
+                webbrowser.open(self._web_dashboard_url)
+            except Exception:
+                pass
+            return
+
+        # Find a free port (avoid conflicts during demos).
+        host = "127.0.0.1"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, 0))
+            port = int(s.getsockname()[1])
+
+        url = f"http://{host}:{port}"
+        self._web_dashboard_url = url
+
+        console.print()
+        console.print(f"[cyan]Opening dashboard:[/] {url}")
+
+        # Start server in background thread.
+        self._start_background_job(
+            name=f"web-dashboard ({url})",
+            fn=lambda: run_dashboard_server(host=host, port=port),
+        )
+
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+        console.print("[dim]Tip: keep this terminal open while the dashboard is running.[/]")
 
     def _handle_indexing(self) -> None:
         """Handle repository indexing."""
@@ -572,7 +611,8 @@ class ChatSession:
             self.indexed_repo = self.current_task.repo_path
             self.indexed_branch = self.current_task.branch
 
-            console.print(f"[green]✓[/] Task created: [cyan]{self.current_task.id}[/]")
+            title = (self.current_task.title or "").strip() or (self.current_task.description.splitlines()[0] if self.current_task.description else "Untitled task")
+            console.print(f"[green]✓[/] Task created: [cyan]{title}[/]")
             self.state = ConversationState.CLARIFYING
 
         except Exception as exc:
@@ -888,7 +928,7 @@ class ChatSession:
                     self.state = ConversationState.REVIEWING_PATCHES
                 else:
                     console.print("[green]✓[/] Next milestone: patch generation.")
-                    console.print(f"[dim]CLI: ./spec-agent generate-patches {self.current_task.id}[/]")
+                    console.print("[dim]You can generate patches later from the main menu.[/]")
                     self.state = ConversationState.MAIN_MENU
             except Exception as exc:
                 console.print(f"Error approving plan: {exc}", style="red", markup=False)
@@ -1048,7 +1088,6 @@ class ChatSession:
 
         # For now, just return to main menu
         console.print("[green]✓[/] Task workflow complete![/]")
-        console.print(f"[cyan]Task ID: {self.current_task.id}[/]")
         console.print()
 
         if Confirm.ask("Return to main menu?", default=True):
