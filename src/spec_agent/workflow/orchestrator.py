@@ -1220,7 +1220,22 @@ class TaskOrchestrator:
             "candidate_directory_count": len(directory_candidates),
         }
 
-    def generate_plan(self, task_id: str, skip_rationale_enhancement: bool = False) -> Dict[str, List[str]]:
+    def generate_plan(
+        self,
+        task_id: str,
+        skip_rationale_enhancement: bool = False,
+        auto_freeze_scope: bool = True,
+    ) -> Dict[str, List[str]]:
+        """
+        Generate an implementation plan for the task.
+        
+        Args:
+            task_id: UUID of the task
+            skip_rationale_enhancement: Skip rationale enhancement for faster execution
+            auto_freeze_scope: If True (default), automatically infer and freeze scope
+                              to produce a final plan directly. If False, creates a
+                              preliminary plan that requires manual scope approval.
+        """
         import sys
         
         task = self._get_task(task_id)
@@ -1374,6 +1389,27 @@ class TaskOrchestrator:
             file_count = agg.get("file_count", 0) if isinstance(agg, dict) else 0
             if frozen and isinstance(file_count, int) and file_count > 0:
                 task.metadata["plan_stage"] = "FINAL"
+        
+        # Auto-freeze scope: infer targets and create final plan directly
+        # This makes the flow more natural (skip preliminary plan step)
+        if auto_freeze_scope and task.metadata.get("plan_stage") != "FINAL":
+            sys.stderr.write("Auto-freezing scope for final plan...\n")
+            try:
+                inferred = self.infer_scope_targets(task_id)
+                inferred_targets = inferred.get("targets") or []
+                if inferred_targets:
+                    sys.stderr.write(f"Inferred {len(inferred_targets)} scope targets\n")
+                    # Run bounded index to freeze scope
+                    self.bounded_index_task(task_id, list(inferred_targets))
+                    task = self._get_task(task_id)  # Reload after bounded index
+                    task.metadata["plan_stage"] = "FINAL"
+                    sys.stderr.write("Scope frozen - plan is now FINAL\n")
+                else:
+                    sys.stderr.write("Could not infer scope targets, plan remains preliminary\n")
+            except Exception as exc:
+                LOG.warning("Auto-freeze scope failed: %s", exc)
+                sys.stderr.write(f"Auto-freeze scope failed: {exc}\n")
+        
         # Default stage if not otherwise set.
         task.metadata.setdefault("plan_stage", "PRELIMINARY")
 

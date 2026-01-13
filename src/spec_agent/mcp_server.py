@@ -310,7 +310,8 @@ def generate_plan(task_id: str, fast: bool = False) -> dict:
     Generate an implementation plan for the task.
 
     Creates a step-by-step plan with boundary specifications that define
-    the contracts and invariants for the changes.
+    the contracts and invariants for the changes. Automatically freezes
+    scope to create a final plan ready for approval.
 
     Args:
         task_id: UUID of the task
@@ -328,7 +329,8 @@ def generate_plan(task_id: str, fast: bool = False) -> dict:
             "pending_clarifications": orchestrator.list_clarifications(task_id),
         }
 
-    result = orchestrator.generate_plan(task_id, skip_rationale_enhancement=fast)
+    # auto_freeze_scope=True creates a final plan directly (more natural flow)
+    result = orchestrator.generate_plan(task_id, skip_rationale_enhancement=fast, auto_freeze_scope=True)
 
     plan = result.get("plan", {})
     steps = plan.get("steps", [])

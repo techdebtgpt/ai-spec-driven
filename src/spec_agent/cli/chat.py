@@ -834,7 +834,8 @@ class ChatSession:
         if choice == "1":
             try:
                 if stage != "FINAL":
-                    # Approve preliminary plan: infer scope now, freeze it, then build final plan.
+                    # Plan is still preliminary - need to freeze scope first
+                    # (This path is only taken if auto_freeze_scope=False was used)
                     console.print("[yellow]Approving preliminary plan: inferring frozen scope...[/]")
                     inferred = self.orchestrator.infer_scope_targets(self.current_task.id)
                     targets = inferred.get("targets") or []
