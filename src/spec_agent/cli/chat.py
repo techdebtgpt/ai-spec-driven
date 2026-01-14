@@ -7,21 +7,50 @@ from typing import Optional
 from threading import Lock, Thread
 from uuid import uuid4
 import socket
+from datetime import datetime, timezone
 
 from prompt_toolkit import prompt as prompt_toolkit_prompt
 from prompt_toolkit.completion import PathCompleter
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm
 from rich.table import Table
 
-from ..domain.models import Task, TaskStatus
+from ..domain.models import Task, TaskStatus, ClarificationStatus
 from ..workflow.orchestrator import TaskOrchestrator
 from .dashboard import run_task_dashboard
 from ..web.server import run_dashboard_server
 
 
 console = Console()
+
+
+def _safe(text: Optional[str]) -> str:
+    """Escape user-provided text for Rich markup output."""
+    return escape(text or "")
+
+
+def _format_relative(ts: str | None) -> str:
+    if not ts:
+        return "unknown time"
+    try:
+        dt = datetime.fromisoformat(ts)
+    except Exception:
+        return ts
+    now = datetime.now(timezone.utc)
+    delta = now - dt.astimezone(timezone.utc)
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    days = hours // 24
+    return f"{days}d ago"
 
 
 def _infer_step_scenario(description: str, notes: Optional[str] = None, *, has_tests: bool = True) -> list[str]:
@@ -140,7 +169,106 @@ class ChatSession:
         self._bg_lock = Lock()
         self._bg_jobs: dict[str, dict] = {}
         self._web_dashboard_url: str | None = None
+        self._prefill_description: str = ""
+        self._prefill_clarification_answers: list[dict] = []
+        self._current_index_data: Optional[dict] = None
         self._maybe_load_cached_index()
+
+    def _recent_repositories(self) -> list[dict]:
+        options: list[dict] = []
+        try:
+            cached = self.orchestrator.list_cached_indexes()
+        except Exception:
+            return options
+        seen: set[tuple[str, str]] = set()
+        for data in cached:
+            repo_path = str(data.get("repo_path") or "").strip()
+            branch = str(data.get("branch") or "main")
+            if not repo_path:
+                continue
+            key = (repo_path, branch)
+            if key in seen:
+                continue
+            seen.add(key)
+            options.append(
+                {
+                    "repo_path": Path(repo_path),
+                    "branch": branch,
+                    "indexed_at": data.get("indexed_at"),
+                    "index_data": data,
+                }
+            )
+            if len(options) >= 7:
+                break
+        return options
+
+    def _find_recent_task(self, repo_root: Path, branch: str) -> Optional[Task]:
+        try:
+            tasks = self.orchestrator.store.load_tasks()
+        except Exception:
+            return None
+        repo_resolved = repo_root.resolve()
+        latest: Optional[Task] = None
+        for task in tasks:
+            try:
+                task_repo_path = task.repo_path.resolve()
+            except Exception:
+                task_repo_path = Path(str(task.repo_path))
+            matches_repo = task_repo_path == repo_resolved
+            if not matches_repo:
+                try:
+                    matches_repo = repo_resolved.is_relative_to(task_repo_path) or task_repo_path.is_relative_to(repo_resolved)
+                except ValueError:
+                    matches_repo = False
+            if not matches_repo:
+                continue
+            if (task.branch or "") != (branch or ""):
+                continue
+            if not latest or task.updated_at > latest.updated_at:
+                latest = task
+        return latest
+
+    def _apply_saved_clarifications(self) -> int:
+        """
+        Reapply previously answered clarifications when the engineer reuses a description.
+        """
+        if not self.current_task or not self._prefill_clarification_answers:
+            return 0
+
+        answers_map = {}
+        for item in self._prefill_clarification_answers:
+            question = str(item.get("question") or "").strip().lower()
+            answer = str(item.get("answer") or "").strip()
+            if question and answer:
+                answers_map[question] = answer
+
+        if not answers_map:
+            return 0
+
+        clarifications = self.current_task.metadata.get("clarifications", []) or []
+        reused = 0
+        for item in clarifications:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status") or "").strip().upper()
+            if status and status != "PENDING":
+                continue
+            question = str(item.get("question") or "").strip()
+            key = question.lower()
+            answer = answers_map.get(key)
+            if not answer:
+                continue
+            try:
+                self.orchestrator.update_clarification(
+                    self.current_task.id,
+                    item["id"],
+                    answer,
+                    ClarificationStatus.ANSWERED,
+                )
+                reused += 1
+            except Exception:
+                continue
+        return reused
 
     def _maybe_load_cached_index(self) -> None:
         """
@@ -307,40 +435,102 @@ class ChatSession:
 
         if choice == "1":
             self.index_only = False
-            # Always let the engineer choose a repo path, then reuse cached index if present.
             console.print()
-            default_repo = str(self.indexed_repo) if self.indexed_repo else str(Path.cwd())
-            console.print(f"Repository path (press Tab for completion) [default: {default_repo}]:")
-            try:
-                repo_path_str = prompt_toolkit_prompt(
-                    "> ",
-                    completer=PathCompleter(only_directories=True, expanduser=True),
-                    default=default_repo,
-                ).strip()
-                if not repo_path_str:
-                    repo_path_str = default_repo
-            except (KeyboardInterrupt, EOFError):
-                console.print("[yellow]Cancelled[/]")
-                self.state = ConversationState.MAIN_MENU
-                return
 
-            requested = Path(repo_path_str).resolve()
-            if not requested.exists() or not requested.is_dir():
-                console.print(f"[red]Error: {requested} is not a valid directory[/]")
-                self.state = ConversationState.MAIN_MENU
-                return
-
-            repo_root = self.orchestrator.resolve_repo_root(requested)
-
-            # Ask for branch before deciding whether we can reuse a cached index.
+            repo_root: Path | None = None
             branch_default = self.indexed_branch or "main"
+            branch: str = branch_default
+
+            recent = self._recent_repositories()
+            selected_cached: dict | None = None
+            if recent:
+                console.print("Cached repositories:")
+                for idx, item in enumerate(recent, start=1):
+                    when = _format_relative(item.get("indexed_at"))
+                    console.print(f"  [cyan]{idx}.[/] {item['repo_path']} ({item['branch']}) · indexed {when}")
+                console.print(f"  [cyan]{len(recent)+1}.[/] Enter another path")
+                selection = Prompt.ask("Select repository", default="1").strip()
+                if selection.isdigit():
+                    idx = int(selection)
+                    if 1 <= idx <= len(recent):
+                        selected_cached = recent[idx - 1]
+                    elif idx != len(recent) + 1:
+                        # default to first if invalid
+                        selected_cached = recent[0]
+
+            if selected_cached:
+                repo_root = selected_cached["repo_path"].resolve()
+                branch_default = selected_cached["branch"] or branch_default
+                self._current_index_data = dict(selected_cached.get("index_data") or {})
+            else:
+                default_repo = str(self.indexed_repo) if self.indexed_repo else str(Path.cwd())
+                console.print(f"Repository path (press Tab for completion) [default: {default_repo}]:")
+                try:
+                    repo_path_str = prompt_toolkit_prompt(
+                        "> ",
+                        completer=PathCompleter(only_directories=True, expanduser=True),
+                        default=default_repo,
+                    ).strip()
+                    if not repo_path_str:
+                        repo_path_str = default_repo
+                except (KeyboardInterrupt, EOFError):
+                    console.print("[yellow]Cancelled[/]")
+                    self.state = ConversationState.MAIN_MENU
+                    return
+
+                requested = Path(repo_path_str).resolve()
+                if not requested.exists() or not requested.is_dir():
+                    console.print(f"[red]Error: {requested} is not a valid directory[/]")
+                    self.state = ConversationState.MAIN_MENU
+                    return
+                repo_root = self.orchestrator.resolve_repo_root(requested)
+                self._current_index_data = None
+
             branch = Prompt.ask("Branch", default=branch_default)
+
+            if not self._current_index_data:
+                try:
+                    self._current_index_data = self.orchestrator.get_repository_index_for_repo_and_branch(repo_root, branch)
+                except Exception:
+                    self._current_index_data = None
+
+            self._prefill_description = ""
+            self._prefill_clarification_answers = []
+            self._current_index_data = None
+            previous_task = self._find_recent_task(repo_root, branch)
+            if previous_task and previous_task.description:
+                preview = previous_task.description.strip().splitlines()[0][:80]
+                console.print(f"[dim]Last task for this repo/branch:[/] {preview}")
+                reuse_choice = Prompt.ask("Reuse previous description? (y/n/edit)", default="y").strip().lower()
+                if reuse_choice.startswith("y") or reuse_choice == "":
+                    self._prefill_description = previous_task.description.strip()
+                    answers = []
+                    clar_list = previous_task.metadata.get("clarifications", [])
+                    if isinstance(clar_list, list):
+                        for item in clar_list:
+                            if not isinstance(item, dict):
+                                continue
+                            if str(item.get("status")).upper() == "ANSWERED" and item.get("answer"):
+                                answers.append(
+                                    {
+                                        "question": str(item.get("question") or ""),
+                                        "answer": str(item.get("answer") or ""),
+                                    }
+                                )
+                    self._prefill_clarification_answers = answers
+                    console.print("[dim]Will reuse previous description and answers. You can edit them in the next step.[/]")
+                elif reuse_choice.startswith("e"):
+                    edited = Prompt.ask("Description", default=previous_task.description).strip()
+                    if edited:
+                        self._prefill_description = edited
+                # if 'n', leave defaults empty
 
             # Try to reuse an existing cached index for this repo.
             try:
                 cached = self.orchestrator.get_repository_index_for_repo_and_branch(repo_root, branch)
                 self.indexed_repo = Path(cached.get("repo_path") or repo_root).resolve()
                 self.indexed_branch = str(cached.get("branch") or branch or "main")
+                self._current_index_data = cached
                 console.print(f"[cyan]Using cached index for:[/] {self.indexed_repo} ({self.indexed_branch})")
                 self._indexing_preselected = False
                 self.state = ConversationState.TASK_SETUP
@@ -588,6 +778,10 @@ class ChatSession:
                 console.print("[cyan]Repository indexed! You can now start a task.[/]")
                 self.state = ConversationState.MAIN_MENU
             else:
+                try:
+                    self._current_index_data = self.orchestrator.get_repository_index_for_repo_and_branch(self.indexed_repo, self.indexed_branch)
+                except Exception:
+                    self._current_index_data = None
                 self.state = ConversationState.TASK_SETUP
 
         except Exception as exc:
@@ -603,7 +797,12 @@ class ChatSession:
         console.print("[dim](Be as detailed or brief as you like - I'll ask clarifying questions)[/]")
         console.print()
 
-        description = Prompt.ask("Description")
+        default_desc = (self._prefill_description or "").strip()
+        if default_desc:
+            description = Prompt.ask("Description", default=default_desc).strip()
+        else:
+            description = Prompt.ask("Description").strip()
+        self._prefill_description = ""
 
         if not description or description.strip() == "":
             console.print("[yellow]Description cannot be empty.[/]")
@@ -622,7 +821,10 @@ class ChatSession:
         console.print("[yellow]Creating task...[/]")
 
         try:
-            self.current_task = self.orchestrator.create_task_from_index(description=description)
+            self.current_task = self.orchestrator.create_task_from_index(
+                description=description,
+                index_data=self._current_index_data,
+            )
             self.indexed_repo = self.current_task.repo_path
             self.indexed_branch = self.current_task.branch
 
@@ -643,7 +845,15 @@ class ChatSession:
         # Reload task to pick up any auto-resets (e.g. description changed in tasks.json)
         self.current_task = self.orchestrator._get_task(self.current_task.id)
 
-        clarifications = self.current_task.metadata.get("clarifications", [])
+        clarifications = self.current_task.metadata.get("clarifications", []) or []
+
+        if self._prefill_clarification_answers:
+            reused = self._apply_saved_clarifications()
+            if reused:
+                console.print(f"[dim]Reused {reused} previous clarification answer(s).[/]")
+                self.current_task = self.orchestrator._get_task(self.current_task.id)
+                clarifications = self.current_task.metadata.get("clarifications", []) or []
+            self._prefill_clarification_answers = []
 
         if not clarifications:
             console.print()
@@ -803,18 +1013,28 @@ class ChatSession:
         if bounded:
             aggregate = bounded.get("aggregate", {}) if isinstance(bounded, dict) else {}
             impact = bounded.get("impact", {}) if isinstance(bounded, dict) else {}
+            scope_meta = bounded.get("scope", {}) if isinstance(bounded, dict) else {}
             file_count = aggregate.get("file_count", 0)
             files_sample = impact.get("files_sample") or []
+            allowed_files = scope_meta.get("allowed_files") or []
+            target_list = scope_meta.get("targets") or []
+
+            if not files_sample and allowed_files:
+                files_sample = allowed_files
 
             if isinstance(file_count, int) and file_count > 0:
                 console.print()
                 scope_source = "scoped index" if manual_bounded else "plan targets"
 
                 scope_lines = [f"Scope: {file_count} file(s) ({scope_source})"]
+                if target_list:
+                    scope_lines.append("")
+                    scope_lines.append("Scope targets:")
+                    scope_lines.extend([f"- {_safe(str(p))}" for p in target_list[:8]])
                 if files_sample:
                     scope_lines.append("")
                     scope_lines.append("Impacted files (sample):")
-                    scope_lines.extend([f"- {p}" for p in files_sample[:12]])
+                    scope_lines.extend([f"- {_safe(str(p))}" for p in files_sample[:12]])
 
                 console.print(
                     Panel.fit(
@@ -1205,20 +1425,17 @@ class ChatSession:
             return
 
         console.print()
-        console.print("[cyan]Patch review would go here...[/]")
-        console.print("[dim]This will be similar to the patches command but interactive[/]")
-        console.print()
-
-        # For now, just return to main menu
-        console.print("[green]✓[/] Task workflow complete![/]")
-        console.print()
-
-        if Confirm.ask("Return to main menu?", default=True):
-            self.state = ConversationState.MAIN_MENU
+        console.print("[green]Patches generated and ready for review.[/]")
+        console.print(f"[dim]Use './spec-agent patches {self.current_task.id}' to inspect and apply them in your editor.[/]")
+        self.state = ConversationState.MAIN_MENU
 
     def _continue_task(self) -> None:
         """Continue an existing task."""
-        tasks = self.orchestrator.list_tasks()
+        tasks = sorted(
+            self.orchestrator.list_tasks(),
+            key=lambda t: t.updated_at,
+            reverse=True,
+        )
 
         if not tasks:
             console.print()
@@ -1227,6 +1444,8 @@ class ChatSession:
 
         console.print()
         console.print("[bold]Select a task to continue:[/]")
+        console.print()
+        console.print("[dim]Pick a task from this list; its repository and branch will be loaded automatically.[/]")
         console.print()
 
         for i, task in enumerate(tasks[:10], 1):
@@ -1238,9 +1457,17 @@ class ChatSession:
             }.get(task.status.value, "white")
 
             title = (task.title or "").strip() or (task.description.splitlines()[0] if task.description else f"task-{task.id[:8]}")
-            console.print(
-                f"  [cyan]{i}.[/] [{status_color}]{task.status.value}[/] - {(task.client or '—')[:10]} - {title[:50]}"
-            )
+            repo_display = _safe(str(task.repo_path))
+            branch_display = _safe(task.branch)
+            title_display = _safe(title[:60])
+            client_display = _safe((task.client or '—')[:12])
+            updated = _safe(_format_relative(task.updated_at.isoformat()))
+
+            console.print(f"  [cyan]{i}.[/] [{status_color}]{task.status.value}[/] • {branch_display}")
+            console.print(f"      Repo: {repo_display}")
+            console.print(f"      Title: {title_display}")
+            console.print(f"      Client: {client_display} • Updated: {updated}")
+            console.print()
 
         console.print()
         choice = Prompt.ask("Choice", default="1")
@@ -1251,6 +1478,9 @@ class ChatSession:
                 self.current_task = tasks[idx]
                 self.indexed_repo = self.current_task.repo_path
                 self.indexed_branch = self.current_task.branch
+                console.print(
+                    f"[dim]Resuming task {self.current_task.id[:8]} in {escape(str(self.indexed_repo))} ({escape(self.indexed_branch)}).[/]"
+                )
 
                 # Optional: allow updating the description when resuming.
                 if Confirm.ask("Update task description before continuing?", default=False):
@@ -1282,7 +1512,11 @@ class ChatSession:
 
     def _show_task_history(self) -> None:
         """Show task history."""
-        tasks = self.orchestrator.list_tasks()
+        tasks = sorted(
+            self.orchestrator.list_tasks(),
+            key=lambda t: t.updated_at,
+            reverse=True,
+        )
 
         if not tasks:
             console.print()
@@ -1307,9 +1541,9 @@ class ChatSession:
 
             table.add_row(
                 f"[{status_color}]{task.status.value}[/]",
-                (task.client or "—")[:10],
-                ((task.title or "").strip() or (task.description.splitlines()[0] if task.description else f"task-{task.id[:8]}"))[:40],
-                task.description[:60],
+                _safe((task.client or "—")[:10]),
+                _safe(((task.title or "").strip() or (task.description.splitlines()[0] if task.description else f"task-{task.id[:8]}"))[:40]),
+                _safe((task.description or "")[:60]),
                 task.updated_at.strftime("%Y-%m-%d %H:%M")
             )
 

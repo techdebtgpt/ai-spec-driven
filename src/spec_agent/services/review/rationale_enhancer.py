@@ -159,13 +159,25 @@ Return only valid JSON, no markdown, no explanations."""
 
             # Create enhanced patch
             enhanced_rationale = enhanced_data.get("rationale", patch.rationale)
+            if not isinstance(enhanced_rationale, str):
+                enhanced_rationale = str(enhanced_rationale)
             enhanced_alternatives = enhanced_data.get("alternatives", patch.alternatives)
-            
+            if not isinstance(enhanced_alternatives, list):
+                enhanced_alternatives = [
+                    str(enhanced_alternatives)
+                ] if enhanced_alternatives is not None else patch.alternatives
+
             # Store additional metadata in a structured format
             enhanced_metadata = {
-                "design_decisions": enhanced_data.get("design_decisions", []),
-                "trade_offs": enhanced_data.get("trade_offs", []),
-                "constraints": enhanced_data.get("constraints", []),
+                "design_decisions": [
+                    str(item) for item in enhanced_data.get("design_decisions", []) or []
+                ],
+                "trade_offs": [
+                    str(item) for item in enhanced_data.get("trade_offs", []) or []
+                ],
+                "constraints": [
+                    str(item) for item in enhanced_data.get("constraints", []) or []
+                ],
                 "original_rationale": patch.rationale,
             }
 

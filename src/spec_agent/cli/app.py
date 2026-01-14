@@ -9,6 +9,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from ..domain.models import ClarificationStatus, RefactorSuggestionStatus, TaskStatus
 from ..workflow.orchestrator import TaskOrchestrator
@@ -543,6 +544,14 @@ def handle_clarifications(
         status = item.get("status") or ClarificationStatus.PENDING.value
         console.print()
         console.print(Panel.fit(item.get("question", "No question text provided."), title=f"Question {item.get('id','')} [{status}]"))
+        suggestions = item.get("auto_scope_suggestions") or []
+        if suggestions:
+            console.print(
+                Panel.fit(
+                    "\n".join(f"- {path}" for path in suggestions[:12]),
+                    title="Suggested scope paths",
+                )
+            )
         if status != ClarificationStatus.PENDING.value:
             existing = item.get("answer") or "(no answer recorded)"
             console.print(f"[dim]Already resolved: {existing}[/]")
@@ -550,13 +559,21 @@ def handle_clarifications(
 
         answer = typer.prompt("Your answer (leave blank to skip)", default="").strip()
         if answer:
-            orchestrator.update_clarification(
+            updated = orchestrator.update_clarification(
                 task_id,
                 item.get("id"),
                 answer=answer,
                 status=ClarificationStatus.ANSWERED,
             )
             console.print("[green]Saved answer.[/]")
+            suggestions = updated.get("auto_scope_suggestions") or []
+            if suggestions:
+                console.print(
+                    Panel.fit(
+                        "\n".join(f"- {path}" for path in suggestions[:12]),
+                        title="Suggested scope paths",
+                    )
+                )
             handled = True
         else:
             if typer.confirm("Override/skip this question?", default=True):
@@ -1156,8 +1173,10 @@ def review_patches(
         if change_summary:
             console.print(f"[bold]Change summary:[/] {' '.join(change_summary)}\n")
 
-        console.print(Panel.fit(patch.diff, title=f"Patch {patch.id[:8]} ({patch.step_reference})"))
-        console.print(Panel.fit(patch.rationale, title="Rationale"))
+        diff_text = Text(patch.diff or "", no_wrap=False)
+        rationale_text = Text(patch.rationale or "", no_wrap=False)
+        console.print(Panel.fit(diff_text, title=f"Patch {patch.id[:8]} ({patch.step_reference})"))
+        console.print(Panel.fit(rationale_text, title="Rationale"))
         console.print("[yellow]⚠️  This patch will be applied to your repository only if you approve it.[/]")
         console.print("[dim]Currently, nothing has changed in your repo. Approve to apply the changes above.[/]\n")
         

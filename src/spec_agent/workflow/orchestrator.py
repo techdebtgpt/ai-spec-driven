@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 from datetime import datetime
 import json
+import re
 
 from ..config.settings import AgentSettings, get_settings
 from ..domain.models import (
@@ -34,7 +35,7 @@ from ..services.integrations.serena_client import SerenaToolClient
 from ..services.llm.openai_client import OpenAILLMClient
 from ..services.planning.clarifier import Clarifier
 from ..services.planning.plan_builder import PlanBuilder
-from ..services.patches.engine import PatchEngine
+from ..services.patches.engine import PatchEngine, EXTERNAL_PATCH_SENTINEL
 from ..services.specs.boundary_manager import BoundaryManager
 from ..services.planning.refactor_advisor import RefactorAdvisor
 from ..services.tests.suggester import TestSuggester
@@ -42,6 +43,77 @@ from ..tracing.reasoning_log import ReasoningLog
 
 
 LOG = logging.getLogger(__name__)
+
+SCOPE_STOPWORDS = {
+    "the",
+    "this",
+    "that",
+    "with",
+    "from",
+    "into",
+    "only",
+    "should",
+    "need",
+    "have",
+    "been",
+    "will",
+    "would",
+    "could",
+    "yes",
+    "no",
+    "and",
+    "for",
+    "are",
+    "not",
+    "use",
+    "using",
+    "used",
+    "table",
+    "tables",
+    "file",
+    "files",
+    "model",
+    "view",
+    "new",
+    "data",
+    "clean",
+    "dynamic",
+    "report",
+    "reports",
+    "endpoint",
+    "endpoints",
+    "url",
+    "urls",
+    "client",
+    "clients",
+    "secret",
+    "secrets",
+    "credential",
+    "credentials",
+    "environment",
+    "environments",
+    "env",
+    "dev",
+    "stage",
+    "staging",
+    "prod",
+    "production",
+    "aws",
+    "secretsmanager",
+    "manager",
+    "oauth",
+    "oauth2",
+}
+
+UNCERTAIN_ANSWER_PATTERNS = [
+    re.compile(r"\bi\s*don't\s*know\b", re.IGNORECASE),
+    re.compile(r"\bidk\b", re.IGNORECASE),
+    re.compile(r"\bno\s+idea\b", re.IGNORECASE),
+    re.compile(r"\bnot\s+sure\b", re.IGNORECASE),
+    re.compile(r"\bno\s+clue\b", re.IGNORECASE),
+    re.compile(r"\bremove\s+this\s+question\b", re.IGNORECASE),
+    re.compile(r"\bno\s+specific\b", re.IGNORECASE),
+]
 
 
 class TaskOrchestrator:
@@ -67,6 +139,7 @@ class TaskOrchestrator:
         self.patch_engine = PatchEngine(
             serena_client=self.serena_client,
             llm_client=self.llm_client,
+            prefer_external_edits=self.settings.prefer_external_edits,
         )
         self.test_suggester = TestSuggester(llm_client=self.llm_client)
 
@@ -254,16 +327,45 @@ class TaskOrchestrator:
         """
         Derive a human-friendly title + short summary from a free-form description.
 
-        - Title: first non-empty line (trimmed, max 80 chars)
-        - Summary: first line (trimmed, max 140 chars)
+        Use the first line as a fallback, but prefer an LLM-generated title when available.
         """
         raw = (description or "").strip()
         if not raw:
             return ("", "")
         first_line = raw.splitlines()[0].strip()
-        title = first_line[:80].rstrip()
-        summary = first_line[:140].rstrip()
-        return (title, summary)
+        fallback_title = first_line[:80].rstrip()
+        fallback_summary = first_line[:140].rstrip()
+
+        if not self.llm_client:
+            return (fallback_title, fallback_summary)
+
+        prompt = (
+            "You turn engineering change descriptions into concise task titles. "
+            "Respond ONLY with JSON: {\"title\": \"...\", \"summary\": \"...\"}. "
+            "Title requirements: 3-6 words, <= 32 characters, title case (e.g. 'OAuth2 Sign-In Fix'). "
+            "Summary requirements: <= 110 characters, one sentence. "
+            "Example input 'Implement OAuth 2 flow with refresh tokens' -> "
+            "{\"title\": \"OAuth2 Flow Update\", \"summary\": \"Add refresh-token support to the OAuth2 login flow\"}.\n\n"
+            f"Description:\n{description.strip()}"
+        )
+        try:
+            response = self.llm_client.complete(
+                system_prompt="You are a senior tech lead who writes concise task titles.",
+                user_prompt=prompt,
+                max_output_tokens=400,
+            )
+            payload = json.loads(response)
+            title = str(payload.get("title") or "").strip()
+            summary = str(payload.get("summary") or "").strip()
+            if title:
+                fallback_title = title[:80].rstrip()
+            if summary:
+                fallback_summary = summary[:140].rstrip()
+        except Exception:
+            # Silently fall back to the first-line heuristic if LLM fails.
+            pass
+
+        return (fallback_title, fallback_summary)
 
     def create_task_from_index(
         self,
@@ -272,11 +374,13 @@ class TaskOrchestrator:
         title: str | None = None,
         summary: str | None = None,
         client: str | None = None,
+        index_data: Optional[Dict[str, Any]] = None,
     ) -> Task:
         """
         Create a task using a previously indexed repository.
         """
-        index_data = self.store.load_repository_index()
+        if index_data is None:
+            index_data = self.store.load_repository_index()
 
         repo_path = Path(index_data["repo_path"])
         branch = index_data["branch"]
@@ -294,9 +398,11 @@ class TaskOrchestrator:
         )
 
         # Use the pre-computed summary from the index
+        git_info = index_data.get("git_info") or {}
         task.metadata["repository_summary"] = index_data["repository_summary"]
         task.metadata["starting_commit"] = index_data.get("starting_commit")
         task.metadata["description_snapshot"] = task.description
+        task.metadata["git_info"] = git_info
 
         # Generate clarifications based on the task description
         clarifications = self.clarifier.generate_questions(
@@ -352,10 +458,24 @@ class TaskOrchestrator:
             context_summary=summary
         )
 
+        git_info: Dict[str, Any] = {}
+        try:
+            git_info = {
+                "current_commit": self._current_commit(task.repo_path),
+                "current_branch": branch or self._get_current_branch(task.repo_path),
+                "remote_url": self._get_remote_url(task.repo_path),
+                "commit_author": self._get_commit_author(task.repo_path),
+                "commit_message": self._get_commit_message(task.repo_path),
+                "commit_date": self._get_commit_date(task.repo_path),
+            }
+        except Exception as exc:
+            git_info = {"error": str(exc)}
+
         task.metadata["repository_summary"] = summary
         task.metadata["clarifications"] = [asdict(item) for item in clarifications]
         task.metadata["starting_commit"] = self._current_commit(task.repo_path)
         task.metadata["description_snapshot"] = task.description
+        task.metadata["git_info"] = git_info
         self._snapshot_worktree_status(task)
 
         self._seed_context_from_description(task)
@@ -417,6 +537,12 @@ class TaskOrchestrator:
         """
         return self.store.load_repository_index_for_repo(repo_path.resolve(), branch)
 
+    def list_cached_indexes(self) -> List[Dict[str, Any]]:
+        """
+        Return all cached repository indexes.
+        """
+        return self.store.list_repository_indexes()
+
     def list_clarifications(self, task_id: str) -> List[Dict[str, Any]]:
         task = self._get_task(task_id)
         return task.metadata.get("clarifications", [])
@@ -445,6 +571,7 @@ class TaskOrchestrator:
                 item["status"] = status.value
                 if answer is not None:
                     item["answer"] = answer
+                self._maybe_attach_scope_suggestions(task, item, answer)
                 found = item
                 break
 
@@ -965,6 +1092,99 @@ class TaskOrchestrator:
         # Prefer stable order for debugging and deterministic tests.
         return sorted(set(results), key=lambda p: (p.count("/"), len(p), p))
 
+    @staticmethod
+    def _is_scope_question_text(question: str) -> bool:
+        ql = (question or "").lower()
+        return any(
+            key in ql
+            for key in (
+                "impacted",
+                "affected",
+                "in scope",
+                "out of scope",
+                "scope",
+                "files",
+                "directories",
+                "components",
+                "modules",
+            )
+        )
+
+    @staticmethod
+    def _answer_is_uncertain(answer: Optional[str]) -> bool:
+        text = (answer or "").strip()
+        if not text:
+            return True
+        for pattern in UNCERTAIN_ANSWER_PATTERNS:
+            if pattern.search(text):
+                return True
+        return False
+
+    @staticmethod
+    def _token_meets_scope_threshold(token: str) -> bool:
+        if not token:
+            return False
+        if len(token) >= 7:
+            return True
+        if any(ch in token for ch in ("_", ".", "-", "/")):
+            return True
+        if any(ch.isdigit() for ch in token):
+            return True
+        return False
+
+    @staticmethod
+    def _extract_generic_scope_tokens(text: str, stopwords: Optional[set[str]] = None) -> set[str]:
+        tokens: set[str] = set()
+        if not text:
+            return tokens
+        for raw in re.findall(r"[A-Za-z0-9_.-]{3,}", text):
+            cleaned = raw.strip(".,:;()[]{}\"'").lower()
+            if not cleaned:
+                continue
+            if stopwords and cleaned in stopwords:
+                continue
+            if cleaned in {"encrypt", "encrypted", "encryption"}:
+                continue
+            if not TaskOrchestrator._token_meets_scope_threshold(cleaned):
+                continue
+            tokens.add(cleaned)
+        return tokens
+
+    def _suggest_scope_targets(
+        self,
+        task: Task,
+        extra_terms: Optional[List[str]] = None,
+        limit: int = 8,
+    ) -> List[str]:
+        summary = task.metadata.get("repository_summary", {}) or {}
+        repo_path = task.repo_path.resolve()
+        tokens = set(extra_terms or [])
+        tokens |= self._extract_generic_scope_tokens(task.description or "", stopwords=SCOPE_STOPWORDS)
+        if not tokens:
+            return []
+        resolved = self._resolve_plan_targets_to_paths(repo_path, sorted(tokens), summary)
+        resolved_targets = list(resolved.get("resolved_targets") or [])
+        return resolved_targets[:limit]
+
+    def _maybe_attach_scope_suggestions(
+        self,
+        task: Task,
+        clarification: Dict[str, Any],
+        answer: Optional[str],
+    ) -> None:
+        if not self._is_scope_question_text(clarification.get("question") or ""):
+            clarification.pop("auto_scope_suggestions", None)
+            return
+        current_answer = answer if answer is not None else clarification.get("answer")
+        if self._answer_is_uncertain(current_answer):
+            suggestions = self._suggest_scope_targets(task)
+            if suggestions:
+                clarification["auto_scope_suggestions"] = suggestions
+            else:
+                clarification.pop("auto_scope_suggestions", None)
+        else:
+            clarification.pop("auto_scope_suggestions", None)
+
     def _resolve_plan_targets_to_paths(
         self,
         repo_path: Path,
@@ -995,6 +1215,8 @@ class TaskOrchestrator:
         resolved: List[str] = []
         unresolved: List[str] = []
         matches: Dict[str, List[str]] = {}
+        ordered_tokens: List[str] = []
+        search_tokens: List[str] = []
 
         def norm_token(value: str) -> str:
             return (
@@ -1014,6 +1236,106 @@ class TaskOrchestrator:
                 .replace("/", "")
                 .strip()
             )
+
+        def _should_search_token(value: str) -> bool:
+            if not value:
+                return False
+            lowered = value.lower()
+            if any(ch in value for ch in ("/", "\\")):
+                return True
+            if any(ch in value for ch in ("_", "-", ".")):
+                return True
+            if any(ch.isdigit() for ch in value):
+                return True
+            return len(lowered) >= 6
+
+        def _search_repo_for_tokens(tokens: List[str], limit_per_token: int = 6) -> Dict[str, List[str]]:
+            normalized = {token.lower(): token for token in tokens if token}
+            remaining = set(normalized.keys())
+            results: Dict[str, List[str]] = {token: [] for token in tokens}
+            if not remaining:
+                return results
+
+            try:
+                for path in repo_path.rglob("*"):
+                    if not remaining:
+                        break
+                    if ".git" in path.parts:
+                        continue
+                    if not path.is_file():
+                        continue
+                    rel = str(path.relative_to(repo_path)).replace("\\", "/")
+                    rel_lower = rel.lower()
+                    for norm in list(remaining):
+                        if norm in rel_lower:
+                            original = normalized.get(norm)
+                            if not original:
+                                continue
+                            hits = results.setdefault(original, [])
+                            if rel not in hits:
+                                hits.append(rel)
+                            if len(hits) >= limit_per_token:
+                                remaining.discard(norm)
+                    if not remaining:
+                        break
+            except OSError:
+                pass
+
+            return results
+
+        def _discover_keyword_files(keywords: List[str], limit: int = 12) -> List[str]:
+            lowered = []
+            for raw in keywords:
+                val = (raw or "").strip().lower()
+                if (
+                    not val
+                    or len(val) < 4
+                    or val in SCOPE_STOPWORDS
+                    or val.endswith(".tf")
+                ):
+                    continue
+                lowered.append(val)
+            if not lowered:
+                return []
+
+            noise_segments = (
+                "/.git/",
+                "/.serena/",
+                "/node_modules/",
+                "/.venv/",
+                "/.mypy_cache/",
+                "/__pycache__/",
+            )
+
+            matches: List[tuple[int, str]] = []
+            seen_paths: set[str] = set()
+            try:
+                for path in repo_path.rglob("*"):
+                    if not path.is_file():
+                        continue
+                    rel = str(path.relative_to(repo_path)).replace("\\", "/")
+                    rel_lower = rel.lower()
+                    if any(seg in rel_lower for seg in noise_segments):
+                        continue
+                    if rel_lower.endswith(".tf"):
+                        continue
+                    matched_tokens = [tok for tok in lowered if tok in rel_lower]
+                    if not matched_tokens:
+                        continue
+                    matches.append((len(matched_tokens), rel))
+            except OSError:
+                pass
+
+            matches.sort(key=lambda item: (-item[0], item[1].count("/"), len(item[1]), item[1]))
+            results: List[str] = []
+            for _, rel in matches:
+                if rel in seen_paths:
+                    continue
+                seen_paths.add(rel)
+                results.append(rel)
+                if len(results) >= limit:
+                    break
+            return results
 
         # Precompute candidate name map for faster matching.
         candidate_names = []
@@ -1228,14 +1550,31 @@ class TaskOrchestrator:
             # Keep a small, deterministic set of matches.
             local_matches = sorted(set(local_matches), key=lambda p: (p.count("/"), len(p), p))[:6]
             matches[t] = local_matches
+            ordered_tokens.append(t)
 
-            if local_matches:
-                resolved.extend(local_matches)
+            if not local_matches and _should_search_token(t):
+                search_tokens.append(t)
+
+        if search_tokens:
+            fallback_hits = _search_repo_for_tokens(search_tokens, limit_per_token=6)
+            for token, hits in fallback_hits.items():
+                if hits:
+                    matches[token] = sorted(set(hits), key=lambda p: (p.count("/"), len(p), p))[:6]
+
+        for token in ordered_tokens:
+            token_matches = matches.get(token) or []
+            if token_matches:
+                resolved.extend(token_matches)
             else:
-                unresolved.append(t)
+                unresolved.append(token)
 
         resolved_unique = sorted(set(resolved), key=lambda p: (p.count("/"), len(p), p))
         unresolved_unique = sorted(set(unresolved))
+
+        keyword_hits = _discover_keyword_files(raw_targets, limit=12)
+        for hit in keyword_hits:
+            if hit not in resolved_unique:
+                resolved_unique.append(hit)
 
         return {
             "raw_targets": list(raw_targets or []),
@@ -1285,67 +1624,7 @@ class TaskOrchestrator:
         #   can explode the allowlist (e.g., hundreds of unrelated Models).
         # - If boundary specs indicate a service-focused change (e.g. EncryptedService),
         #   bias toward /Services/ and /Configuration/ and avoid /Models/.
-        stopwords = {
-            "the",
-            "this",
-            "that",
-            "with",
-            "from",
-            "into",
-            "only",
-            "should",
-            "need",
-            "have",
-            "been",
-            "will",
-            "would",
-            "could",
-            "yes",
-            "no",
-            "and",
-            "for",
-            "are",
-            "not",
-            "use",
-            "using",
-            "used",
-            "table",
-            "tables",
-            "file",
-            "files",
-            "model",
-            "view",
-            "new",
-            "data",
-            "clean",
-            "dynamic",
-            "report",
-            "reports",
-            # Common config nouns that appear in many repos; keep them out of filename matching.
-            "endpoint",
-            "endpoints",
-            "url",
-            "urls",
-            "client",
-            "clients",
-            "secret",
-            "secrets",
-            "credential",
-            "credentials",
-            "environment",
-            "environments",
-            "env",
-            "dev",
-            "stage",
-            "staging",
-            "prod",
-            "production",
-            "aws",
-            "secretsmanager",
-            "manager",
-            "oauth",
-            "oauth2",
-        }
+        stopwords = set(SCOPE_STOPWORDS)
 
         specs = task.metadata.get("boundary_specs", []) or []
         spec_text = " ".join(str(s.get("boundary_name") or "") for s in specs if isinstance(s, dict)).lower()
@@ -1387,23 +1666,6 @@ class TaskOrchestrator:
         except Exception:
             pass
 
-        def _is_scope_question(q: str) -> bool:
-            ql = (q or "").lower()
-            return any(
-                k in ql
-                for k in (
-                    "impacted",
-                    "affected",
-                    "in scope",
-                    "out of scope",
-                    "scope",
-                    "files",
-                    "directories",
-                    "components",
-                    "modules",
-                )
-            )
-
         # Authoritative scope answers: treat answers to "scope" questions as the source
         # of truth for frozen scope, even if the tokens are short (e.g. "EncryptedService").
         authoritative_answers: list[str] = []
@@ -1418,7 +1680,7 @@ class TaskOrchestrator:
             if not answer:
                 continue
             question = (item.get("question") or "").strip()
-            if _is_scope_question(question):
+            if self._is_scope_question_text(question):
                 authoritative_answers.append(answer)
             else:
                 other_answers.append(answer)
@@ -1449,7 +1711,7 @@ class TaskOrchestrator:
                 if t in stopwords:
                     continue
                 # Heuristic: only keep "strong" tokens that are likely identifiers.
-                if not (len(t) >= 8 or any(ch in t for ch in ("_", ".", "-", "/")) or any(ch.isdigit() for ch in t)):
+                if not self._token_meets_scope_threshold(t):
                     continue
                 # Avoid overly generic encryption tokens unless they include "service"
                 # or are long composite identifiers.
@@ -1479,6 +1741,10 @@ class TaskOrchestrator:
                 tok = re.sub(r"[^A-Za-z0-9_-]+", "", p_norm)
                 if tok:
                     scope_candidates.add(tok.lower())
+
+        description_tokens = self._extract_generic_scope_tokens(task.description or "", stopwords=stopwords)
+        if description_tokens:
+            scope_candidates |= description_tokens
 
         if not scope_candidates:
             return []
@@ -2328,7 +2594,7 @@ class TaskOrchestrator:
         if isinstance(scoped_files, int):
             lines.append("## Scope")
             lines.append("")
-            lines.append(f"- **Scoped files**: {scoped_files} (repo: {repo_files})")
+            lines.append(f"- **Total files (scoped)**: {scoped_files} (repo: {repo_files})")
             # Show a compact, human-readable scope summary instead of dumping many roots.
             impact = (bounded.get('impact') or {}) if isinstance(bounded, dict) else {}
             top_dirs = impact.get("top_directories") or []
@@ -2753,6 +3019,12 @@ class TaskOrchestrator:
         patch = self._require_patch(patches, patch_id)
         if patch.status != PatchStatus.PENDING:
             raise ValueError("Patch has already been processed.")
+
+        if patch.diff.startswith(EXTERNAL_PATCH_SENTINEL):
+            raise ValueError(
+                f"Patch {patch.id} requires external edits. Apply the change in your editor and run "
+                f"`./spec-agent sync-external {task.id} --patch-id {patch.id}` to capture the diff."
+            )
 
         self._ensure_branch(task.repo_path, task.branch)
         self._apply_patch_diff(task.repo_path, patch.diff)

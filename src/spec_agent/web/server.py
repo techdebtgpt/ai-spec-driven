@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlparse
 from ..config.settings import get_settings
 from ..domain.models import LogEntry, Task, TaskStatus
 from ..persistence.store import JsonStore
+from ..services.patches.engine import EXTERNAL_PATCH_SENTINEL
 
 
 def _utcnow() -> datetime:
@@ -58,6 +59,9 @@ def _render_plan_markdown(task: Task) -> str:
     dashboard process' accessible filesystem.
     """
     meta = task.metadata if isinstance(task.metadata, dict) else {}
+    repo_summary = meta.get("repository_summary") or {}
+    if not isinstance(repo_summary, dict):
+        repo_summary = {}
     plan_preview = meta.get("plan_preview") or {}
     if not isinstance(plan_preview, dict):
         plan_preview = {}
@@ -76,6 +80,38 @@ def _render_plan_markdown(task: Task) -> str:
     lines.append(f"- **Repo**: `{task.repo_path}`")
     lines.append(f"- **Branch**: `{task.branch}`")
     lines.append("")
+
+    repo_summary = meta.get("repository_summary") or {}
+    snapshot_lines: list[str] = []
+    languages = repo_summary.get("top_languages") or []
+    if languages:
+        snapshot_lines.append(f"- Languages: {', '.join(languages[:5])}")
+    modules = repo_summary.get("top_modules") or []
+    if modules:
+        module_names = [str(m).split('(', 1)[0].strip() for m in modules[:5]]
+        snapshot_lines.append(f"- Key modules: {', '.join(module_names)}")
+    hotspots = repo_summary.get("hotspots") or []
+    if hotspots:
+        hotspot_names = [h.get("path") for h in hotspots if h.get("path")]
+        if hotspot_names:
+            snapshot_lines.append(f"- Hotspots: {', '.join(hotspot_names[:5])}")
+    tests_flag = repo_summary.get("has_tests")
+    if tests_flag is not None:
+        snapshot_lines.append(f"- Tests detected: {'yes' if tests_flag else 'no'}")
+    scoped = (repo_summary.get("scoped_context") or {})
+    impact = scoped.get("impact") or {}
+    directories = impact.get("top_directories") or []
+    if directories:
+        snapshot_lines.append(f"- Scoped directories: {', '.join(directories[:6])}")
+    files_sample = impact.get("files_sample") or []
+    if files_sample:
+        sample_list = ", ".join(files_sample[:6])
+        snapshot_lines.append(f"- Sample files: {sample_list}")
+    if snapshot_lines:
+        lines.append("## Repository snapshot")
+        lines.append("")
+        lines.extend(snapshot_lines)
+        lines.append("")
 
     desc = (task.description or "").strip()
     lines.append("## Change request")
@@ -477,6 +513,22 @@ def _infer_workflow(task: Task, logs: list[LogEntry]) -> list[Dict[str, Any]]:
     pending_specs_count = len(pending_specs) if isinstance(pending_specs, list) else 0
     plan_approved = bool(task.metadata.get("plan_approved")) if isinstance(task.metadata, dict) else False
     patches = _patch_counts(task)
+    external_patch_pending = False
+    if isinstance(task.metadata, dict):
+        patch_queue = task.metadata.get("patch_queue_state")
+        if isinstance(patch_queue, list):
+            for patch in patch_queue:
+                if not isinstance(patch, dict):
+                    continue
+                status = str(patch.get("status") or "").strip().upper()
+                if status and status != "PENDING":
+                    continue
+                if patch.get("applied_diff"):
+                    continue
+                diff_text = str(patch.get("diff") or "")
+                if diff_text.startswith(EXTERNAL_PATCH_SENTINEL):
+                    external_patch_pending = True
+                    break
 
     def _dur(a: datetime | None, b: datetime | None) -> float | None:
         if not a or not b:
@@ -539,6 +591,8 @@ def _infer_workflow(task: Task, logs: list[LogEntry]) -> list[Dict[str, Any]]:
             started_at, ended_at = codegen_start, codegen_end
             if patches.get("total", 0) > 0:
                 chips.append({"kind": "neutral", "text": f"{patches['total']} patches"})
+            if external_patch_pending:
+                chips.append({"kind": "warning", "text": "External edit required"})
 
         status = "pending"
         if done:
@@ -860,6 +914,7 @@ body{
 .taskCard:hover{border-color:rgba(59,130,246,.35)}
 .taskCard.selected{outline:2px solid rgba(59,130,246,.35)}
 .taskRow{display:flex; align-items:center; justify-content:space-between; gap:10px}
+.timeLabel{color:#cbd5ff;font-size:12px}
 .taskTitle{
   font-size:13px;
   font-weight:650;
@@ -951,6 +1006,48 @@ body{
 .taskHeroTop{display:flex; align-items:flex-start; justify-content:space-between; gap:12px}
 .taskHeroTitle{font-weight:800; font-size:16px; color:#f1f5f9}
 .taskHeroDesc{margin-top:8px; color:var(--muted); font-size:13px; line-height:1.5}
+.overviewHero{
+  border:1px solid var(--border);
+  background:rgba(10,16,32,.55);
+  border-radius:12px;
+  padding:12px 14px;
+  margin-bottom:16px;
+}
+.overviewTitle{font-weight:700; font-size:15px; color:#f1f5f9}
+.overviewSubtitle{margin-top:6px; font-size:12px; color:var(--muted)}
+.overviewGrid{
+  display:grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap:10px;
+  margin-bottom:16px;
+}
+.infoCard{
+  border:1px solid var(--border);
+  background:rgba(11,17,32,.5);
+  border-radius:10px;
+  padding:10px 12px;
+}
+.infoLabel{font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em}
+.infoValue{margin-top:4px; font-size:13px; color:#e2e8f0}
+.ctaBox{
+  border:1px solid rgba(124,58,237,.45);
+  background:rgba(79,70,229,.12);
+  border-radius:12px;
+  padding:12px 14px;
+  margin-top:12px;
+  font-size:13px;
+  color:#e2e8f0;
+}
+.copyBtn{
+  margin-top:10px;
+  padding:6px 10px;
+  border-radius:8px;
+  border:1px solid rgba(124,58,237,.6);
+  background:rgba(124,58,237,.2);
+  color:#e5e7eb;
+  font-size:12px;
+  cursor:pointer;
+}
 .prio{
   font-size:11px;
   font-weight:800;
@@ -1101,6 +1198,191 @@ let state = {
 
 const $ = (id) => document.getElementById(id);
 
+function resolveTaskTitle(task) {
+  if (!task) return 'Untitled';
+  const raw = (task.title && task.title.trim())
+    || (task.summary && task.summary.trim())
+    || ((task.description || '').split(/\n/)[0] || '').trim();
+  if (!raw) return 'Untitled';
+  return raw.length > 42 ? raw.slice(0, 39) + '…' : raw;
+}
+
+function fmtCount(value) {
+  if (typeof value === 'number' && !Number.isNaN(value)) {
+    return value.toLocaleString();
+  }
+  return '—';
+}
+
+function renderOverview(container, task, detail) {
+  const data = detail || {};
+  const gitInfo = data.git_info || {};
+  const hero = document.createElement('div');
+  hero.className = 'overviewHero';
+  const title = document.createElement('div');
+  title.className = 'overviewTitle';
+  title.textContent = data.repo_path || task.repo_path || '—';
+  const subtitle = document.createElement('div');
+  subtitle.className = 'overviewSubtitle';
+  const clientLabel = (task.client && String(task.client).trim()) ? task.client : 'CLI';
+  subtitle.textContent = `${clientLabel} · ${data.branch || task.branch || '—'}`;
+  hero.appendChild(title);
+  hero.appendChild(subtitle);
+  container.appendChild(hero);
+
+  const metricsGrid = document.createElement('div');
+  metricsGrid.className = 'overviewGrid';
+  const metrics = [
+    { label: 'Files indexed', value: fmtCount(data.file_count) },
+    { label: 'Directories', value: fmtCount(data.directory_count) },
+    { label: 'Tests detected', value: data.has_tests ? 'Yes' : 'Not detected' },
+  ];
+  metrics.forEach(item => {
+    const card = document.createElement('div');
+    card.className = 'infoCard';
+    const k = document.createElement('div');
+    k.className = 'infoLabel';
+    k.textContent = item.label;
+    const v = document.createElement('div');
+    v.className = 'infoValue';
+    v.textContent = item.value;
+    card.appendChild(k);
+    card.appendChild(v);
+    metricsGrid.appendChild(card);
+  });
+  container.appendChild(metricsGrid);
+
+  const contextGrid = document.createElement('div');
+  contextGrid.className = 'overviewGrid';
+  const contextItems = [
+    { label: 'Primary languages', value: (data.languages || []).join(', ') || '—' },
+    { label: 'Frameworks', value: (data.frameworks || []).join(', ') || '—' },
+    { label: 'Top modules', value: (data.top_modules || []).join(', ') || '—' },
+    { label: 'Top directories', value: (data.top_directories || []).join(', ') || '—' },
+  ];
+  if (gitInfo.current_commit) {
+    contextItems.push({ label: 'Commit', value: String(gitInfo.current_commit).slice(0, 12) });
+  }
+  if (gitInfo.commit_author) {
+    contextItems.push({ label: 'Author', value: gitInfo.commit_author });
+  }
+  if (gitInfo.commit_message) {
+    const msg = String(gitInfo.commit_message);
+    contextItems.push({
+      label: 'Commit message',
+      value: msg.length > 80 ? msg.slice(0, 77) + '…' : msg
+    });
+  }
+  if (gitInfo.remote_url) {
+    contextItems.push({ label: 'Remote', value: gitInfo.remote_url });
+  }
+  if (gitInfo.commit_date) {
+    contextItems.push({ label: 'Commit date', value: gitInfo.commit_date });
+  }
+  const hotspotSummary = (data.hotspots || []).map(h => h.path || '').filter(Boolean).slice(0,3).join(', ');
+  contextItems.push({ label: 'Hotspots', value: hotspotSummary || '—' });
+  contextItems.forEach(item => {
+    const card = document.createElement('div');
+    card.className = 'infoCard';
+    const k = document.createElement('div');
+    k.className = 'infoLabel';
+    k.textContent = item.label;
+    const v = document.createElement('div');
+    v.className = 'infoValue';
+    v.textContent = item.value;
+    card.appendChild(k);
+    card.appendChild(v);
+    contextGrid.appendChild(card);
+  });
+  container.appendChild(contextGrid);
+
+  const scopeTitle = document.createElement('div');
+  scopeTitle.className = 'sectionTitle';
+  scopeTitle.textContent = 'Scoped directories';
+  container.appendChild(scopeTitle);
+  const scopeMeta = document.createElement('div');
+  scopeMeta.className = 'small';
+  const scopeCount = typeof data.scope_file_count === 'number' ? data.scope_file_count : (data.files_sample || []).length;
+  scopeMeta.textContent = `${scopeCount || 0} file(s) in scope`;
+  container.appendChild(scopeMeta);
+  const scopeList = data.scoped_directories && data.scoped_directories.length ? data.scoped_directories : (data.files_sample || []);
+  scopeList.slice(0, 12).forEach(item => {
+    const row = document.createElement('div');
+    row.className = 'fileRow';
+    row.textContent = item;
+    container.appendChild(row);
+  });
+
+  const hotspots = data.hotspots || [];
+  if (hotspots.length) {
+    const sec = document.createElement('div');
+    sec.className = 'sectionTitle';
+    sec.textContent = 'Hotspots';
+    container.appendChild(sec);
+    hotspots.slice(0, 6).forEach(h => {
+      const row = document.createElement('div');
+      row.className = 'fileRow';
+      const reason = h.reason ? ` · ${h.reason}` : '';
+      row.textContent = `${h.path || '—'}${reason}`;
+      container.appendChild(row);
+    });
+  }
+
+  const tests = data.test_paths_sample || [];
+  if (tests.length) {
+    const sec = document.createElement('div');
+    sec.className = 'sectionTitle';
+    sec.textContent = 'Test files (sample)';
+    container.appendChild(sec);
+    tests.slice(0, 8).forEach(t => {
+      const row = document.createElement('div');
+      row.className = 'fileRow';
+      row.textContent = t;
+      container.appendChild(row);
+    });
+  }
+
+  if (data.clarifications) {
+    const clar = document.createElement('div');
+    clar.className = 'sectionTitle';
+    clar.textContent = 'Clarifications';
+    container.appendChild(clar);
+    const summary = document.createElement('div');
+    summary.className = 'small';
+    summary.textContent = `${data.clarifications.answered || 0} answered · ${data.clarifications.pending || 0} pending`;
+    container.appendChild(summary);
+  }
+
+  if (data.external_patches && data.external_patches.length) {
+    const extTitle = document.createElement('div');
+    extTitle.className = 'sectionTitle';
+    extTitle.textContent = 'External edits required';
+    container.appendChild(extTitle);
+    data.external_patches.slice(0, 4).forEach(p => {
+      const box = document.createElement('div');
+      box.className = 'ctaBox';
+      const info = document.createElement('div');
+      info.innerHTML = `<strong>${p.step_reference || 'Patch'}</strong><br/>Apply externally, then sync.`;
+      box.appendChild(info);
+      if (p.instructions) {
+        const txt = document.createElement('div');
+        txt.className = 'small';
+        txt.style.marginTop = '6px';
+        txt.textContent = p.instructions;
+        box.appendChild(txt);
+      }
+      if (p.sync_command) {
+        const btn = document.createElement('button');
+        btn.className = 'copyBtn';
+        btn.textContent = 'Copy sync command';
+        btn.onclick = () => copyText(p.sync_command, btn);
+        box.appendChild(btn);
+      }
+      container.appendChild(box);
+    });
+  }
+}
+
 function parseRangeToMinutes(range) {
   if (range === '5m') return 5;
   if (range === '1h') return 60;
@@ -1193,13 +1475,13 @@ function renderTasks() {
     const title = document.createElement('div');
     title.className = 'taskTitle';
     const clientLabel = (t.client && String(t.client).trim()) ? t.client : 'CLI';
-    title.textContent = `${clientLabel} · ${t.title}`;
+    const shortTitle = resolveTaskTitle(t);
+    title.textContent = `${clientLabel} · ${shortTitle}`;
     left.appendChild(dot);
     left.appendChild(title);
 
     const right = document.createElement('div');
-    right.style.color = 'var(--muted)';
-    right.style.fontSize = '12px';
+    right.className = 'timeLabel';
     right.textContent = fmtAgo(t.updated_at, nowIso);
 
     row.appendChild(left);
@@ -1309,7 +1591,24 @@ function renderWorkflow(task, workflow) {
 function renderDetails(task, step, detail) {
   const el = $('detailsBody');
   el.innerHTML = '';
-  if (!task || !step) {
+  if (!task) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'Select a task to view details';
+    el.appendChild(empty);
+    return;
+  }
+
+  const cached = (state.selectedTaskData && state.selectedTaskData.step_details) || {};
+  let currentStep = step || { key: 'OVERVIEW', label: 'Task overview', status: 'info' };
+  let d = detail || cached[currentStep.key] || {};
+
+  if (currentStep.key === 'OVERVIEW') {
+    renderOverview(el, task, d);
+    return;
+  }
+
+  if (!step) {
     const empty = document.createElement('div');
     empty.className = 'empty';
     empty.textContent = 'Select a step to view details';
@@ -1323,19 +1622,19 @@ function renderDetails(task, step, detail) {
   const h1 = document.createElement('div');
   h1.style.fontWeight = '700';
   h1.style.fontSize = '14px';
-  h1.textContent = step.label;
+  h1.textContent = currentStep.label;
   const h2 = document.createElement('div');
   h2.className = 'small';
-  const dur = typeof step.duration_seconds === 'number' ? `${Math.round(step.duration_seconds * 10) / 10}s` : '—';
-  h2.textContent = `${dur} · ${step.status.toUpperCase()}`;
+  const dur = typeof currentStep.duration_seconds === 'number' ? `${Math.round(currentStep.duration_seconds * 10) / 10}s` : '—';
+  h2.textContent = `${dur} · ${currentStep.status.toUpperCase()}`;
   head.appendChild(h1);
   head.appendChild(h2);
   el.appendChild(head);
 
-  const d = detail || {};
+  d = d || {};
 
   // Step-specific rendering (mockup-style)
-  if (step.key === 'TASK_SPECIFICATION') {
+  if (currentStep.key === 'TASK_SPECIFICATION') {
     const hero = document.createElement('div');
     hero.className = 'taskHero';
 
@@ -1388,7 +1687,7 @@ function renderDetails(task, step, detail) {
     return;
   }
 
-  if (step.key === 'CLARIFYING') {
+  if (currentStep.key === 'CLARIFYING') {
     const items = d.items || [];
     const summary = document.createElement('div');
     summary.className = 'small';
@@ -1431,7 +1730,7 @@ function renderDetails(task, step, detail) {
     return;
   }
 
-  if (step.key === 'PLANNING') {
+  if (currentStep.key === 'PLANNING') {
     if (d.plan_approved) {
       const banner = document.createElement('div');
       banner.className = 'banner';
@@ -1488,7 +1787,7 @@ function renderDetails(task, step, detail) {
     return;
   }
 
-  if (step.key === 'APPROVAL') {
+  if (currentStep.key === 'APPROVAL') {
     const banner = document.createElement('div');
     banner.className = d.plan_approved ? 'banner' : 'banner warn';
     banner.textContent = d.plan_approved ? 'Plan approved' : 'Plan not approved yet';
@@ -1640,7 +1939,7 @@ function renderDetails(task, step, detail) {
     return;
   }
 
-  if (step.key === 'CODEGEN') {
+  if (currentStep.key === 'CODEGEN') {
     const patches = d.patches || [];
     const pending = (patches || []).filter(p => p.status === 'PENDING');
     const banner = document.createElement('div');
@@ -1688,6 +1987,29 @@ function renderDetails(task, step, detail) {
       });
       el.appendChild(list);
 
+      if (chosen && chosen.requires_external) {
+        const cta = document.createElement('div');
+        cta.className = 'ctaBox';
+        const msg = document.createElement('div');
+        msg.innerHTML = `<strong>External edit required</strong><br/>Apply this step in your editor, then sync the diff.`;
+        cta.appendChild(msg);
+        if (chosen.external_instructions) {
+          const txt = document.createElement('div');
+          txt.className = 'small';
+          txt.style.marginTop = '6px';
+          txt.textContent = chosen.external_instructions;
+          cta.appendChild(txt);
+        }
+        if (chosen.sync_command) {
+          const btn = document.createElement('button');
+          btn.className = 'copyBtn';
+          btn.textContent = 'Copy sync command';
+          btn.onclick = () => copyText(chosen.sync_command, btn);
+          cta.appendChild(btn);
+        }
+        el.appendChild(cta);
+      }
+
       const pre = document.createElement('pre');
       pre.className = 'diff';
       pre.textContent = (chosen && chosen.diff) ? chosen.diff : '—';
@@ -1700,6 +2022,23 @@ function renderDetails(task, step, detail) {
   fallback.className = 'small';
   fallback.textContent = 'No renderer for this step yet.';
   el.appendChild(fallback);
+}
+
+async function copyText(value, btn) {
+  if (!value) return;
+  const previous = btn ? btn.textContent : null;
+  try {
+    await navigator.clipboard.writeText(value);
+    if (btn) {
+      btn.textContent = 'Copied!';
+      setTimeout(() => btn.textContent = previous || 'Copy', 1200);
+    }
+  } catch (e) {
+    if (btn) {
+      btn.textContent = 'Copy failed';
+      setTimeout(() => btn.textContent = previous || 'Copy', 1200);
+    }
+  }
 }
 
 async function fetchState() {
@@ -1715,8 +2054,11 @@ async function loadTask(taskId) {
   if (!res.ok) return;
   const data = await res.json();
   state.selectedTaskData = data;
+  state.selectedPatchId = null;
   renderWorkflow(data.task, data.workflow);
-  renderDetails(data.task, null, null);
+  state.selectedStepKey = null;
+  const overview = (data.step_details && data.step_details.OVERVIEW) ? data.step_details.OVERVIEW : null;
+  renderDetails(data.task, { key: 'OVERVIEW', label: 'Task overview', status: 'info' }, overview);
 }
 
 function wireUI() {
@@ -1746,21 +2088,24 @@ async function tick() {
     renderTasks();
 
     // Keep selected task view fresh
-    if (state.selectedTaskId) {
-      const res = await fetch(`/api/task/${encodeURIComponent(state.selectedTaskId)}`, { cache: 'no-store' });
-      if (res.ok) {
-        const tdata = await res.json();
-        state.selectedTaskData = tdata;
-        renderWorkflow(tdata.task, tdata.workflow);
-        if (state.selectedStepKey) {
-          const step = (tdata.workflow || []).find(s => s.key === state.selectedStepKey);
-          if (step) {
-            const detail = (tdata.step_details || {})[step.key] || null;
-            renderDetails(tdata.task, step, detail);
+      if (state.selectedTaskId) {
+        const res = await fetch(`/api/task/${encodeURIComponent(state.selectedTaskId)}`, { cache: 'no-store' });
+        if (res.ok) {
+          const tdata = await res.json();
+          state.selectedTaskData = tdata;
+          renderWorkflow(tdata.task, tdata.workflow);
+          if (state.selectedStepKey) {
+            const step = (tdata.workflow || []).find(s => s.key === state.selectedStepKey);
+            if (step) {
+              const detail = (tdata.step_details || {})[step.key] || null;
+              renderDetails(tdata.task, step, detail);
+            }
+          } else {
+            const overview = (tdata.step_details && tdata.step_details.OVERVIEW) ? tdata.step_details.OVERVIEW : null;
+            renderDetails(tdata.task, { key: 'OVERVIEW', label: 'Task overview', status: 'info' }, overview);
           }
         }
       }
-    }
   } catch (e) {
     // If state dir missing, etc.
     console.warn(e);
@@ -1972,6 +2317,7 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
     files_sample_clean = [f for f in files_sample if f and not _is_noise(f)]
 
     patches_raw = meta.get("patch_queue_state") or []
+    external_patch_notes: list[Dict[str, str]] = []
     patches: list[Dict[str, Any]] = []
     files_touched: list[str] = []
     if isinstance(patches_raw, list):
@@ -1979,21 +2325,42 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
             if not isinstance(p, dict):
                 continue
             applied_diff = p.get("applied_diff")
-            diff = str(applied_diff or p.get("diff") or "")
+            raw_diff = str(p.get("diff") or "")
+            diff = str(applied_diff or raw_diff)
+            patch_id = str(p.get("id") or "")
+            step_reference = str(p.get("step_reference") or "")
+            requires_external = bool(not applied_diff and raw_diff.startswith(EXTERNAL_PATCH_SENTINEL))
+            sync_command = ""
+            external_message = ""
+            if requires_external:
+                external_message = raw_diff[len(EXTERNAL_PATCH_SENTINEL) :].strip()
+                diff = external_message or diff or "External edit required."
+                sync_command = f"./spec-agent sync-external {task.id} --patch-id {patch_id}"
+                external_patch_notes.append(
+                    {
+                        "patch_id": patch_id,
+                        "step_reference": step_reference,
+                        "sync_command": sync_command,
+                        "instructions": external_message,
+                    }
+                )
             for f in _extract_files_from_diff(diff):
                 if f not in files_touched:
                     files_touched.append(f)
             patches.append(
                 {
-                    "id": str(p.get("id") or ""),
+                    "id": patch_id,
                     "status": str(p.get("status") or ""),
                     "kind": str(p.get("kind") or ""),
-                    "step_reference": str(p.get("step_reference") or ""),
+                    "step_reference": step_reference,
                     "diff": diff,
                     "rationale": str(p.get("rationale") or ""),
                     "applied_via": str(p.get("applied_via") or ""),
                     "applied_at": p.get("applied_at"),
                     "has_applied_diff": bool(applied_diff),
+                    "requires_external": requires_external,
+                    "sync_command": sync_command,
+                    "external_instructions": external_message,
                 }
             )
 
@@ -2005,7 +2372,72 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
         raw = raw[:12_000] + "\n\n… (preview truncated)\n"
     plan_md_preview: str | None = raw
 
+    repo_summary = meta.get("repository_summary") or {}
+    if not isinstance(repo_summary, dict):
+        repo_summary = {}
+    languages = repo_summary.get("top_languages") or []
+    if not isinstance(languages, list):
+        languages = []
+    frameworks = repo_summary.get("frameworks") or []
+    if not isinstance(frameworks, list):
+        frameworks = []
+    hotspots = repo_summary.get("hotspots") or []
+    if not isinstance(hotspots, list):
+        hotspots = []
+    hotspot_items: list[Dict[str, Any]] = []
+    for item in hotspots:
+        if not isinstance(item, dict):
+            continue
+        hotspot_items.append(
+            {
+                "path": str(item.get("path") or ""),
+                "reason": str(item.get("reason") or ""),
+                "lines": item.get("lines"),
+            }
+        )
+    top_modules_summary = repo_summary.get("top_modules") or []
+    if not isinstance(top_modules_summary, list):
+        top_modules_summary = []
+    top_dirs_summary = repo_summary.get("top_directories") or []
+    if not isinstance(top_dirs_summary, list):
+        top_dirs_summary = []
+    test_sample = repo_summary.get("test_paths_sample") or []
+    if not isinstance(test_sample, list):
+        test_sample = []
+    git_info = meta.get("git_info") or {}
+    if not isinstance(git_info, dict):
+        git_info = {}
+
+    overview = {
+        "repo_path": str(task.repo_path),
+        "branch": task.branch,
+        "client": (task.client or "").strip(),
+        "languages": languages[:5],
+        "frameworks": frameworks[:5],
+        "has_tests": bool(repo_summary.get("has_tests")),
+        "hotspots": [h for h in hotspot_items if h.get("path")][:8],
+        "scoped_directories": (impact.get("top_directories") or [])[:8],
+        "files_sample": files_sample_clean[:12],
+        "scope_file_count": len(allowed_files) if allowed_files else len(files_sample_clean),
+        "clarifications": {"answered": answered, "pending": pending},
+        "external_patches": external_patch_notes[:8],
+        "file_count": repo_summary.get("file_count"),
+        "directory_count": repo_summary.get("directory_count"),
+        "top_modules": top_modules_summary[:6],
+        "top_directories": top_dirs_summary[:6],
+        "test_paths_sample": test_sample[:10],
+        "git_info": {
+            "current_commit": git_info.get("current_commit"),
+            "commit_message": git_info.get("commit_message"),
+            "commit_author": git_info.get("commit_author"),
+            "commit_date": git_info.get("commit_date"),
+            "remote_url": git_info.get("remote_url"),
+            "current_branch": git_info.get("current_branch") or task.branch,
+        },
+    }
+
     return {
+        "OVERVIEW": overview,
         "TASK_SPECIFICATION": {
             "title": _task_title(task),
             "description": (task.description or "").strip(),
@@ -2129,5 +2561,3 @@ def run_dashboard_server(*, host: str = "127.0.0.1", port: int = 8844) -> None:
         httpd.serve_forever(poll_interval=0.25)
     finally:
         httpd.server_close()
-
-

@@ -166,11 +166,12 @@ class ContextIndexer:
                     if len(test_paths_sample) < 10:
                         test_paths_sample.append(rel_str)
 
-            line_count = self._count_lines(path)
-            if line_count >= self.settings.hotspot_loc_threshold:
-                hotspots.append(
-                    {"path": str(relative_path), "reason": f"{line_count} LOC", "lines": line_count}
-                )
+            if path.suffix.lower() not in {".dll", ".exe"}:
+                line_count = self._count_lines(path)
+                if line_count >= self.settings.hotspot_loc_threshold:
+                    hotspots.append(
+                        {"path": str(relative_path), "reason": f"{line_count} LOC", "lines": line_count}
+                    )
 
             if language in {"python", "typescript"}:
                 imports = self._extract_imports(path)
@@ -280,6 +281,21 @@ class ContextIndexer:
         # Detect frameworks based on common patterns
         frameworks = self._detect_frameworks(repo_path)
         
+        # Determine project type with heuristics around detected frameworks/languages.
+        project_type = serena_project_type
+        if project_type:
+            project_type = project_type.strip()
+            if project_type.lower() == "node.js" and ".NET" in frameworks:
+                project_type = ".NET"
+            elif ".net" not in project_type.lower() and ".NET" in frameworks:
+                project_type = ".NET"
+        if not project_type and ".NET" in frameworks:
+            project_type = ".NET"
+        if not project_type and language_hits.get("csharp"):
+            project_type = ".NET"
+        if project_type and project_type.lower() == "node.js" and not frameworks:
+            project_type = None
+
         # Build comprehensive response with enhanced data
         return {
             # Basic counts
@@ -294,7 +310,7 @@ class ContextIndexer:
             "all_languages": list(language_hits.keys()),
             
             # Project type and structure
-            "project_type": serena_project_type,
+            "project_type": project_type,
             "frameworks": frameworks,
             "top_file_extensions": [f"{ext} ({count})" for ext, count in extension_hits.most_common(10)],
             "has_tests": bool(has_tests),
