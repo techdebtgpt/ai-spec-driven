@@ -66,6 +66,10 @@ spec-agent --help
 ./spec-agent approve-plan <task-id>
 ./spec-agent generate-patches <task-id>
 
+# NOTE: When Serena code generation is disabled, the patch queue will emit
+# "EXTERNAL_EDIT_REQUIRED" entries. Apply those steps in your editor and sync:
+# ./spec-agent sync-external <task-id> --patch-id <patch-id>
+
 # 7) Review/apply patches
 ./spec-agent patches <task-id>
 
@@ -226,6 +230,7 @@ To isolate state (per repo / branch / session), set:
 - `SPEC_AGENT_SERENA_ENABLED=1`
 - `SPEC_AGENT_SERENA_COMMAND="python $(pwd)/scripts/serena_patch_wrapper.py"`
 - `SPEC_AGENT_SERENA_TIMEOUT=120`
+- `SPEC_AGENT_EXTERNAL_EDITS_ONLY=1` to skip placeholder files and require `sync-external` for every patch
 
 Delegate used by the wrapper (recommended):
 
