@@ -1050,11 +1050,11 @@ class ChatSession:
         console.print()
         console.print("  [cyan]1.[/] Approve plan")
         console.print("  [cyan]2.[/] Reject and regenerate plan")
-        console.print("  [cyan]3.[/] View boundary specs (details)")
-        console.print("  [cyan]4.[/] Return to main menu")
+        # console.print("  [cyan]3.[/] View boundary specs (details)")  # HIDDEN
+        console.print("  [cyan]3.[/] Return to main menu")
         console.print()
 
-        choice = self._ask_menu_choice("Choice", ["1", "2", "3", "4"], "1")
+        choice = self._ask_menu_choice("Choice", ["1", "2", "3"], "1")
 
         if choice == "1":
             try:
@@ -1098,16 +1098,17 @@ class ChatSession:
                     return
 
                 # FINAL stage: approve + export + optional patches
-                specs = self.orchestrator.get_boundary_specs(self.current_task.id)
-                pending = [s for s in (specs or []) if s.get("status") == "PENDING"]
-                if pending:
-                    console.print()
-                    console.print(
-                        f"[yellow]{len(pending)} boundary spec(s) are still pending.[/]\n"
-                        "[dim]Resolve or skip them before approving the final plan.[/]"
-                    )
-                    self.state = ConversationState.REVIEWING_SPECS
-                    return
+                # HIDDEN: Boundary spec check disabled
+                # specs = self.orchestrator.get_boundary_specs(self.current_task.id)
+                # pending = [s for s in (specs or []) if s.get("status") == "PENDING"]
+                # if pending:
+                #     console.print()
+                #     console.print(
+                #         f"[yellow]{len(pending)} boundary spec(s) are still pending.[/]\n"
+                #         "[dim]Resolve or skip them before approving the final plan.[/]"
+                #     )
+                #     self.state = ConversationState.REVIEWING_SPECS
+                #     return
 
                 self.orchestrator.approve_plan(self.current_task.id)
                 console.print("[green]✓[/] Plan approved!")
@@ -1295,128 +1296,128 @@ class ChatSession:
                 console.print("[yellow]Falling back to plan regeneration...[/]")
                 self.state = ConversationState.PLANNING
         elif choice == "3":
-            # Show spec details but don't require approval
-            self._show_spec_details()
-        elif choice == "4":
+            # HIDDEN: Was "View spec details", now "Return to main menu"
+            # self._show_spec_details()
             self.state = ConversationState.MAIN_MENU
 
-    def _show_spec_details(self) -> None:
-        """Show detailed boundary specifications for information only."""
-        if not self.current_task:
-            return
-
-        specs = self.orchestrator.get_boundary_specs(self.current_task.id)
-
-        if not specs:
-            console.print()
-            console.print("[yellow]No boundary specifications found.[/]")
-            return
-
-        for i, spec in enumerate(specs, 1):
-            console.print()
-            console.print("=" * 70)
-            console.print(f"[bold cyan]Boundary Spec {i}/{len(specs)}: {spec.get('boundary_name')}[/]")
-            console.print("=" * 70)
-            console.print()
-
-            console.print("[bold]Description:[/]")
-            console.print(spec.get('human_description', 'No description'))
-            console.print()
-
-            console.print("[bold]Mermaid Diagram:[/]")
-            console.print(f"[dim]{spec.get('diagram_text', 'No diagram')}[/]")
-            console.print()
-
-            machine_spec = spec.get('machine_spec', {})
-            console.print("[bold]Machine Spec:[/]")
-            console.print(f"  Actors: {', '.join(machine_spec.get('actors', []))}")
-            console.print("  Interfaces:")
-            for interface in machine_spec.get('interfaces', []):
-                console.print(f"    • {interface}")
-            console.print("  Invariants:")
-            for invariant in machine_spec.get('invariants', []):
-                console.print(f"    • {invariant}")
-
-        console.print()
-        console.print("[dim]Press Enter to return to plan review...[/]")
-        input()
-
-    def _handle_spec_review(self) -> None:
-        """Handle boundary spec review and approval."""
-        if not self.current_task:
-            self.state = ConversationState.MAIN_MENU
-            return
-
-        specs = self.orchestrator.get_boundary_specs(self.current_task.id)
-
-        if not specs:
-            console.print()
-            console.print("[cyan]No boundary specifications needed. Returning to plan approval...[/]")
-            self.state = ConversationState.REVIEWING_PLAN
-            return
-
-        pending_specs = [s for s in specs if s.get("status") == "PENDING"]
-
-        if not pending_specs:
-            console.print()
-            console.print("[green]✓[/] All boundary specs resolved!")
-            self.state = ConversationState.REVIEWING_PLAN
-            return
-
-        for spec in pending_specs:
-            console.print()
-            console.print("=" * 70)
-            console.print(f"[bold]Boundary Spec: {spec.get('boundary_name')}[/]")
-            console.print("=" * 70)
-            console.print()
-
-            console.print("[bold cyan]Description:[/]")
-            console.print(spec.get('human_description', 'No description'))
-            console.print()
-
-            console.print("[bold cyan]Mermaid Diagram:[/]")
-            console.print(f"[dim]{spec.get('diagram_text', 'No diagram')}[/]")
-            console.print()
-
-            machine_spec = spec.get('machine_spec', {})
-            console.print("[bold cyan]Machine Spec:[/]")
-            console.print(f"[bold]Actors:[/] {', '.join(machine_spec.get('actors', []))}")
-            console.print("[bold]Interfaces:[/]")
-            for interface in machine_spec.get('interfaces', []):
-                console.print(f"  • {interface}")
-            console.print("[bold]Invariants:[/]")
-            for invariant in machine_spec.get('invariants', []):
-                console.print(f"  • {invariant}")
-            console.print()
-
-            console.print("[bold]Actions:[/]")
-            console.print("  [cyan]1.[/] Approve this spec")
-            console.print("  [cyan]2.[/] Skip this spec")
-            console.print("  [cyan]3.[/] Approve all remaining specs")
-            console.print("  [cyan]4.[/] Skip all remaining specs")
-            console.print()
-
-            choice = self._ask_menu_choice("Choice", ["1", "2", "3", "4"], "1")
-
-            if choice == "1":
-                self.orchestrator.approve_spec(self.current_task.id, spec["id"])
-                console.print("[green]✓[/] Spec approved")
-            elif choice == "2":
-                self.orchestrator.skip_spec(self.current_task.id, spec["id"])
-                console.print("[yellow]Spec skipped[/]")
-            elif choice == "3":
-                self.orchestrator.approve_all_specs(self.current_task.id)
-                console.print("[green]✓[/] All specs approved")
-                break
-            elif choice == "4":
-                self.orchestrator.skip_all_specs(self.current_task.id)
-                console.print("[yellow]All specs skipped[/]")
-                break
-
-        console.print()
-        console.print("[green]✓[/] All boundary specs resolved!")
-        console.print("[cyan]Returning to plan approval...[/]")
-        self.state = ConversationState.REVIEWING_PLAN
+    # HIDDEN: Boundary spec UI methods temporarily disabled
+    # def _show_spec_details(self) -> None:
+    #     """Show detailed boundary specifications for information only."""
+    #     if not self.current_task:
+    #         return
+    #
+    #     specs = self.orchestrator.get_boundary_specs(self.current_task.id)
+    #
+    #     if not specs:
+    #         console.print()
+    #         console.print("[yellow]No boundary specifications found.[/]")
+    #         return
+    #
+    #     for i, spec in enumerate(specs, 1):
+    #         console.print()
+    #         console.print("=" * 70)
+    #         console.print(f"[bold cyan]Boundary Spec {i}/{len(specs)}: {spec.get('boundary_name')}[/]")
+    #         console.print("=" * 70)
+    #         console.print()
+    #
+    #         console.print("[bold]Description:[/]")
+    #         console.print(spec.get('human_description', 'No description'))
+    #         console.print()
+    #
+    #         console.print("[bold]Mermaid Diagram:[/]")
+    #         console.print(f"[dim]{spec.get('diagram_text', 'No diagram')}[/]")
+    #         console.print()
+    #
+    #         machine_spec = spec.get('machine_spec', {})
+    #         console.print("[bold]Machine Spec:[/]")
+    #         console.print(f"  Actors: {', '.join(machine_spec.get('actors', []))}")
+    #         console.print("  Interfaces:")
+    #         for interface in machine_spec.get('interfaces', []):
+    #             console.print(f"    • {interface}")
+    #         console.print("  Invariants:")
+    #         for invariant in machine_spec.get('invariants', []):
+    #             console.print(f"    • {invariant}")
+    #
+    #     console.print()
+    #     console.print("[dim]Press Enter to return to plan review...[/]")
+    #     input()
+    #
+    # def _handle_spec_review(self) -> None:
+    #     """Handle boundary spec review and approval."""
+    #     if not self.current_task:
+    #         self.state = ConversationState.MAIN_MENU
+    #         return
+    #
+    #     specs = self.orchestrator.get_boundary_specs(self.current_task.id)
+    #
+    #     if not specs:
+    #         console.print()
+    #         console.print("[cyan]No boundary specifications needed. Returning to plan approval...[/]")
+    #         self.state = ConversationState.REVIEWING_PLAN
+    #         return
+    #
+    #     pending_specs = [s for s in specs if s.get("status") == "PENDING"]
+    #
+    #     if not pending_specs:
+    #         console.print()
+    #         console.print("[green]✓[/] All boundary specs resolved!")
+    #         self.state = ConversationState.REVIEWING_PLAN
+    #         return
+    #
+    #     for spec in pending_specs:
+    #         console.print()
+    #         console.print("=" * 70)
+    #         console.print(f"[bold]Boundary Spec: {spec.get('boundary_name')}[/]")
+    #         console.print("=" * 70)
+    #         console.print()
+    #
+    #         console.print("[bold cyan]Description:[/]")
+    #         console.print(spec.get('human_description', 'No description'))
+    #         console.print()
+    #
+    #         console.print("[bold cyan]Mermaid Diagram:[/]")
+    #         console.print(f"[dim]{spec.get('diagram_text', 'No diagram')}[/]")
+    #         console.print()
+    #
+    #         machine_spec = spec.get('machine_spec', {})
+    #         console.print("[bold cyan]Machine Spec:[/]")
+    #         console.print(f"[bold]Actors:[/] {', '.join(machine_spec.get('actors', []))}")
+    #         console.print("[bold]Interfaces:[/]")
+    #         for interface in machine_spec.get('interfaces', []):
+    #             console.print(f"  • {interface}")
+    #         console.print("[bold]Invariants:[/]")
+    #         for invariant in machine_spec.get('invariants', []):
+    #             console.print(f"  • {invariant}")
+    #         console.print()
+    #
+    #         console.print("[bold]Actions:[/]")
+    #         console.print("  [cyan]1.[/] Approve this spec")
+    #         console.print("  [cyan]2.[/] Skip this spec")
+    #         console.print("  [cyan]3.[/] Approve all remaining specs")
+    #         console.print("  [cyan]4.[/] Skip all remaining specs")
+    #         console.print()
+    #
+    #         choice = self._ask_menu_choice("Choice", ["1", "2", "3", "4"], "1")
+    #
+    #         if choice == "1":
+    #             self.orchestrator.approve_spec(self.current_task.id, spec["id"])
+    #             console.print("[green]✓[/] Spec approved")
+    #         elif choice == "2":
+    #             self.orchestrator.skip_spec(self.current_task.id, spec["id"])
+    #             console.print("[yellow]Spec skipped[/]")
+    #         elif choice == "3":
+    #             self.orchestrator.approve_all_specs(self.current_task.id)
+    #             console.print("[green]✓[/] All specs approved")
+    #             break
+    #         elif choice == "4":
+    #             self.orchestrator.skip_all_specs(self.current_task.id)
+    #             console.print("[yellow]All specs skipped[/]")
+    #             break
+    #
+    #     console.print()
+    #     console.print("[green]✓[/] All boundary specs resolved!")
+    #     console.print("[cyan]Returning to plan approval...[/]")
+    #     self.state = ConversationState.REVIEWING_PLAN
 
     def _handle_patch_review(self) -> None:
         """Handle patch review and approval."""

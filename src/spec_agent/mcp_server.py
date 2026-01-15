@@ -347,112 +347,113 @@ def generate_plan(task_id: str, fast: bool = False) -> dict:
             for i, s in enumerate(steps)
         ],
         "risks": plan.get("risks", []),
-        "pending_specs": result.get("pending_specs", []),
-        "next_step": "get_boundary_specs" if result.get("pending_specs") else "approve_plan",
+        # "pending_specs": result.get("pending_specs", []),  # Hidden from MCP interface
+        "next_step": "approve_plan",  # Boundary spec workflow hidden
     }
 
 
-@mcp.tool()
-def get_boundary_specs(task_id: str) -> list:
-    """
-    Get boundary specifications for a task.
-
-    Boundary specs define the contracts, actors, interfaces, and invariants
-    that must be maintained during implementation.
-
-    Args:
-        task_id: UUID of the task
-
-    Returns:
-        List of boundary specs with their approval status
-    """
-    orchestrator = get_orchestrator()
-    specs = orchestrator.get_boundary_specs(task_id)
-
-    return [
-        {
-            "id": s.get("id"),
-            "boundary_name": s.get("boundary_name"),
-            "status": s.get("status"),
-            "description": s.get("human_description"),
-            "actors": (s.get("machine_spec") or {}).get("actors", []),
-            "interfaces": (s.get("machine_spec") or {}).get("interfaces", []),
-            "invariants": (s.get("machine_spec") or {}).get("invariants", []),
-        }
-        for s in specs
-    ]
-
-
-@mcp.tool()
-def approve_spec(task_id: str, spec_id: str) -> dict:
-    """
-    Approve a boundary specification.
-
-    Args:
-        task_id: UUID of the task
-        spec_id: ID of the boundary spec to approve
-
-    Returns:
-        Updated spec status and remaining pending count
-    """
-    orchestrator = get_orchestrator()
-    result = orchestrator.approve_spec(task_id, spec_id)
-
-    specs = orchestrator.get_boundary_specs(task_id)
-    pending = [s for s in specs if s.get("status") == "PENDING"]
-
-    return {
-        "spec_id": result["spec_id"],
-        "status": "APPROVED",
-        "pending_count": len(pending),
-        "all_specs_resolved": len(pending) == 0,
-        "next_step": "approve_plan" if len(pending) == 0 else "approve_spec",
-    }
-
-
-@mcp.tool()
-def approve_all_specs(task_id: str) -> dict:
-    """
-    Approve all pending boundary specifications at once.
-
-    Args:
-        task_id: UUID of the task
-
-    Returns:
-        Count of approved specs
-    """
-    orchestrator = get_orchestrator()
-    result = orchestrator.approve_all_specs(task_id)
-    return {
-        "approved_count": result.get("approved_count", 0),
-        "next_step": "approve_plan",
-    }
-
-
-@mcp.tool()
-def skip_spec(task_id: str, spec_id: str) -> dict:
-    """
-    Skip a boundary specification (proceed without enforcing it).
-
-    Args:
-        task_id: UUID of the task
-        spec_id: ID of the boundary spec to skip
-
-    Returns:
-        Updated status
-    """
-    orchestrator = get_orchestrator()
-    result = orchestrator.skip_spec(task_id, spec_id)
-
-    specs = orchestrator.get_boundary_specs(task_id)
-    pending = [s for s in specs if s.get("status") == "PENDING"]
-
-    return {
-        "spec_id": result["spec_id"],
-        "status": "SKIPPED",
-        "pending_count": len(pending),
-        "all_specs_resolved": len(pending) == 0,
-    }
+# HIDDEN: Boundary spec tools temporarily disabled (backend logic still exists)
+# @mcp.tool()
+# def get_boundary_specs(task_id: str) -> list:
+#     """
+#     Get boundary specifications for a task.
+#
+#     Boundary specs define the contracts, actors, interfaces, and invariants
+#     that must be maintained during implementation.
+#
+#     Args:
+#         task_id: UUID of the task
+#
+#     Returns:
+#         List of boundary specs with their approval status
+#     """
+#     orchestrator = get_orchestrator()
+#     specs = orchestrator.get_boundary_specs(task_id)
+#
+#     return [
+#         {
+#             "id": s.get("id"),
+#             "boundary_name": s.get("boundary_name"),
+#             "status": s.get("status"),
+#             "description": s.get("human_description"),
+#             "actors": (s.get("machine_spec") or {}).get("actors", []),
+#             "interfaces": (s.get("machine_spec") or {}).get("interfaces", []),
+#             "invariants": (s.get("machine_spec") or {}).get("invariants", []),
+#         }
+#         for s in specs
+#     ]
+#
+#
+# @mcp.tool()
+# def approve_spec(task_id: str, spec_id: str) -> dict:
+#     """
+#     Approve a boundary specification.
+#
+#     Args:
+#         task_id: UUID of the task
+#         spec_id: ID of the boundary spec to approve
+#
+#     Returns:
+#         Updated spec status and remaining pending count
+#     """
+#     orchestrator = get_orchestrator()
+#     result = orchestrator.approve_spec(task_id, spec_id)
+#
+#     specs = orchestrator.get_boundary_specs(task_id)
+#     pending = [s for s in specs if s.get("status") == "PENDING"]
+#
+#     return {
+#         "spec_id": result["spec_id"],
+#         "status": "APPROVED",
+#         "pending_count": len(pending),
+#         "all_specs_resolved": len(pending) == 0,
+#         "next_step": "approve_plan" if len(pending) == 0 else "approve_spec",
+#     }
+#
+#
+# @mcp.tool()
+# def approve_all_specs(task_id: str) -> dict:
+#     """
+#     Approve all pending boundary specifications at once.
+#
+#     Args:
+#         task_id: UUID of the task
+#
+#     Returns:
+#         Count of approved specs
+#     """
+#     orchestrator = get_orchestrator()
+#     result = orchestrator.approve_all_specs(task_id)
+#     return {
+#         "approved_count": result.get("approved_count", 0),
+#         "next_step": "approve_plan",
+#     }
+#
+#
+# @mcp.tool()
+# def skip_spec(task_id: str, spec_id: str) -> dict:
+#     """
+#     Skip a boundary specification (proceed without enforcing it).
+#
+#     Args:
+#         task_id: UUID of the task
+#         spec_id: ID of the boundary spec to skip
+#
+#     Returns:
+#         Updated status
+#     """
+#     orchestrator = get_orchestrator()
+#     result = orchestrator.skip_spec(task_id, spec_id)
+#
+#     specs = orchestrator.get_boundary_specs(task_id)
+#     pending = [s for s in specs if s.get("status") == "PENDING"]
+#
+#     return {
+#         "spec_id": result["spec_id"],
+#         "status": "SKIPPED",
+#         "pending_count": len(pending),
+#         "all_specs_resolved": len(pending) == 0,
+#     }
 
 
 @mcp.tool()
