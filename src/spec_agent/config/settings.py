@@ -23,10 +23,16 @@ class AgentSettings:
     serena_enabled: bool = False
     serena_command: Tuple[str, ...] = ()
     serena_timeout_seconds: int = 120
+    llm_provider: str = "openai"
+    llm_api_key: Optional[str] = None
+    llm_model: Optional[str] = None
+    llm_base_url: Optional[str] = None
+    llm_timeout_seconds: Optional[int] = None
     openai_api_key: Optional[str] = None
     openai_model: str = "gpt-4.1-mini"
     openai_base_url: Optional[str] = None
     openai_timeout_seconds: int = 60
+    prefer_external_edits: bool = True
 
     DEFAULT_LANGUAGES: ClassVar[Dict[str, tuple[str, ...]]] = {
         "python": (".py", ".pyw", ".pyi"),
@@ -85,6 +91,29 @@ def get_settings() -> AgentSettings:
         except ValueError:
             pass
 
+    llm_provider = os.getenv("SPEC_AGENT_LLM_PROVIDER")
+    if llm_provider:
+        settings.llm_provider = llm_provider.lower()
+
+    llm_api_key = os.getenv("SPEC_AGENT_LLM_API_KEY")
+    if llm_api_key:
+        settings.llm_api_key = llm_api_key
+
+    llm_model = os.getenv("SPEC_AGENT_LLM_MODEL")
+    if llm_model:
+        settings.llm_model = llm_model
+
+    llm_base = os.getenv("SPEC_AGENT_LLM_BASE_URL")
+    if llm_base:
+        settings.llm_base_url = llm_base
+
+    llm_timeout = os.getenv("SPEC_AGENT_LLM_TIMEOUT")
+    if llm_timeout:
+        try:
+            settings.llm_timeout_seconds = int(llm_timeout)
+        except ValueError:
+            pass
+
     openai_api_key = os.getenv("SPEC_AGENT_OPENAI_API_KEY")
     if openai_api_key:
         settings.openai_api_key = openai_api_key
@@ -104,6 +133,8 @@ def get_settings() -> AgentSettings:
         except ValueError:
             pass
 
+    prefer_external = os.getenv("SPEC_AGENT_EXTERNAL_EDITS_ONLY")
+    if prefer_external is not None:
+        settings.prefer_external_edits = prefer_external.lower() in {"1", "true", "yes", "on"}
+
     return settings
-
-

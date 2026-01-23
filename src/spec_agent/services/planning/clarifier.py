@@ -111,27 +111,61 @@ Do not include any explanatory text before or after the JSON."""
 
     def _create_user_prompt(self, description: str, context_summary: Optional[dict]) -> str:
         """Build the user prompt with task description and repository context."""
-        # Extract context information
-        languages = ""
-        modules = ""
+        languages = "unknown"
+        modules = "not analyzed"
         tests_str = "unknown"
+        hotspots = ""
+        scoped_hint = ""
+        samples_text = ""
 
         if context_summary:
             top_languages = context_summary.get("top_languages", [])
-            languages = ", ".join(top_languages[:3]) if top_languages else "unknown"
+            if top_languages:
+                languages = ", ".join(top_languages[:3])
 
             top_modules = context_summary.get("top_modules", [])
-            modules = ", ".join(top_modules[:5]) if top_modules else "not analyzed"
+            if top_modules:
+                modules = ", ".join(str(m).split("(", 1)[0].strip() for m in top_modules[:5])
+
             tests_str = "present" if bool(context_summary.get("has_tests", False)) else "not detected"
+
+            hotspot_entries = context_summary.get("hotspots", []) or []
+            hotspot_names = [entry.get("path") for entry in hotspot_entries if entry.get("path")]
+            if hotspot_names:
+                hotspots = ", ".join(hotspot_names[:5])
+
+            scoped = (context_summary.get("scoped_context") or {})
+            impact = scoped.get("impact") or {}
+            directories = impact.get("top_directories") or []
+            namespaces = impact.get("namespaces") or []
+            files_sample = impact.get("files_sample") or []
+            if directories or namespaces:
+                scoped_hint = "\nScoped surface:\n"
+                if directories:
+                    scoped_hint += f"- Directories: {', '.join(directories[:6])}\n"
+                if namespaces:
+                    scoped_hint += f"- Namespaces: {', '.join(namespaces[:6])}\n"
+            if files_sample:
+                bullet_lines = "\n".join(f"  • {path}" for path in files_sample[:8])
+                samples_text = f"\nSample files we can pre-index:\n{bullet_lines}\n"
 
         return f"""Task Description: {description}
 
-Repository Context:
+Repository Snapshot:
 - Languages: {languages}
 - Key Modules: {modules}
 - Tests: {tests_str}
+- Hotspots / large files: {hotspots or 'none flagged'}
+{scoped_hint}{samples_text}
 
-Generate clarifying questions that will help create a detailed, accurate implementation plan."""
+Context: indexing large repos is expensive, so we freeze scope whenever possible.
+Ask 3-5 sharp questions that pin down:
+- Which components/files/directories are in scope (refer to the sample list above when helpful)
+- Required behaviors, invariants, or integrations that could change boundaries
+- Testing expectations only if the repo already has tests or the request demands new ones
+
+Return questions as JSON so a lightweight agent can proceed with a narrow, affordable plan. 
+Only refer to components/modules mentioned above; do not invent names from other projects."""
 
     def _parse_llm_response(self, response: str) -> List[str]:
         """Parse and validate the LLM's JSON response."""
@@ -207,5 +241,3 @@ Generate clarifying questions that will help create a detailed, accurate impleme
             "List exact paths or names (comma-separated) and what should be excluded."
         )
         return [scope_q, *(questions or [])]
-
-

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
+from textwrap import dedent
 from typing import List, Optional
 from uuid import uuid4
 
@@ -12,6 +14,8 @@ from ..review.rationale_enhancer import RationaleEnhancer
 
 LOG = logging.getLogger(__name__)
 
+EXTERNAL_PATCH_SENTINEL = "EXTERNAL_EDIT_REQUIRED"
+
 
 class PatchEngine:
     """
@@ -19,11 +23,14 @@ class PatchEngine:
     """
 
     def __init__(
-        self, 
+        self,
         serena_client: Optional[SerenaToolClient] = None,
         llm_client: Optional[object] = None,
+        *,
+        prefer_external_edits: bool = False,
     ) -> None:
         self.serena_client = serena_client
+        self.prefer_external_edits = prefer_external_edits
         self.rationale_enhancer = RationaleEnhancer(llm_client=llm_client)
 
     def draft_patches(
@@ -35,6 +42,13 @@ class PatchEngine:
         boundary_specs: List[BoundarySpec] | None = None,
         skip_rationale_enhancement: bool = False,
     ) -> List[Patch]:
+        # If external edits are preferred, emit manual instructions even when Serena is available.
+        if self.prefer_external_edits:
+            return [
+                self._placeholder_patch(plan, index, step.description, kind=kind)
+                for index, step in enumerate(plan.steps, start=1)
+            ]
+
         if self.serena_client:
             if repo_path is None:
                 raise ValueError("repo_path is required when Serena integration is enabled.")
@@ -126,15 +140,49 @@ class PatchEngine:
             patches.append(patch)
         return patches
 
-    @staticmethod
-    def _placeholder_patch(plan: Plan, index: int, description: str, *, kind: PatchKind) -> Patch:
-        diff = f"--- step-{index}.txt\n+++ step-{index}.txt\n@@\n- placeholder\n+ implementation details TBD\n"
-        rationale = f"{kind.value.title()} patch {index}: {description}"
-        alternatives = [
-            "Manual refactor before applying patch.",
-            "Defer change until boundary spec is approved.",
-        ]
-        return Patch(
+    def _placeholder_patch(self, plan: Plan, index: int, description: str, *, kind: PatchKind) -> Patch:
+        """
+        When Serena is unavailable we still emit actionable guidance.
+        """
+        slug = re.sub(r"[^a-z0-9]+", "-", description.lower()).strip("-") or "step"
+        if self.prefer_external_edits:
+            instructions = dedent(
+                f"""\
+                Step {index}: {description}
+
+                Please implement this step in your editor (Cursor/Claude/IDE). You can use Spec Agent MCP tools in Cursor/Claude to fetch patch details if needed. After making the changes, run any relevant tests or checks, then sync the diff back so Spec Agent can capture it: `./spec-agent sync-external {plan.task_id} --patch-id <PATCH_ID>`
+                """
+            ).strip()
+            diff = f"{EXTERNAL_PATCH_SENTINEL}\n{instructions}\n"
+            rationale = (
+                f"{kind.value.title()} patch {index}: external edit required."
+            )
+            alternatives = [
+                "Apply the change externally, then run `./spec-agent sync-external <task-id> --patch-id <patch-id>`.",
+                "If this step is obsolete, reject it from the patch queue.",
+            ]
+        else:
+            filename = f".spec_agent/manual_steps/{plan.id[:8]}-{index:02d}-{slug[:32]}.md"
+            instructions = dedent(
+                f"""\
+                # Manual patch {index}: {description}
+
+                Please implement this step in your editor (Cursor/Claude/etc.). You can use Spec Agent MCP tools in Cursor/Claude to fetch patch details if needed. After making the changes, run the repo's relevant tests to verify behavior, then sync the diff back to Spec Agent: `./spec-agent sync-external {plan.task_id}`
+
+                Include any notes about files touched or follow-up tasks inside this file if helpful.
+                """
+            )
+            diff_body = "\n".join(f"+{line}" for line in instructions.splitlines())
+            diff = f"--- /dev/null\n+++ b/{filename}\n@@\n{diff_body}\n"
+            rationale = (
+                f"{kind.value.title()} patch {index}: manual instructions generated."
+            )
+            alternatives = [
+                "Use your editor to apply the change, then run `./spec-agent sync-external <task-id>`.",
+                "Break the step into smaller manual commits if it spans multiple boundaries.",
+            ]
+
+        patch = Patch(
             id=str(uuid4()),
             task_id=plan.task_id,
             step_reference=description,
@@ -144,4 +192,12 @@ class PatchEngine:
             kind=kind,
         )
 
+        if diff.startswith(EXTERNAL_PATCH_SENTINEL):
+            patch.rationale += (
+                f"\n\nNext steps:\n"
+                f"- Apply this step externally in your editor.\n"
+                f"- Run the relevant tests/checks.\n"
+                f"- Sync the result: `./spec-agent sync-external {plan.task_id} --patch-id {patch.id}`"
+            )
 
+        return patch

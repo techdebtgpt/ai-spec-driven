@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import UUID
@@ -495,7 +497,11 @@ def start(
     """
 
     orchestrator = _get_orchestrator()
-    task = orchestrator.create_task_from_index(description=description, title=title, summary=summary, client=client)
+    try:
+        task = orchestrator.create_task_from_index(description=description, title=title, summary=summary, client=client)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1)
 
     clarifications = task.metadata.get("clarifications", [])
 
@@ -663,12 +669,20 @@ def web_dashboard(
     console.print("[dim]Press Ctrl+C to stop.[/]")
 
     if open_browser:
+        opened = False
         try:
-            import webbrowser
+            if sys.platform == "darwin":
+                result = subprocess.run(["open", url], check=False)
+                opened = result.returncode == 0
+            else:
+                import webbrowser
 
-            webbrowser.open(url)
+                opened = webbrowser.open(url)
         except Exception:
-            pass
+            opened = False
+
+        if not opened:
+            console.print(f"[yellow]Unable to open browser automatically. Open this URL manually: {url}[/]")
 
     try:
         run_dashboard_server(host=host, port=int(port))

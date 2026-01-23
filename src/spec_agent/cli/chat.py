@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from enum import Enum
 import shlex
+import subprocess
 from pathlib import Path
 from typing import Optional
 from threading import Lock, Thread
@@ -293,7 +294,7 @@ class ChatSession:
         self.indexed_repo = repo_path
         self.indexed_branch = str(index_data.get("branch") or "main")
 
-    def _ask_menu_choice(self, prompt: str, choices: list[str], default: str) -> str:
+    def _ask_menu_choice(self, prompt: str, choices: list[str], default: Optional[str]) -> str:
         """
         Robust choice prompt for auto-started terminals.
 
@@ -306,7 +307,7 @@ class ChatSession:
         raw = Prompt.ask(prompt, default=default)
         value = (raw or "").strip()
         if not value:
-            return default
+            return default or ""
 
         # If the input contains a valid option anywhere (e.g. "1 ", "1\n", or stray chars),
         # pick the first matching choice.
@@ -314,7 +315,7 @@ class ChatSession:
             if ch in choices:
                 return ch
 
-        return default
+        return default or ""
 
     def _start_background_job(self, name: str, fn) -> str:
         job_id = str(uuid4())
@@ -431,7 +432,16 @@ class ChatSession:
         console.print("  [cyan]6.[/] Exit")
         console.print()
 
-        choice = self._ask_menu_choice("Choice", ["1", "2", "3", "4", "5", "6"], "1")
+        try:
+            has_tasks = bool(self.orchestrator.list_tasks())
+        except Exception:
+            has_tasks = False
+
+        # Require explicit selection to avoid auto-starting new tasks.
+        choice = self._ask_menu_choice("Choice", ["1", "2", "3", "4", "5", "6"], None)
+
+        if not choice:
+            return
 
         if choice == "1":
             self.index_only = False
@@ -440,6 +450,7 @@ class ChatSession:
             repo_root: Path | None = None
             branch_default = self.indexed_branch or "main"
             branch: str = branch_default
+            current_branch: str | None = None
 
             recent = self._recent_repositories()
             selected_cached: dict | None = None
@@ -460,8 +471,23 @@ class ChatSession:
 
             if selected_cached:
                 repo_root = selected_cached["repo_path"].resolve()
-                branch_default = selected_cached["branch"] or branch_default
-                self._current_index_data = dict(selected_cached.get("index_data") or {})
+                cached_branch = (selected_cached.get("branch") or "").strip()
+                try:
+                    current_branch = self.orchestrator._get_current_branch(repo_root)
+                except Exception:
+                    current_branch = None
+
+                # Prefer the live branch when available; fall back to cached.
+                branch_default = current_branch or cached_branch or branch_default
+
+                # Only reuse cached index when branch matches; otherwise force reindex.
+                if current_branch and cached_branch and current_branch == cached_branch:
+                    self._current_index_data = dict(selected_cached.get("index_data") or {})
+                else:
+                    self._current_index_data = None
+                    if cached_branch and current_branch and cached_branch != current_branch:
+                        console.print(
+                            f"[yellow]Cached index is for branch '{cached_branch}', current branch is '{current_branch}'. Will re-run indexing for the current branch.[/]")
             else:
                 default_repo = str(self.indexed_repo) if self.indexed_repo else str(Path.cwd())
                 console.print(f"Repository path (press Tab for completion) [default: {default_repo}]:")
@@ -486,9 +512,32 @@ class ChatSession:
                 repo_root = self.orchestrator.resolve_repo_root(requested)
                 self._current_index_data = None
 
-            branch = Prompt.ask("Branch", default=branch_default)
+            branch = Prompt.ask("Branch", default=branch_default).strip()
+            cached_branch = str(selected_cached.get("branch") or "").strip() if selected_cached else ""
 
-            if not self._current_index_data:
+            if current_branch and branch != current_branch:
+                console.print(
+                    f"[yellow]Current branch is '{current_branch}', requested '{branch}'.[/]"
+                )
+                if Confirm.ask(f"Switch working tree to '{branch}'?", default=False):
+                    try:
+                        subprocess.run([
+                            "git",
+                            "checkout",
+                            branch,
+                        ], check=True, cwd=repo_root)
+                        current_branch = branch
+                        console.print(f"[green]✓[/] Checked out branch '{branch}'.")
+                    except subprocess.CalledProcessError as exc:
+                        console.print(f"[red]Failed to checkout '{branch}': {exc}[/]")
+                        branch = current_branch
+                else:
+                    console.print(f"[dim]Keeping current branch '{current_branch}'.[/]")
+                    branch = current_branch
+
+            branch_changed = bool(selected_cached and cached_branch and cached_branch != branch)
+
+            if not self._current_index_data and not branch_changed:
                 try:
                     self._current_index_data = self.orchestrator.get_repository_index_for_repo_and_branch(repo_root, branch)
                 except Exception:
@@ -525,8 +574,11 @@ class ChatSession:
                         self._prefill_description = edited
                 # if 'n', leave defaults empty
 
-            # Try to reuse an existing cached index for this repo.
+            # Try to reuse an existing cached index for this repo unless the branch changed.
             try:
+                if branch_changed:
+                    raise ValueError("Branch changed from cached selection; forcing re-index")
+
                 cached = self.orchestrator.get_repository_index_for_repo_and_branch(repo_root, branch)
                 self.indexed_repo = Path(cached.get("repo_path") or repo_root).resolve()
                 self.indexed_branch = str(cached.get("branch") or branch or "main")
@@ -535,8 +587,9 @@ class ChatSession:
                 self._indexing_preselected = False
                 self.state = ConversationState.TASK_SETUP
             except Exception:
-                # No cached index: go index now.
-                console.print(f"[yellow]No cached index for {repo_root} ({branch}). Indexing now...[/]")
+                # No cached index or branch switched: go index now.
+                reason = "branch change" if branch_changed else f"{branch} cache"
+                console.print(f"[yellow]No usable cached index for {repo_root} ({branch}) [{reason}]. Indexing now...[/]")
                 self.indexed_repo = repo_root
                 self.indexed_branch = branch
                 self._indexing_preselected = True
@@ -636,7 +689,18 @@ class ChatSession:
 
             # Ask for branch (reuse last branch if known)
             branch_default = self.indexed_branch or "main"
-            branch = Prompt.ask("Branch", default=branch_default)
+            branch = Prompt.ask("Branch", default=branch_default).strip()
+
+        # Align branch with the current git branch to avoid stale caches.
+        try:
+            resolved_repo_root = self.orchestrator.resolve_repo_root(repo_path)
+            git_branch = self.orchestrator._get_current_branch(resolved_repo_root)
+        except Exception:
+            git_branch = None
+
+        if git_branch and git_branch.lower() != "unknown" and branch != git_branch:
+            console.print(f"[yellow]Branch mismatch: using current git branch '{git_branch}' instead of '{branch}'.[/]")
+            branch = git_branch
 
         # Show equivalent CLI command and index the repository
         command = f"./spec-agent index {shlex.quote(str(repo_path))}"
@@ -813,6 +877,53 @@ class ChatSession:
             self.state = ConversationState.MAIN_MENU
             return
 
+        # If an existing task matches the same repo/branch/description, resume it instead of creating a duplicate.
+        try:
+            repo_resolved = self.indexed_repo.resolve()
+        except Exception:
+            repo_resolved = self.indexed_repo
+
+        matching: Optional[Task] = None
+        try:
+            for task in self.orchestrator.list_tasks():
+                try:
+                    task_repo = task.repo_path.resolve()
+                except Exception:
+                    task_repo = Path(str(task.repo_path))
+
+                if task_repo != repo_resolved:
+                    try:
+                        if not (repo_resolved.is_relative_to(task_repo) or task_repo.is_relative_to(repo_resolved)):
+                            continue
+                    except ValueError:
+                        continue
+
+                if (task.branch or "") != (self.indexed_branch or ""):
+                    continue
+                if (task.description or "").strip() != description:
+                    continue
+                if not matching or task.updated_at > matching.updated_at:
+                    matching = task
+        except Exception:
+            matching = None
+
+        if matching:
+            console.print()
+            console.print("[cyan]Found an existing task with the same repo, branch, and description. Resuming it instead of creating a new one.[/]")
+            self.current_task = matching
+            self.indexed_repo = matching.repo_path
+            self.indexed_branch = matching.branch
+
+            if matching.status == TaskStatus.CLARIFYING:
+                self.state = ConversationState.CLARIFYING
+            elif matching.status == TaskStatus.PLANNING:
+                self.state = ConversationState.PLANNING
+            elif matching.status == TaskStatus.SPEC_PENDING:
+                self.state = ConversationState.REVIEWING_SPECS
+            else:
+                self.state = ConversationState.REVIEWING_PATCHES
+            return
+
         command = f"./spec-agent start --description {shlex.quote(description)}"
         self._show_cli_command(command)
 
@@ -879,16 +990,26 @@ class ChatSession:
             console.print(item["question"])
             console.print()
 
-            answer = Prompt.ask("Your answer", default="")
+            while True:
+                answer = Prompt.ask(
+                    "Your answer (type 'skip' to move on)",
+                    default=None,
+                    show_default=False,
+                )
 
-            if answer and answer.strip():
-                # Store the answer
-                item["answer"] = answer.strip()
-                item["status"] = "ANSWERED"
-                console.print("[green]✓[/] Got it!")
-            else:
-                console.print("[yellow]Skipped[/]")
-                item["status"] = "OVERRIDDEN"
+                normalized = (answer or "").strip()
+
+                if normalized.lower() == "skip":
+                    console.print("[yellow]Skipped[/]")
+                    item["status"] = "OVERRIDDEN"
+                    break
+                if normalized:
+                    item["answer"] = normalized
+                    item["status"] = "ANSWERED"
+                    console.print("[green]✓[/] Got it!")
+                    break
+
+                console.print("[yellow]Please provide an answer or type 'skip' to continue.[/]")
 
         # Update task with answers
         self.current_task.metadata["clarifications"] = clarifications
@@ -1103,11 +1224,16 @@ class ChatSession:
                 if pending:
                     console.print()
                     console.print(
-                        f"[yellow]{len(pending)} boundary spec(s) are still pending.[/]\n"
-                        "[dim]Resolve or skip them before approving the final plan.[/]"
+                        f"[dim]Auto-approving {len(pending)} pending boundary spec(s) before final approval...[/]"
                     )
-                    self.state = ConversationState.REVIEWING_SPECS
-                    return
+                    try:
+                        self.orchestrator.approve_all_specs(self.current_task.id)
+                        self.current_task = self.orchestrator._get_task(self.current_task.id)
+                        console.print("[green]✓[/] Boundary specs approved")
+                    except Exception as exc:
+                        console.print(f"[yellow]Could not auto-approve specs: {exc}[/]")
+                        self.state = ConversationState.REVIEWING_SPECS
+                        return
 
                 self.orchestrator.approve_plan(self.current_task.id)
                 console.print("[green]✓[/] Plan approved!")
@@ -1182,31 +1308,51 @@ class ChatSession:
                     pending = [p for p in patches if p.status.value == "PENDING"]
                     example_patch = pending[0] if pending else (patches[0] if patches else None)
 
-                    console.print()
-                    console.print(Panel.fit(
-                        "\n".join(
+                    panel_lines = [
+                        "[bold]Cursor (MCP) apply flow[/]",
+                        "",
+                        "1) Open Cursor on the repo and apply the patch changes in the editor.",
+                        "2) After edits, run sync so Spec Agent records the real git diff:",
+                        "",
+                        f"   ./spec-agent sync-external {self.current_task.id}"
+                        + (f" --patch-id {example_patch.id}" if len(pending) == 1 and example_patch else "")
+                        + " --client cursor",
+                        "",
+                        "Tip: If you have Spec Agent MCP installed in Cursor, you can also call:",
+                        f"   sync_external_patch(task_id=\"{self.current_task.id}\", patch_id=\"{example_patch.id if len(pending) == 1 and example_patch else ''}\", client=\"cursor\")",
+                        "",
+                    ]
+
+                    if pending:
+                        panel_lines.extend(
                             [
-                                "[bold]Cursor (MCP) apply flow[/]",
+                                "[bold]Pending patches (apply all):[/]",
+                                *[f"  - {p.id}: {p.step_reference}" for p in pending],
                                 "",
-                                "1) Open Cursor on the repo and apply the patch changes in the editor.",
-                                "2) After edits, run sync so Spec Agent records the real git diff:",
+                                "Apply each pending patch in order. For every patch:",
+                                "  a) Call get_patch_details and apply the diff to the workspace files.",
+                                "  b) Do NOT call approve_patch from Cursor.",
+                                f"  c) Run sync_external_patch(task_id=\"{self.current_task.id}\", patch_id=\"<PATCH_ID>\", client=\"cursor\") after each patch.",
                                 "",
-                                f"   ./spec-agent sync-external {self.current_task.id}"
-                                + (f" --patch-id {example_patch.id}" if example_patch else "")
-                                + " --client cursor",
-                                "",
-                                "Tip: If you have Spec Agent MCP installed in Cursor, you can also call:",
-                                f"   sync_external_patch(task_id=\"{self.current_task.id}\", patch_id=\"{example_patch.id if example_patch else ''}\", client=\"cursor\")",
-                                "",
-                                "[bold]Copy/paste into Cursor chat (recommended):[/]",
-                                f"  \"Use spec-agent MCP tools. For task {self.current_task.id}, patch {example_patch.id if example_patch else '(none)'}: "
-                                f"{(example_patch.step_reference if example_patch else 'apply the next pending patch')}. "
-                                "Show me the patch diff (get_patch_details) and then APPLY the changes to the workspace files. "
-                                "Do NOT call approve_patch. After applying, call sync_external_patch with client=cursor.\"",
                             ]
-                        ),
-                        title="Option B: Apply in Cursor + Sync",
-                    ))
+                        )
+
+                    pending_ids = ", ".join(p.id for p in pending) if pending else "(none)"
+                    cursor_prompt = (
+                        f"Use spec-agent MCP tools. For task {self.current_task.id}, apply ALL pending patches (in order): {pending_ids}. "
+                        "For each patch: get_patch_details, apply the diff to the workspace files, do NOT call approve_patch, "
+                        f"and then call sync_external_patch(task_id=\"{self.current_task.id}\", patch_id=\"<PATCH_ID>\", client=\"cursor\")."
+                    )
+
+                    panel_lines.extend(
+                        [
+                            "[bold]Copy/paste into Cursor chat (recommended):[/]",
+                            f"  \"{cursor_prompt}\"",
+                        ]
+                    )
+
+                    console.print()
+                    console.print(Panel.fit("\n".join(panel_lines), title="Option B: Apply in Cursor + Sync"))
 
                     # Best-effort: open Cursor on macOS (non-fatal if it fails).
                     try:
@@ -1218,54 +1364,59 @@ class ChatSession:
                     except Exception:
                         pass
 
-                    # Auto-sync (best-effort): watch for git changes and sync as soon as Cursor edits files.
-                    try:
-                        import time
-                        import subprocess
+                    # Auto-sync (best-effort): watch for git changes and sync when a single pending patch exists.
+                    if len(pending) == 1 and example_patch:
+                        try:
+                            import time
+                            import subprocess
 
-                        repo_path = str(self.current_task.repo_path)
-                        task_id = self.current_task.id
-                        patch_id = example_patch.id if example_patch else None
+                            repo_path = str(self.current_task.repo_path)
+                            task_id = self.current_task.id
+                            patch_id = example_patch.id
 
-                        def _git_status_short() -> str:
-                            try:
-                                r = subprocess.run(
-                                    ["git", "status", "--short"],
-                                    capture_output=True,
-                                    text=True,
-                                    check=True,
-                                    cwd=repo_path,
-                                )
-                                return (r.stdout or "").strip()
-                            except Exception:
-                                return ""
-
-                        baseline = _git_status_short()
-
-                        def _watch_and_sync():
-                            # Wait up to 20 minutes for Cursor edits (demo-friendly).
-                            deadline = time.time() + 20 * 60
-                            while time.time() < deadline:
-                                current = _git_status_short()
-                                if current != baseline and current.strip():
-                                    # Capture and persist the real diff on the patch/task.
-                                    return self.orchestrator.sync_external_patch(
-                                        task_id,
-                                        patch_id=patch_id,
-                                        client="cursor",
-                                        include_staged=True,
+                            def _git_status_short() -> str:
+                                try:
+                                    r = subprocess.run(
+                                        ["git", "status", "--short"],
+                                        capture_output=True,
+                                        text=True,
+                                        check=True,
+                                        cwd=repo_path,
                                     )
-                                time.sleep(2.0)
-                            return {"timeout": True}
+                                    return (r.stdout or "").strip()
+                                except Exception:
+                                    return ""
 
-                        self._start_background_job(
-                            name=f"auto-sync (cursor) {task_id[:8]}",
-                            fn=_watch_and_sync,
+                            baseline = _git_status_short()
+
+                            def _watch_and_sync():
+                                # Wait up to 20 minutes for Cursor edits (demo-friendly).
+                                deadline = time.time() + 20 * 60
+                                while time.time() < deadline:
+                                    current = _git_status_short()
+                                    if current != baseline and current.strip():
+                                        # Capture and persist the real diff on the patch/task.
+                                        return self.orchestrator.sync_external_patch(
+                                            task_id,
+                                            patch_id=patch_id,
+                                            client="cursor",
+                                            include_staged=True,
+                                        )
+                                    time.sleep(2.0)
+                                return {"timeout": True}
+
+                            self._start_background_job(
+                                name=f"auto-sync (cursor) {task_id[:8]}",
+                                fn=_watch_and_sync,
+                            )
+                            console.print("[dim]Watching for Cursor edits… will auto-sync when changes are detected.[/]")
+                        except Exception:
+                            # Non-fatal; user can always run sync-external manually.
+                            pass
+                    else:
+                        console.print(
+                            "[dim]Multiple pending patches detected; run sync-external after each patch to mark them applied.[/]"
                         )
-                        console.print("[dim]Watching for Cursor edits… will auto-sync when changes are detected.[/]")
-                    except Exception:
-                        # Non-fatal; user can always run sync-external manually.
-                        pass
 
                     # Return to main menu; patches are now generated and can be synced later.
                     self.state = ConversationState.MAIN_MENU
@@ -1424,9 +1575,48 @@ class ChatSession:
             self.state = ConversationState.MAIN_MENU
             return
 
+        patches = self.orchestrator.list_patches(self.current_task.id)
+
         console.print()
-        console.print("[green]Patches generated and ready for review.[/]")
-        console.print(f"[dim]Use './spec-agent patches {self.current_task.id}' to inspect and apply them in your editor.[/]")
+        if patches:
+            console.print("[green]Patches generated and ready for review.[/]")
+            console.print(f"[dim]Use './spec-agent patches {self.current_task.id}' to inspect and apply them in your editor.[/]")
+            console.print()
+            console.print("[bold]Copy/paste into Cursor or Claude MCP:[/]")
+            console.print(
+                f"  Use spec-agent MCP tools to apply ALL pending patches for task {self.current_task.id}:\n"
+                f"  1) Call get_patch_details for each pending patch in order.\n"
+                f"  2) Apply the diff to your workspace files.\n"
+                f"  3) Do NOT call approve_patch from the editor.\n"
+                f"  4) After each patch, call sync_external_patch(task_id=\"{self.current_task.id}\", patch_id=\"<PATCH_ID>\", client=\"cursor\")\n"
+                f"  5) Repeat for all pending patches."
+            )
+            self.state = ConversationState.MAIN_MENU
+            return
+
+        console.print("[yellow]No patches have been generated for this task yet.[/]")
+        if Confirm.ask("Generate patches now?", default=True):
+            has_tests = bool((self.current_task.metadata.get("repository_summary") or {}).get("has_tests", False))
+            if has_tests:
+                console.print("[cyan]Generating patches and test suggestions...[/]")
+            else:
+                console.print("[cyan]Generating patches...[/]")
+
+            patch_result = self.orchestrator.generate_patches(self.current_task.id)
+            patch_count = patch_result.get("patch_count", 0)
+            test_count = patch_result.get("test_count", 0)
+            tests_skipped_reason = patch_result.get("tests_skipped_reason")
+            if tests_skipped_reason:
+                console.print(f"[green]✓[/] Generated {patch_count} patch(es); test suggestions skipped ({tests_skipped_reason})")
+            else:
+                console.print(f"[green]✓[/] Generated {patch_count} patch(es) and {test_count} test suggestion(s)")
+
+            # Reload task to get updated metadata with patches
+            self.current_task = self.orchestrator._get_task(self.current_task.id)
+            console.print(f"[dim]Use './spec-agent patches {self.current_task.id}' to inspect and apply them in your editor.[/]")
+        else:
+            console.print("[dim]Okay — you can generate patches later from the main menu.[/]")
+
         self.state = ConversationState.MAIN_MENU
 
     def _continue_task(self) -> None:

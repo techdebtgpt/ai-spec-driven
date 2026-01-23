@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from ...domain.models import BoundarySpec, Plan, PlanStep
@@ -28,6 +28,7 @@ class BoundaryManager:
         """
         self.llm_client = llm_client
         self.context_summary = context_summary or {}
+        self._boundary_catalog = self._build_boundary_catalog(self.context_summary)
 
     def required_specs(self, plan: Plan) -> List[BoundarySpec]:
         """
@@ -61,16 +62,103 @@ class BoundaryManager:
         LOG.debug("No LLM client available, using template spec")
         return self._generate_spec_template(task_id, step)
 
+    def _build_boundary_catalog(self, summary: Dict[str, Any]) -> Dict[str, set[str]]:
+        """
+        Materialize known boundary tokens from the repository summary so we can
+        compare plan targets against real directories/namespaces instead of
+        relying solely on keywords.
+        """
+        catalog: Dict[str, set[str]] = {
+            "directories": set(),
+            "namespaces": set(),
+            "modules": set(),
+        }
+
+        scoped = (summary.get("scoped_context") or {})
+        impact = scoped.get("impact") or {}
+        directories = impact.get("top_directories") or []
+        namespaces = impact.get("namespaces") or []
+        files_sample = impact.get("files_sample") or []
+
+        for value in directories + files_sample:
+            token = self._component_from_path(value)
+            if token:
+                catalog["directories"].add(token)
+
+        for namespace in namespaces or []:
+            token = self._component_from_namespace(namespace)
+            if token:
+                catalog["namespaces"].add(token)
+
+        modules = summary.get("top_modules") or []
+        for module_entry in modules:
+            module_name = str(module_entry).split("(", 1)[0].strip()
+            token = self._component_from_path(module_name) or self._component_from_namespace(module_name)
+            if token:
+                catalog["modules"].add(token)
+
+        return catalog
+
+    def _component_from_path(self, raw_path: str | None) -> Optional[str]:
+        if not raw_path:
+            return None
+        normalized = raw_path.strip().replace("\\", "/").strip("/")
+        if not normalized:
+            return None
+        parts = [part for part in normalized.split("/") if part]
+        if not parts:
+            return None
+        # Collapse common root folders so "src/api" and "app/api" resolve consistently
+        primary_roots = {"src", "app", "apps", "services", "packages"}
+        if parts[0].lower() in primary_roots and len(parts) > 1:
+            return f"{parts[0]}/{parts[1]}"
+        return parts[0]
+
+    def _component_from_namespace(self, namespace: str | None) -> Optional[str]:
+        if not namespace:
+            return None
+        token = namespace.split(".")[0].strip()
+        return token or None
+
+    def _components_for_step(self, step: PlanStep) -> set[str]:
+        components: set[str] = set()
+        for target in step.target_files or []:
+            token = self._component_from_path(target)
+            if token:
+                components.add(token.lower())
+        return components
+
     def _is_boundary_crossing(self, step: PlanStep) -> bool:
         """
-        Placeholder for boundary detection (section 2.3).
-
-        Currently uses simple keyword matching. Will be replaced with proper
-        boundary detection logic by the team member assigned to section 2.3.
+        Detect boundary crossings using scoped components + keywords.
         """
-        # Simple heuristic: look for keywords that suggest boundary crossings
+        components = self._components_for_step(step)
+        if len(components) > 1:
+            return True
+
+        # When scoped context is available, check if the step leaves the frozen scope.
+        if components:
+            catalog_components = (
+                self._boundary_catalog.get("directories", set())
+                | self._boundary_catalog.get("modules", set())
+            )
+            normalized_catalog = {token.lower() for token in catalog_components}
+            if normalized_catalog and not components <= normalized_catalog:
+                return True
+
+        # Fall back to textual heuristics so we still catch API/database steps
         text = f"{step.description} {step.notes or ''}".lower()
-        boundary_keywords = ["boundary", "api", "database", "service", "layer", "module", "component"]
+        boundary_keywords = [
+            "boundary",
+            "api",
+            "database",
+            "service",
+            "layer",
+            "module",
+            "component",
+            "queue",
+            "event",
+        ]
         return any(keyword in text for keyword in boundary_keywords)
 
     def _generate_spec_with_llm(self, task_id: str, step: PlanStep) -> BoundarySpec:
@@ -209,4 +297,3 @@ Focus on making the boundary maintainable and loosely coupled."""
             },
             plan_step=step.description,
         )
-

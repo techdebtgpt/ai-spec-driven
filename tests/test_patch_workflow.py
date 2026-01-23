@@ -41,7 +41,7 @@ def make_patch(kind: PatchKind = PatchKind.IMPLEMENTATION, status: PatchStatus =
         task_id="task-1",
         steps=[PlanStep(description="do work")],
     )
-    engine = PatchEngine()
+    engine = PatchEngine(prefer_external_edits=False)
     patch = engine._placeholder_patch(plan, 1, "do work", kind=kind)
     patch.status = status
     return patch
@@ -92,6 +92,63 @@ def test_approve_patch_applies_diff(mock_run: MagicMock, tmp_path: Path) -> None
 
     patch = orch.approve_patch(task.id, orch.list_patches(task.id)[0].id)
     assert patch.status == PatchStatus.APPLIED
+    assert orch._get_task(task.id).status == TaskStatus.COMPLETED
+
+
+@patch.object(subprocess, "run")
+def test_task_status_completes_when_all_patches_applied(mock_run: MagicMock, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    patches = [make_patch(), make_patch()]
+    task = Task(
+        id="task-1",
+        repo_path=repo,
+        branch="main",
+        description="desc",
+        status=TaskStatus.IMPLEMENTING,
+        metadata={"patch_queue_state": [p.to_dict() for p in patches]},
+    )
+
+    orch = TaskOrchestrator()
+    orch.store.root = tmp_path / "state"
+    orch.store.root.mkdir(exist_ok=True)
+    orch.store.upsert_task(task)
+
+    mock_run.return_value = MagicMock(stdout="main")
+
+    first = orch.list_patches(task.id)[0]
+    orch.approve_patch(task.id, first.id)
+    assert orch._get_task(task.id).status != TaskStatus.COMPLETED
+
+    second = orch.list_patches(task.id)[1]
+    orch.approve_patch(task.id, second.id)
+    assert orch._get_task(task.id).status == TaskStatus.COMPLETED
+
+
+def test_list_patches_backfills_completed_status(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    patches = [make_patch(status=PatchStatus.APPLIED), make_patch(status=PatchStatus.APPLIED)]
+    task = Task(
+        id="task-1",
+        repo_path=repo,
+        branch="main",
+        description="desc",
+        status=TaskStatus.IMPLEMENTING,
+        metadata={"patch_queue_state": [p.to_dict() for p in patches]},
+    )
+
+    orch = TaskOrchestrator()
+    orch.store.root = tmp_path / "state"
+    orch.store.root.mkdir(exist_ok=True)
+    orch.store.upsert_task(task)
+
+    # Loading patches should auto-mark completed when none are pending.
+    loaded = orch.list_patches(task.id)
+    assert all(p.status == PatchStatus.APPLIED for p in loaded)
+    assert orch._get_task(task.id).status == TaskStatus.COMPLETED
 
 
 @patch.object(subprocess, "run")
@@ -119,6 +176,32 @@ def test_reject_patch_marks_status_and_regenerates(mock_run: MagicMock, tmp_path
     orch.reject_patch(task.id, orch.list_patches(task.id)[0].id)
     task_after = orch._get_task(task.id)
     assert "patch_queue_state" not in task_after.metadata
+
+
+def test_approve_patch_requires_external_sync(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task = Task(
+        id="task-1",
+        repo_path=repo,
+        branch="main",
+        description="desc",
+        status=TaskStatus.PLANNING,
+        metadata={},
+    )
+    orch = TaskOrchestrator()
+    orch.store.root = tmp_path / "state"
+    orch.store.root.mkdir(exist_ok=True)
+    orch.store.upsert_task(task)
+
+    plan = Plan(id="plan-1", task_id=task.id, steps=[PlanStep(description="external step")])
+    placeholder = orch.patch_engine._placeholder_patch(plan, 1, "external step", kind=PatchKind.IMPLEMENTATION)
+    task.metadata["patch_queue_state"] = [placeholder.to_dict()]
+    orch.store.upsert_task(task)
+
+    with pytest.raises(ValueError) as exc:
+        orch.approve_patch(task.id, placeholder.id)
+    assert "sync-external" in str(exc.value)
 
 
 def test_restart_clarifications_preserves_manual_bounded_context(tmp_path: Path) -> None:

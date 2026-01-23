@@ -384,6 +384,23 @@ class TaskOrchestrator:
 
         repo_path = Path(index_data["repo_path"])
         branch = index_data["branch"]
+
+        # Guard against using a cached index from a different branch.
+        try:
+            current_branch = self._get_current_branch(repo_path)
+        except Exception:
+            current_branch = "unknown"
+
+        if (
+            branch
+            and current_branch
+            and current_branch.lower() != "unknown"
+            and branch != current_branch
+        ):
+            raise ValueError(
+                f"Cached index is for branch '{branch}', but the repository is on '{current_branch}'. "
+                "Re-run indexing for the current branch."
+            )
         
         derived_title, derived_summary = self._derive_title_summary(description)
         task = Task(
@@ -535,7 +552,11 @@ class TaskOrchestrator:
         """
         Return the cached repository index payload for a specific repo+branch (if present).
         """
-        return self.store.load_repository_index_for_repo(repo_path.resolve(), branch)
+        return self.store.load_repository_index_for_repo(
+            repo_path.resolve(),
+            branch,
+            allow_branch_fallback=False,
+        )
 
     def list_cached_indexes(self) -> List[Dict[str, Any]]:
         """
@@ -2693,57 +2714,28 @@ class TaskOrchestrator:
         lines.append(_fmt_list([str(r) for r in refactors if str(r).strip()]))
         lines.append("")
 
-        lines.append("## Boundary specs")
+        lines.append("## Boundary specs (summary)")
         lines.append("")
         if specs:
+            lines.append(f"- Count: {len(specs)}")
+            lines.append("")
             for spec in specs:
                 name = (spec.get("boundary_name") or "Unknown").strip()
                 status = (spec.get("status") or "").strip()
                 human_description = (spec.get("human_description") or "").strip()
-                diagram_text = (spec.get("diagram_text") or "").rstrip()
-                machine_spec = spec.get("machine_spec") or {}
-                actors = machine_spec.get("actors") or []
-                interfaces = machine_spec.get("interfaces") or []
-                invariants = machine_spec.get("invariants") or []
                 plan_step = (spec.get("plan_step") or "").strip()
 
-                lines.append(f"### {name}{f' ({status})' if status else ''}")
-                lines.append("")
+                one_liner = human_description.splitlines()[0].strip() if human_description else ""
+                if len(one_liner) > 140:
+                    one_liner = one_liner[:137].rstrip() + "..."
 
-                if plan_step:
-                    lines.append(f"- **Plan step**: {plan_step}")
-                    lines.append("")
+                status_suffix = f" ({status})" if status else ""
+                step_suffix = f" — step: {plan_step}" if plan_step else ""
+                desc_suffix = f" — {one_liner}" if one_liner else ""
 
-                if human_description:
-                    lines.append("**Description**")
-                    lines.append("")
-                    lines.append(human_description)
-                    lines.append("")
-
-                if diagram_text:
-                    lines.append("**Mermaid diagram**")
-                    lines.append("")
-                    lines.append("```mermaid")
-                    lines.append(diagram_text)
-                    lines.append("```")
-                    lines.append("")
-
-                lines.append("**Machine-readable contract**")
-                lines.append("")
-                lines.append("- Actors:")
-                lines.extend([f"  - {actor}" for actor in actors] or ["  - (none)"])
-                lines.append("- Interfaces:")
-                lines.extend([f"  - {interface}" for interface in interfaces] or ["  - (none)"])
-                lines.append("- Invariants:")
-                lines.extend([f"  - {invariant}" for invariant in invariants] or ["  - (none)"])
-                lines.append("")
-
-                lines.append("**Implementation constraints (for Cursor/Claude)**")
-                lines.append("")
-                lines.append("- Preserve the actor boundaries above (do not fold responsibilities across services).")
-                lines.append("- Ensure invariants hold across all happy-path and failure-path flows.")
-                lines.append("- If an interface is renamed/expanded, update all call sites and configuration consistently.")
-                lines.append("")
+                lines.append(f"- `{name}`{status_suffix}{step_suffix}{desc_suffix}")
+            lines.append("")
+            lines.append("For full details or to regenerate, run `./spec-agent specs <task-id>`.")
         else:
             lines.append("_None_")
         lines.append("")
@@ -2962,22 +2954,43 @@ class TaskOrchestrator:
 
     def _maybe_create_llm_client(self) -> Optional[OpenAILLMClient]:
         """
-        Initialize OpenAI LLM client if API key is configured.
+        Initialize LLM client based on configured provider.
+
+        Supported providers:
+        - openai (default)
+        - openai-compatible (uses OpenAI SDK against a custom base URL/API key)
         """
+
+        provider = (self.settings.llm_provider or "openai").lower()
+
+        if provider not in {"openai", "openai-compatible", "openai_compatible"}:
+            LOG.warning("Unsupported LLM provider '%s'", provider)
+            return None
+
         api_key = self.settings.openai_api_key
+        model = self.settings.openai_model
+        base_url = self.settings.openai_base_url
+        timeout_seconds = self.settings.openai_timeout_seconds
+
+        if provider in {"openai-compatible", "openai_compatible"}:
+            api_key = self.settings.llm_api_key or api_key
+            model = self.settings.llm_model or model
+            base_url = self.settings.llm_base_url or base_url
+            timeout_seconds = self.settings.llm_timeout_seconds or timeout_seconds
+
         if not api_key:
-            LOG.debug("OpenAI API key not configured, LLM features will be unavailable")
+            LOG.debug("LLM API key not configured, LLM features will be unavailable")
             return None
 
         try:
             return OpenAILLMClient(
                 api_key=api_key,
-                model=self.settings.openai_model,
-                base_url=self.settings.openai_base_url,
-                timeout_seconds=self.settings.openai_timeout_seconds,
+                model=model,
+                base_url=base_url,
+                timeout_seconds=timeout_seconds,
             )
         except ValueError as exc:
-            LOG.warning("Failed to initialize OpenAI client: %s", exc)
+            LOG.warning("Failed to initialize LLM client: %s", exc)
             return None
 
     def _maybe_create_serena_client(self) -> Optional[SerenaToolClient]:
@@ -3178,12 +3191,30 @@ class TaskOrchestrator:
 
     def _load_patch_queue(self, task: Task) -> List[Patch]:
         raw = task.metadata.get("patch_queue_state", [])
-        return [Patch.from_dict(item) for item in raw]
+        patches = [Patch.from_dict(item) for item in raw]
+        self._maybe_autocomplete_task(task, patches)
+        return patches
 
     def _persist_patch_queue(self, task: Task, patches: List[Patch]) -> None:
         task.metadata["patch_queue_state"] = [patch.to_dict() for patch in patches]
-        task.touch()
-        self.store.upsert_task(task)
+        changed = self._maybe_autocomplete_task(task, patches)
+        if not changed:
+            task.touch()
+            self.store.upsert_task(task)
+
+    def _maybe_autocomplete_task(self, task: Task, patches: List[Patch]) -> bool:
+        """
+        Automatically marks a task as COMPLETED when all patches have been applied.
+        Returns True if the task status was changed, False otherwise.
+        """
+        pending_remaining = any(p.status == PatchStatus.PENDING for p in patches)
+        applied_any = any(p.status == PatchStatus.APPLIED for p in patches)
+        if applied_any and not pending_remaining and task.status not in {TaskStatus.COMPLETED, TaskStatus.CANCELLED}:
+            task.status = TaskStatus.COMPLETED
+            task.touch()
+            self.store.upsert_task(task)
+            return True
+        return False
 
     @staticmethod
     def _require_patch(patches: List[Patch], patch_id: str) -> Patch:

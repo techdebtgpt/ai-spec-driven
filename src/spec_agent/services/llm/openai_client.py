@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional
 
+from .base import LLMClientError, LLMClientProtocol
+
 try:
     # Optional at dev-time: editors/CI environments may not have extras installed.
     # If you want LLM features, install dependencies (e.g. `pip install -e .`).
@@ -16,11 +18,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover
 LOG = logging.getLogger(__name__)
 
 
-class LLMClientError(RuntimeError):
-    """Raised when an LLM provider returns an invalid response."""
-
-
-class OpenAILLMClient:
+class OpenAILLMClient(LLMClientProtocol):
     """
     Thin wrapper around the OpenAI Responses API used throughout the agent.
 

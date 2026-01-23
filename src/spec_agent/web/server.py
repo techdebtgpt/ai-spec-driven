@@ -242,6 +242,27 @@ def _render_plan_markdown(task: Task) -> str:
         lines.extend([f"- {str(r).strip()}" for r in refactors if str(r).strip()] or ["_None_"])
         lines.append("")
 
+    specs = meta.get("boundary_specs") or []
+    if isinstance(specs, list):
+        lines.append("## Boundary specs (summary)")
+        lines.append("")
+        if specs:
+            lines.append(f"- Count: {len(specs)}")
+            for spec in specs:
+                name = (spec.get("boundary_name") or "Unknown").strip()
+                status = (spec.get("status") or "").strip()
+                plan_step = (spec.get("plan_step") or "").strip()
+                desc = (spec.get("human_description") or "").strip().splitlines()[0] if isinstance(spec, dict) else ""
+                if desc and len(desc) > 140:
+                    desc = desc[:137].rstrip() + "..."
+                status_suffix = f" ({status})" if status else ""
+                step_suffix = f" — step: {plan_step}" if plan_step else ""
+                desc_suffix = f" — {desc}" if desc else ""
+                lines.append(f"- `{name}`{status_suffix}{step_suffix}{desc_suffix}")
+        else:
+            lines.append("_None_")
+        lines.append("")
+
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1111,8 +1132,36 @@ body{
   padding:10px;
   margin-top:10px;
 }
-.treeDir{font-weight:650; font-size:13px; margin-bottom:6px}
-.treeFile{font-size:12px; color:var(--muted); padding:2px 0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.treeDir{
+  font-weight:650;
+  font-size:13px;
+  margin-bottom:4px;
+  display:flex;
+  align-items:center;
+  gap:6px;
+}
+.treeDir::before{
+  content:"▸";
+  font-size:11px;
+  opacity:0.65;
+}
+.treeFile{
+  font-size:12px;
+  color:var(--muted);
+  padding:2px 0 2px 18px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  position:relative;
+}
+.treeFile::before{
+  content:"•";
+  position:absolute;
+  left:0;
+  top:2px;
+  font-size:11px;
+  opacity:0.75;
+}
 .planItem{
   border:1px solid var(--border);
   background:rgba(10,16,32,.55);
@@ -1192,7 +1241,7 @@ let state = {
   selectedPatchId: null,
   selectedTaskData: null,
   filter: 'all',
-  range: 'today',
+  range: 'all',
   lastNow: null,
 };
 
@@ -1212,6 +1261,70 @@ function fmtCount(value) {
     return value.toLocaleString();
   }
   return '—';
+}
+
+/**
+ * Render a compact "bounded context tree" grouped by directory.
+ *
+ * This is intentionally shallow and demo-friendly: we group by the
+ * immediate directory and list a small sample of files under each,
+ * using the existing `.tree`, `.treeDir`, `.treeFile` styles.
+ */
+function renderPathTree(container, paths, maxDirs = 8, maxFilesPerDir = 6) {
+  const clean = (paths || []).filter(p => typeof p === 'string' && p.trim());
+  if (!clean.length) return;
+
+  // If there are no directory separators (e.g. C# namespaces like
+  // "Pbp.Payments.CardStore.Domain"), a tree would look fake. Fall back
+  // to a simple flat list in that case.
+  const hasSlash = clean.some(p => String(p).includes('/'));
+  if (!hasSlash) {
+    const box = document.createElement('div');
+    box.className = 'tree';
+    clean.slice(0, maxFilesPerDir * maxDirs).forEach(p => {
+      const row = document.createElement('div');
+      row.className = 'fileRow';
+      row.textContent = p;
+      box.appendChild(row);
+    });
+    container.appendChild(box);
+    return;
+  }
+
+  const tree = document.createElement('div');
+  tree.className = 'tree';
+
+  const byDir = {};
+  clean.forEach(raw => {
+    const full = String(raw).trim().replace(/\\/g, '/');
+    if (!full) return;
+    const idx = full.lastIndexOf('/');
+    const dir = idx >= 0 ? full.slice(0, idx) : '(root)';
+    const file = idx >= 0 ? full.slice(idx + 1) : full;
+    if (!file) return;
+    if (!byDir[dir]) byDir[dir] = [];
+    if (!byDir[dir].includes(file)) {
+      byDir[dir].push(file);
+    }
+  });
+
+  const dirs = Object.keys(byDir).sort().slice(0, maxDirs);
+  dirs.forEach(dir => {
+    const dirEl = document.createElement('div');
+    dirEl.className = 'treeDir';
+    dirEl.textContent = dir;
+    tree.appendChild(dirEl);
+
+    byDir[dir].slice(0, maxFilesPerDir).forEach(file => {
+      const fileEl = document.createElement('div');
+      fileEl.className = 'treeFile';
+      fileEl.textContent = file;
+      tree.appendChild(fileEl);
+    });
+  });
+
+  if (!dirs.length) return;
+  container.appendChild(tree);
 }
 
 function renderOverview(container, task, detail) {
@@ -1404,6 +1517,10 @@ function fmtAgo(iso, nowIso) {
   if (m < 1) return 'just now';
   if (m < 60) return `${m}m ago`;
   const h = Math.floor(m / 60);
+  if (h >= 24) {
+    const d = Math.floor(h / 24);
+    return `${d}d ago`;
+  }
   return `${h}h ago`;
 }
 
@@ -1557,6 +1674,8 @@ function renderWorkflow(task, workflow) {
     chips.appendChild(dur);
 
     (step.chips || []).forEach(c => {
+      const text = (c.text || '').trim();
+      if (!text || text.toLowerCase() === 'ended') return; // hide noisy "ended" chip
       const ch = document.createElement('span');
       let cls = 'chip';
       if (c.kind === 'success') cls += ' green';
@@ -1564,23 +1683,12 @@ function renderWorkflow(task, workflow) {
       if (c.kind === 'danger') cls += ' red';
       if (c.kind === 'neutral') cls += ' purple';
       ch.className = cls;
-      ch.textContent = c.text;
+      ch.textContent = text.length > 8 ? text.slice(0, 8) + '…' : text;
       chips.appendChild(ch);
     });
 
-    const small = document.createElement('div');
-    small.className = 'small';
-    if (step.ended_at) {
-      small.textContent = `Ended: ${step.ended_at}`;
-    } else if (step.started_at) {
-      small.textContent = `Started: ${step.started_at}`;
-    } else {
-      small.textContent = '—';
-    }
-
     body.appendChild(label);
     body.appendChild(chips);
-    body.appendChild(small);
 
     el.appendChild(rail);
     el.appendChild(body);
@@ -1747,7 +1855,7 @@ function renderDetails(task, step, detail) {
     if (list.length) {
       const sec = document.createElement('div');
       sec.className = 'sectionTitle';
-      sec.textContent = targets.length ? 'Impacted targets (scope)' : 'Impacted files (sample)';
+      sec.textContent = targets.length ? 'Bounded context tree' : 'Impacted files (sample)';
       el.appendChild(sec);
 
       const meta = document.createElement('div');
@@ -1755,13 +1863,18 @@ function renderDetails(task, step, detail) {
       meta.textContent = `${total} file(s) in scope`;
       el.appendChild(meta);
 
-      // Render as a compact list (same style as Code generation "Files touched")
-      list.slice(0, 25).forEach(p => {
-        const row = document.createElement('div');
-        row.className = 'fileRow';
-        row.textContent = p;
-        el.appendChild(row);
-      });
+      // If we have explicit targets, show a compact tree grouped by directory.
+      if (targets.length) {
+        renderPathTree(el, list, 12, 8);
+      } else {
+        // Fallback to a flat sample list (same style as Code generation "Files touched").
+        list.slice(0, 25).forEach(p => {
+          const row = document.createElement('div');
+          row.className = 'fileRow';
+          row.textContent = p;
+          el.appendChild(row);
+        });
+      }
     }
 
     // Execution plan
@@ -1838,6 +1951,64 @@ function renderDetails(task, step, detail) {
       el.appendChild(hint);
     }
 
+    // Boundary specs (summary + details)
+    const specs = d.boundary_specs || [];
+    if (specs.length) {
+      const sec = document.createElement('div');
+      sec.className = 'sectionTitle';
+      sec.textContent = 'Boundary specs';
+      el.appendChild(sec);
+
+      specs.slice(0, 20).forEach(s => {
+        const card = document.createElement('div');
+        card.className = 'card';
+
+        const title = document.createElement('div');
+        title.className = 'sectionTitle';
+        const status = s.status ? ` (${s.status})` : '';
+        title.textContent = `${s.name}${status}`;
+        card.appendChild(title);
+
+        if (s.plan_step) {
+          const step = document.createElement('div');
+          step.className = 'small';
+          step.textContent = `Plan step: ${s.plan_step}`;
+          card.appendChild(step);
+        }
+
+        if (s.summary || s.description) {
+          const desc = document.createElement('div');
+          desc.className = 'small';
+          desc.style.marginTop = '6px';
+          desc.textContent = s.description || s.summary;
+          card.appendChild(desc);
+        }
+
+        const meta = document.createElement('div');
+        meta.className = 'small';
+        meta.style.marginTop = '8px';
+        const actors = (s.actors || []).join(', ');
+        const interfaces = (s.interfaces || []).join(', ');
+        const invariants = (s.invariants || []).join('; ');
+        meta.textContent = [
+          actors ? `Actors: ${actors}` : '',
+          interfaces ? `Interfaces: ${interfaces}` : '',
+          invariants ? `Invariants: ${invariants}` : '',
+        ].filter(Boolean).join(' • ');
+        if (meta.textContent) card.appendChild(meta);
+
+        if (s.diagram) {
+          const pre = document.createElement('pre');
+          pre.className = 'diff';
+          pre.textContent = s.diagram;
+          pre.style.marginTop = '8px';
+          card.appendChild(pre);
+        }
+
+        el.appendChild(card);
+      });
+    }
+
     // Impacted scope (prefer explicit targets; fall back to small file sample)
     const bc = d.bounded_context || {};
     const targets = (bc.targets || []);
@@ -1847,7 +2018,7 @@ function renderDetails(task, step, detail) {
     if (list.length) {
       const sec = document.createElement('div');
       sec.className = 'sectionTitle';
-      sec.textContent = targets.length ? 'Impacted targets (scope)' : 'Impacted files (sample)';
+      sec.textContent = targets.length ? 'Bounded context tree' : 'Impacted files (sample)';
       el.appendChild(sec);
 
       const meta = document.createElement('div');
@@ -1855,12 +2026,16 @@ function renderDetails(task, step, detail) {
       meta.textContent = `${total} file(s) in scope`;
       el.appendChild(meta);
 
-      list.slice(0, 25).forEach(p => {
-        const row = document.createElement('div');
-        row.className = 'fileRow';
-        row.textContent = p;
-        el.appendChild(row);
-      });
+      if (targets.length) {
+        renderPathTree(el, list, 12, 8);
+      } else {
+        list.slice(0, 25).forEach(p => {
+          const row = document.createElement('div');
+          row.className = 'fileRow';
+          row.textContent = p;
+          el.appendChild(row);
+        });
+      }
     }
 
     // Execution plan (same visual style as planning)
@@ -2285,6 +2460,38 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
     acceptance_criteria = _derive_acceptance_criteria(task, clarifications, plan_steps if isinstance(plan_steps, list) else [])
     scenarios = _derive_scenarios(task, plan_steps if isinstance(plan_steps, list) else [])
 
+    specs = meta.get("boundary_specs") if isinstance(meta, dict) else []
+    spec_summary: list[dict] = []
+    if isinstance(specs, list):
+        for spec in specs:
+            if not isinstance(spec, dict):
+                continue
+            name = str(spec.get("boundary_name") or "Unknown").strip()
+            status = str(spec.get("status") or "").strip()
+            plan_step = str(spec.get("plan_step") or "").strip()
+            human_description = str(spec.get("human_description") or "").strip()
+            desc = human_description.splitlines()[0] if human_description else ""
+            if desc and len(desc) > 140:
+                desc = desc[:137].rstrip() + "..."
+            machine = spec.get("machine_spec") or {}
+            actors = machine.get("actors") or []
+            interfaces = machine.get("interfaces") or []
+            invariants = machine.get("invariants") or []
+            diagram = str(spec.get("diagram_text") or "").strip()
+            spec_summary.append(
+                {
+                    "name": name,
+                    "status": status,
+                    "plan_step": plan_step,
+                    "summary": desc,
+                    "description": human_description,
+                    "actors": actors,
+                    "interfaces": interfaces,
+                    "invariants": invariants,
+                    "diagram": diagram,
+                }
+            )
+
     bounded_ctx = meta.get("bounded_context") or {}
     if not isinstance(bounded_ctx, dict):
         bounded_ctx = {}
@@ -2421,6 +2628,7 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
         "scope_file_count": len(allowed_files) if allowed_files else len(files_sample_clean),
         "clarifications": {"answered": answered, "pending": pending},
         "external_patches": external_patch_notes[:8],
+        "boundary_specs": spec_summary,
         "file_count": repo_summary.get("file_count"),
         "directory_count": repo_summary.get("directory_count"),
         "top_modules": top_modules_summary[:6],
@@ -2453,6 +2661,7 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
                 "targets": targets_clean[:25],
                 "files_sample": files_sample_clean[:25],
             },
+            "boundary_specs": spec_summary,
         },
         "APPROVAL": {
             "plan_approved": plan_approved,
@@ -2469,6 +2678,7 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
             "scenarios": scenarios,
             "risks": [str(r).strip() for r in risks if str(r).strip()][:20],
             "refactors": [str(r).strip() for r in refactors if str(r).strip()][:20],
+            "boundary_specs": spec_summary,
         },
         "CODEGEN": {"patches": patches, "files_touched": files_touched},
     }

@@ -5,7 +5,7 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List
 
 from ..domain.models import LogEntry, Task
 
@@ -143,7 +143,13 @@ class JsonStore:
         with self._lock:
             return json.loads(self.index_file.read_text())
 
-    def load_repository_index_for_repo(self, repo_path: Path, branch: str | None = None) -> Dict:
+    def load_repository_index_for_repo(
+        self,
+        repo_path: Path,
+        branch: str | None = None,
+        *,
+        allow_branch_fallback: bool = True,
+    ) -> Dict:
         """
         Load a cached repository index for a specific repo path (+ optional branch).
         """
@@ -151,8 +157,10 @@ class JsonStore:
         candidates: list[Path] = []
         if branch:
             candidates.append(self._index_file_for_repo(repo_path, branch))
-        # Fallback to repo-only cache.
-        candidates.append(self._index_file_for_repo(repo_path, None))
+            if allow_branch_fallback:
+                candidates.append(self._index_file_for_repo(repo_path, None))
+        else:
+            candidates.append(self._index_file_for_repo(repo_path, None))
 
         for file_path in candidates:
             if file_path.exists():
@@ -160,3 +168,27 @@ class JsonStore:
                     return json.loads(file_path.read_text())
 
         raise ValueError(f"No repository index found for: {repo_path}{f' ({branch})' if branch else ''}")
+
+    def list_repository_indexes(self) -> List[Dict[str, Any]]:
+        """
+        Enumerate cached repository indexes (most recent first).
+        """
+        entries: list[Dict[str, Any]] = []
+        if not self.indexes_dir.exists():
+            return entries
+
+        files = sorted(
+            self.indexes_dir.glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for file_path in files:
+            try:
+                with self._lock:
+                    data = json.loads(file_path.read_text())
+                entries.append(data)
+            except Exception:
+                continue
+
+        entries.sort(key=lambda d: (d.get("indexed_at") or ""), reverse=True)
+        return entries
