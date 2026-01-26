@@ -1,8 +1,9 @@
 """
-MCP Server for Spec Agent - Enables Cursor/Claude integration.
+MCP Server for Spec Agent - Prompt-Based Architecture.
 
-This module exposes spec-agent's core functionality as MCP tools,
-allowing AI assistants to drive spec-driven development workflows.
+This module exposes spec-agent's core functionality using MCP prompts for generation
+and tools for state management. LLM calls are delegated to the Cursor/Claude client
+rather than running in the backend.
 
 Usage:
     # Run directly
@@ -29,9 +30,10 @@ LOG = logging.getLogger(__name__)
 # Initialize the MCP server
 mcp = FastMCP(
     "spec-agent",
-    instructions="Spec-driven development agent for making changes in large/legacy repositories. "
-    "Use index_repository first, then create_task, answer clarifications, generate_plan, "
-    "approve specs, approve plan, and finally generate/approve patches.",
+    instructions="Spec-driven development agent using prompt-based architecture. "
+    "Use index_repository first, then create_task. For LLM-based generation, invoke the "
+    "appropriate prompts (generate_clarifications_prompt, generate_plan_prompt, etc.), then "
+    "submit results using submit_* tools.",
 )
 
 # Lazy-loaded orchestrator (created on first use)
@@ -47,7 +49,227 @@ def get_orchestrator() -> TaskOrchestrator:
 
 
 # =============================================================================
-# Repository Indexing Tools
+# MCP PROMPTS - LLM Generation Tasks
+# =============================================================================
+
+
+@mcp.prompt()
+def generate_clarifications_prompt(task_id: str):
+    """
+    Generate clarifying questions for a task.
+
+    This prompt guides Claude to generate 3-5 clarification questions
+    to better understand the task requirements before planning.
+
+    Args:
+        task_id: UUID of the task
+
+    Returns:
+        Prompt messages for Claude to generate clarifications
+    """
+    orchestrator = get_orchestrator()
+    task = orchestrator._get_task(task_id)
+
+    # Get repository context
+    try:
+        repo_index = orchestrator.get_cached_repository_index()
+        repo_summary = repo_index.get("repository_summary", {})
+        languages = repo_summary.get("top_languages", [])
+        modules = repo_summary.get("top_modules", [])
+
+        repo_context = f"""Repository Context:
+- Primary languages: {', '.join([l['language'] for l in languages[:3]])}
+- Key modules: {', '.join(modules[:5])}
+"""
+    except ValueError:
+        repo_context = ""
+
+    prompt_content = f"""You are a senior software architect helping to clarify requirements for a software development task.
+
+Task Details:
+{repo_context}
+Title: {task.title or "N/A"}
+Description: {task.description}
+
+Your job is to generate 3-5 clarifying questions that will help understand:
+1. Edge cases and constraints
+2. Performance or scalability requirements
+3. Integration points with existing systems
+4. Error handling expectations
+5. Testing requirements
+
+For each question, provide:
+- The question text (clear and specific)
+- Rationale: Why this question is important
+- Default answer: A reasonable default if the user skips
+
+Return your response as a JSON object:
+{{
+  "clarifications": [
+    {{
+      "question": "the question text",
+      "rationale": "why it matters",
+      "default_answer": "suggested default"
+    }}
+  ]
+}}
+
+IMPORTANT: After generating the clarifications, call the tool:
+submit_clarifications(task_id="{task_id}", clarifications_json=<your_json>)
+"""
+
+    return [{"role": "user", "content": prompt_content}]
+
+
+@mcp.prompt()
+def generate_plan_prompt(task_id: str):
+    """
+    Generate an implementation plan for a task.
+
+    This prompt guides Claude to create a step-by-step implementation plan
+    based on the task description and answered clarifications.
+
+    Args:
+        task_id: UUID of the task
+
+    Returns:
+        Prompt messages for Claude to generate a plan
+    """
+    orchestrator = get_orchestrator()
+    task = orchestrator._get_task(task_id)
+    clarifications = orchestrator.list_clarifications(task_id)
+
+    # Format clarifications
+    clarifications_text = "\n".join([
+        f"Q: {c['question']}\nA: {c.get('answer', c.get('default_answer', 'N/A'))}"
+        for c in clarifications
+    ])
+
+    # Get repository context
+    try:
+        repo_index = orchestrator.get_cached_repository_index()
+        repo_summary = repo_index.get("repository_summary", {})
+        languages = repo_summary.get("top_languages", [])
+        modules = repo_summary.get("top_modules", [])
+        hotspots = repo_summary.get("hotspots", [])
+
+        repo_context = f"""Repository Context:
+- Primary languages: {', '.join([l['language'] for l in languages[:3]])}
+- Key modules: {', '.join(modules[:5])}
+- Code hotspots: {', '.join([h.get('file', '') for h in hotspots[:5]])}
+"""
+    except ValueError:
+        repo_context = ""
+
+    prompt_content = f"""You are a senior software architect creating a detailed implementation plan.
+
+{repo_context}
+
+Task Details:
+Title: {task.title or "N/A"}
+Description: {task.description}
+
+Clarifications:
+{clarifications_text or "None provided"}
+
+Your job is to create a step-by-step implementation plan that:
+1. Breaks the task into logical, incremental steps
+2. Identifies which files need to be modified for each step
+3. Considers dependencies between steps
+4. Identifies potential risks
+
+Each step should be implementable independently and testable.
+
+Return your response as a JSON object:
+{{
+  "steps": [
+    {{
+      "description": "what to implement in this step",
+      "target_files": ["file1.py", "file2.js"],
+      "reasoning": "why this step is needed and how it fits in"
+    }}
+  ],
+  "risks": [
+    "potential issue 1",
+    "potential issue 2"
+  ],
+  "dependencies": ["external library needed", "..."]
+}}
+
+IMPORTANT: After generating the plan, call the tool:
+submit_plan(task_id="{task_id}", plan_json=<your_json>)
+"""
+
+    return [{"role": "user", "content": prompt_content}]
+
+
+@mcp.prompt()
+def generate_patch_prompt(task_id: str, step_index: int):
+    """
+    Generate a code patch for a specific plan step.
+
+    This prompt guides Claude to create the actual code changes (as a unified diff)
+    for implementing a single step from the plan.
+
+    Args:
+        task_id: UUID of the task
+        step_index: Zero-based index of the step to implement
+
+    Returns:
+        Prompt messages for Claude to generate a patch
+    """
+    orchestrator = get_orchestrator()
+    task = orchestrator._get_task(task_id)
+    plan_data = task.metadata.get("plan", {})
+    steps = plan_data.get("steps", [])
+
+    if step_index >= len(steps):
+        return [{"role": "user", "content": f"Error: Step index {step_index} out of range (plan has {len(steps)} steps)"}]
+
+    step = steps[step_index]
+    step_desc = step.get("description") if isinstance(step, dict) else str(step)
+    target_files = step.get("target_files", []) if isinstance(step, dict) else []
+    reasoning = step.get("reasoning", "") if isinstance(step, dict) else ""
+
+    prompt_content = f"""You are an expert software engineer implementing a specific code change.
+
+Task: {task.title or "N/A"}
+
+Plan Step #{step_index + 1}:
+Description: {step_desc}
+Target Files: {', '.join(target_files) if target_files else 'Not specified - infer from description'}
+Reasoning: {reasoning}
+
+Your job is to:
+1. Read the target files (or infer them from the description)
+2. Implement the changes needed for this step
+3. Create a unified diff patch showing the changes
+4. Explain the rationale for your implementation choices
+
+Guidelines:
+- Follow the existing code style and patterns
+- Add appropriate error handling
+- Consider edge cases mentioned in clarifications
+- Keep changes minimal and focused on this step only
+- Include comments where logic isn't self-evident
+
+After implementing the changes:
+1. Generate a unified diff (use `git diff` or create manually)
+2. Write a rationale explaining:
+   - What you changed and why
+   - Design decisions made
+   - Trade-offs considered
+   - How this addresses the step requirements
+
+Then call:
+submit_patch(task_id="{task_id}", step_index={step_index}, diff="<unified_diff>", rationale="<explanation>")
+"""
+
+    return [{"role": "user", "content": prompt_content}]
+
+
+# =============================================================================
+# Repository Indexing Tools (State Management)
 # =============================================================================
 
 
@@ -117,46 +339,67 @@ def get_repository_summary() -> dict:
 
 
 # =============================================================================
-# Task Management Tools
+# Task Management Tools (State Management)
 # =============================================================================
 
 
 @mcp.tool()
 def create_task(description: str, title: Optional[str] = None, client: Optional[str] = None) -> dict:
     """
-    Create a new development task from the indexed repository.
+    Create a new development task (does NOT auto-generate clarifications).
 
-    This generates clarifying questions to understand the requirements better.
-    Answer the clarifications before generating a plan.
+    After creating the task, invoke the generate_clarifications_prompt to create
+    clarifying questions using Claude's LLM.
 
     Args:
         description: Detailed description of what changes you want to make
         title: Optional short title for the task
-        client: Optional editor/chat client driving this task (e.g. cursor, claude, terminal)
+        client: Optional editor/chat client driving this task (e.g. cursor, claude)
 
     Returns:
-        Task ID and any clarifying questions that need answers
+        Task ID and next step instructions
     """
+    from uuid import uuid4
+    from .domain.models import Task, TaskStatus
+
     orchestrator = get_orchestrator()
-    task = orchestrator.create_task_from_index(
-        description=description,
-        title=title,
+
+    # Get repo info from cached index
+    try:
+        index_data = orchestrator.get_cached_repository_index()
+        repo_path = Path(index_data.get("repo_path", "."))
+        branch = index_data.get("branch", "main")
+        repository_summary = index_data.get("repository_summary", {})
+    except ValueError:
+        return {
+            "error": "No repository index found",
+            "hint": "Run index_repository first"
+        }
+
+    # Create task manually WITHOUT auto-generating clarifications
+    task = Task(
+        id=str(uuid4()),
+        repo_path=repo_path,
+        branch=branch,
+        title=title or description[:50],
+        summary="",
         client=client or "mcp",
+        description=description,
+        status=TaskStatus.CLARIFYING,
     )
 
-    clarifications = task.metadata.get("clarifications", [])
-    pending = [c for c in clarifications if c.get("status") == "PENDING"]
+    # Store minimal metadata
+    task.metadata["repository_summary"] = repository_summary
+    task.metadata["clarifications"] = []  # Empty - will be populated by prompt
+
+    # Save the task
+    orchestrator.store.upsert_task(task)
 
     return {
         "task_id": task.id,
-        "status": task.status.value,
+        "status": "created",
         "title": task.title,
-        "clarifications_pending": len(pending),
-        "clarifications": [
-            {"id": c["id"], "question": c["question"]}
-            for c in pending
-        ],
-        "next_step": "answer_clarification" if pending else "generate_plan",
+        "next_step": f"Invoke generate_clarifications_prompt with task_id='{task.id}' to create clarification questions",
     }
 
 
@@ -206,8 +449,59 @@ def get_task_status(task_id: str) -> dict:
 
 
 # =============================================================================
-# Clarification Tools
+# Clarification Tools (State Management + Submission)
 # =============================================================================
+
+
+@mcp.tool()
+def submit_clarifications(task_id: str, clarifications_json: str) -> dict:
+    """
+    Submit generated clarification questions to the task.
+
+    This tool stores the clarifications generated by Claude via the
+    generate_clarifications_prompt.
+
+    Args:
+        task_id: UUID of the task
+        clarifications_json: JSON string with clarifications array
+
+    Returns:
+        Confirmation and next step instructions
+    """
+    orchestrator = get_orchestrator()
+
+    # Parse the clarifications
+    try:
+        data = json.loads(clarifications_json)
+        clarifications = data.get("clarifications", [])
+    except json.JSONDecodeError as e:
+        return {"error": f"Invalid JSON: {e}"}
+
+    if not clarifications:
+        return {"error": "No clarifications provided in JSON"}
+
+    # Store clarifications in task metadata
+    task = orchestrator._get_task(task_id)
+    task.metadata["clarifications"] = [
+        {
+            "id": f"clarif-{i}",
+            "question": c["question"],
+            "rationale": c.get("rationale", ""),
+            "default_answer": c.get("default_answer", ""),
+            "status": "PENDING",
+            "answer": None,
+        }
+        for i, c in enumerate(clarifications)
+    ]
+    task.status = TaskStatus.CLARIFYING
+    orchestrator.store.upsert_task(task)
+
+    return {
+        "status": "clarifications_stored",
+        "count": len(clarifications),
+        "task_id": task_id,
+        "next_step": "User should answer clarifications using answer_clarification tool",
+    }
 
 
 @mcp.tool()
@@ -231,6 +525,7 @@ def get_clarifications(task_id: str) -> list:
             "question": c.get("question"),
             "status": c.get("status"),
             "answer": c.get("answer"),
+            "default_answer": c.get("default_answer"),
         }
         for c in clarifications
     ]
@@ -266,7 +561,7 @@ def answer_clarification(task_id: str, clarification_id: str, answer: str) -> di
         "clarification_id": clarification_id,
         "pending_count": len(pending),
         "ready_for_plan": len(pending) == 0,
-        "next_step": "generate_plan" if len(pending) == 0 else "answer_clarification",
+        "next_step": f"Invoke generate_plan_prompt with task_id='{task_id}'" if len(pending) == 0 else "answer_clarification",
     }
 
 
@@ -283,10 +578,16 @@ def skip_clarification(task_id: str, clarification_id: str) -> dict:
         Updated status
     """
     orchestrator = get_orchestrator()
+
+    # Get the default answer and use it
+    clarifications = orchestrator.list_clarifications(task_id)
+    clarif = next((c for c in clarifications if c.get("id") == clarification_id), None)
+    default_answer = clarif.get("default_answer", "") if clarif else ""
+
     orchestrator.update_clarification(
         task_id,
         clarification_id,
-        answer="",
+        answer=default_answer,
         status=ClarificationStatus.OVERRIDDEN,
     )
 
@@ -295,49 +596,84 @@ def skip_clarification(task_id: str, clarification_id: str) -> dict:
 
     return {
         "status": "skipped",
+        "used_default": default_answer,
         "pending_count": len(pending),
         "ready_for_plan": len(pending) == 0,
     }
 
 
 # =============================================================================
-# Planning Tools
+# Planning Tools (State Management + Submission)
 # =============================================================================
 
 
 @mcp.tool()
-def generate_plan(task_id: str, fast: bool = False) -> dict:
+def submit_plan(task_id: str, plan_json: str) -> dict:
     """
-    Generate an implementation plan for the task.
+    Submit a generated implementation plan.
 
-    Creates a step-by-step plan with boundary specifications that define
-    the contracts and invariants for the changes. Automatically freezes
-    scope to create a final plan ready for approval.
+    This tool stores the plan generated by Claude via the generate_plan_prompt.
 
     Args:
         task_id: UUID of the task
-        fast: Skip rationale enhancement for faster execution
+        plan_json: JSON string with steps, risks, and dependencies
 
     Returns:
-        Plan steps, boundary specs, and any identified risks
+        Confirmation and next step instructions
     """
     orchestrator = get_orchestrator()
 
-    if orchestrator.has_pending_clarifications(task_id):
-        return {
-            "error": "Clarifications pending",
-            "hint": "Answer all clarifications before generating a plan",
-            "pending_clarifications": orchestrator.list_clarifications(task_id),
-        }
+    # Parse the plan
+    try:
+        plan_data = json.loads(plan_json)
+        steps = plan_data.get("steps", [])
+        risks = plan_data.get("risks", [])
+        dependencies = plan_data.get("dependencies", [])
+    except json.JSONDecodeError as e:
+        return {"error": f"Invalid JSON: {e}"}
 
-    # auto_freeze_scope=True creates a final plan directly (more natural flow)
-    result = orchestrator.generate_plan(task_id, skip_rationale_enhancement=fast, auto_freeze_scope=True)
+    if not steps:
+        return {"error": "Plan must include at least one step"}
 
-    plan = result.get("plan", {})
-    steps = plan.get("steps", [])
+    # Store plan in task metadata
+    task = orchestrator._get_task(task_id)
+    task.metadata["plan"] = {
+        "steps": steps,
+        "risks": risks,
+        "dependencies": dependencies,
+    }
+    task.metadata["plan_approved"] = False
+    task.status = TaskStatus.PLANNING
+    orchestrator.store.upsert_task(task)
+
+    return {
+        "status": "plan_stored",
+        "steps_count": len(steps),
+        "task_id": task_id,
+        "next_step": "User should review the plan and call approve_plan when ready",
+    }
+
+
+@mcp.tool()
+def get_plan(task_id: str) -> dict:
+    """
+    Get the implementation plan for a task.
+
+    Args:
+        task_id: UUID of the task
+
+    Returns:
+        Plan steps, risks, and dependencies
+    """
+    orchestrator = get_orchestrator()
+    task = orchestrator._get_task(task_id)
+    plan_data = task.metadata.get("plan", {})
+
+    steps = plan_data.get("steps", [])
 
     return {
         "task_id": task_id,
+        "approved": task.metadata.get("plan_approved", False),
         "steps": [
             {
                 "index": i + 1,
@@ -346,112 +682,8 @@ def generate_plan(task_id: str, fast: bool = False) -> dict:
             }
             for i, s in enumerate(steps)
         ],
-        "risks": plan.get("risks", []),
-        "pending_specs": result.get("pending_specs", []),
-        "next_step": "get_boundary_specs" if result.get("pending_specs") else "approve_plan",
-    }
-
-
-@mcp.tool()
-def get_boundary_specs(task_id: str) -> list:
-    """
-    Get boundary specifications for a task.
-
-    Boundary specs define the contracts, actors, interfaces, and invariants
-    that must be maintained during implementation.
-
-    Args:
-        task_id: UUID of the task
-
-    Returns:
-        List of boundary specs with their approval status
-    """
-    orchestrator = get_orchestrator()
-    specs = orchestrator.get_boundary_specs(task_id)
-
-    return [
-        {
-            "id": s.get("id"),
-            "boundary_name": s.get("boundary_name"),
-            "status": s.get("status"),
-            "description": s.get("human_description"),
-            "actors": (s.get("machine_spec") or {}).get("actors", []),
-            "interfaces": (s.get("machine_spec") or {}).get("interfaces", []),
-            "invariants": (s.get("machine_spec") or {}).get("invariants", []),
-        }
-        for s in specs
-    ]
-
-
-@mcp.tool()
-def approve_spec(task_id: str, spec_id: str) -> dict:
-    """
-    Approve a boundary specification.
-
-    Args:
-        task_id: UUID of the task
-        spec_id: ID of the boundary spec to approve
-
-    Returns:
-        Updated spec status and remaining pending count
-    """
-    orchestrator = get_orchestrator()
-    result = orchestrator.approve_spec(task_id, spec_id)
-
-    specs = orchestrator.get_boundary_specs(task_id)
-    pending = [s for s in specs if s.get("status") == "PENDING"]
-
-    return {
-        "spec_id": result["spec_id"],
-        "status": "APPROVED",
-        "pending_count": len(pending),
-        "all_specs_resolved": len(pending) == 0,
-        "next_step": "approve_plan" if len(pending) == 0 else "approve_spec",
-    }
-
-
-@mcp.tool()
-def approve_all_specs(task_id: str) -> dict:
-    """
-    Approve all pending boundary specifications at once.
-
-    Args:
-        task_id: UUID of the task
-
-    Returns:
-        Count of approved specs
-    """
-    orchestrator = get_orchestrator()
-    result = orchestrator.approve_all_specs(task_id)
-    return {
-        "approved_count": result.get("approved_count", 0),
-        "next_step": "approve_plan",
-    }
-
-
-@mcp.tool()
-def skip_spec(task_id: str, spec_id: str) -> dict:
-    """
-    Skip a boundary specification (proceed without enforcing it).
-
-    Args:
-        task_id: UUID of the task
-        spec_id: ID of the boundary spec to skip
-
-    Returns:
-        Updated status
-    """
-    orchestrator = get_orchestrator()
-    result = orchestrator.skip_spec(task_id, spec_id)
-
-    specs = orchestrator.get_boundary_specs(task_id)
-    pending = [s for s in specs if s.get("status") == "PENDING"]
-
-    return {
-        "spec_id": result["spec_id"],
-        "status": "SKIPPED",
-        "pending_count": len(pending),
-        "all_specs_resolved": len(pending) == 0,
+        "risks": plan_data.get("risks", []),
+        "dependencies": plan_data.get("dependencies", []),
     }
 
 
@@ -460,8 +692,7 @@ def approve_plan(task_id: str) -> dict:
     """
     Approve the implementation plan.
 
-    All boundary specs must be resolved (approved or skipped) before approving.
-    After approval, you can generate patches.
+    After approval, you can start generating patches for each step.
 
     Args:
         task_id: UUID of the task
@@ -471,53 +702,97 @@ def approve_plan(task_id: str) -> dict:
     """
     orchestrator = get_orchestrator()
 
-    # Check for pending specs
-    specs = orchestrator.get_boundary_specs(task_id)
-    pending = [s for s in specs if s.get("status") == "PENDING"]
-    if pending:
-        return {
-            "error": "Pending boundary specs",
-            "pending_count": len(pending),
-            "hint": "Approve or skip all boundary specs before approving the plan",
-            "pending_specs": [s.get("boundary_name") for s in pending],
-        }
+    task = orchestrator._get_task(task_id)
+    task.metadata["plan_approved"] = True
+    task.status = TaskStatus.IMPLEMENTING
+    orchestrator.store.upsert_task(task)
 
-    result = orchestrator.approve_plan(task_id)
+    plan_data = task.metadata.get("plan", {})
+    steps_count = len(plan_data.get("steps", []))
+
     return {
         "status": "approved",
         "task_id": task_id,
-        "next_step": "generate_patches",
+        "steps_count": steps_count,
+        "next_step": f"Invoke generate_patch_prompt with task_id='{task_id}' and step_index=0 to start implementing",
     }
 
 
 # =============================================================================
-# Patch Generation & Review Tools
+# Patch Generation & Review Tools (State Management + Submission)
 # =============================================================================
 
 
 @mcp.tool()
-def generate_patches(task_id: str, fast: bool = False) -> dict:
+def submit_patch(task_id: str, step_index: int, diff: str, rationale: str) -> dict:
     """
-    Generate code patches for the approved plan.
+    Submit a generated code patch.
 
-    Creates incremental diffs that implement each plan step.
-    Review and approve patches before they are applied.
+    This tool stores the patch generated by Claude via the generate_patch_prompt.
 
     Args:
         task_id: UUID of the task
-        fast: Skip rationale enhancement for faster execution
+        step_index: Zero-based index of the step this patch implements
+        diff: Unified diff showing the code changes
+        rationale: Explanation of what changed and why
 
     Returns:
-        Count of generated patches and test suggestions
+        Confirmation and next step instructions
     """
     orchestrator = get_orchestrator()
-    result = orchestrator.generate_patches(task_id, skip_rationale_enhancement=fast)
+
+    task = orchestrator._get_task(task_id)
+    plan_data = task.metadata.get("plan", {})
+    steps = plan_data.get("steps", [])
+
+    if step_index >= len(steps):
+        return {"error": f"Step index {step_index} out of range (plan has {len(steps)} steps)"}
+
+    step = steps[step_index]
+    step_desc = step.get("description") if isinstance(step, dict) else str(step)
+
+    # Store patch
+    from uuid import uuid4
+    from .domain.models import Patch, PatchKind, PatchStatus
+
+    patch = Patch(
+        id=str(uuid4()),
+        task_id=task_id,
+        step_reference=step_desc,
+        diff=diff,
+        rationale=rationale,
+        status=PatchStatus.PENDING,
+        kind=PatchKind.IMPLEMENTATION,
+        alternatives=[],
+    )
+
+    # Store in task metadata
+    if "patches" not in task.metadata:
+        task.metadata["patches"] = []
+    task.metadata["patches"].append({
+        "id": patch.id,
+        "step_index": step_index,
+        "step_reference": step_desc,
+        "diff": diff,
+        "rationale": rationale,
+        "status": "PENDING",
+    })
+    task.status = TaskStatus.IMPLEMENTING
+    orchestrator.store.upsert_task(task)
+
+    # Check if there are more steps
+    next_step_index = step_index + 1
+    if next_step_index < len(steps):
+        next_step_msg = f"Invoke generate_patch_prompt with task_id='{task_id}' and step_index={next_step_index}"
+    else:
+        next_step_msg = "All patches generated! Review and approve patches using list_patches and approve_patch"
 
     return {
+        "status": "patch_stored",
+        "patch_id": patch.id,
+        "step_index": step_index,
         "task_id": task_id,
-        "patch_count": result.get("patch_count", 0),
-        "test_count": result.get("test_count", 0),
-        "next_step": "list_patches",
+        "next_step": next_step_msg,
     }
 
 
@@ -533,16 +808,17 @@ def list_patches(task_id: str) -> list:
         List of patches with their status and preview
     """
     orchestrator = get_orchestrator()
-    patches = orchestrator.list_patches(task_id)
+    task = orchestrator._get_task(task_id)
+    patches = task.metadata.get("patches", [])
 
     return [
         {
-            "id": p.id,
-            "step_reference": p.step_reference,
-            "status": p.status.value,
-            "kind": p.kind.value,
-            "diff_preview": p.diff[:500] + ("..." if len(p.diff) > 500 else ""),
-            "rationale": p.rationale[:200] + ("..." if len(p.rationale) > 200 else ""),
+            "id": p["id"],
+            "step_index": p.get("step_index", -1),
+            "step_reference": p["step_reference"],
+            "status": p["status"],
+            "diff_preview": p["diff"][:500] + ("..." if len(p["diff"]) > 500 else ""),
+            "rationale": p["rationale"][:200] + ("..." if len(p["rationale"]) > 200 else ""),
         }
         for p in patches
     ]
@@ -561,57 +837,30 @@ def get_patch_details(task_id: str, patch_id: str) -> dict:
         Complete patch details including full diff and rationale
     """
     orchestrator = get_orchestrator()
-    patches = orchestrator.list_patches(task_id)
-    patch = next((p for p in patches if p.id == patch_id), None)
+    task = orchestrator._get_task(task_id)
+    patches = task.metadata.get("patches", [])
+
+    patch = next((p for p in patches if p["id"] == patch_id), None)
 
     if not patch:
         return {"error": f"Patch {patch_id} not found"}
 
     return {
-        "id": patch.id,
-        "step_reference": patch.step_reference,
-        "status": patch.status.value,
-        "kind": patch.kind.value,
-        "diff": patch.diff,
-        "rationale": patch.rationale,
-    }
-
-
-@mcp.tool()
-def get_next_pending_patch(task_id: str) -> dict:
-    """
-    Get the next patch that needs review.
-
-    Args:
-        task_id: UUID of the task
-
-    Returns:
-        Next pending patch or message if none remain
-    """
-    orchestrator = get_orchestrator()
-    patch = orchestrator.get_next_pending_patch(task_id)
-
-    if not patch:
-        return {
-            "message": "No pending patches",
-            "all_reviewed": True,
-        }
-
-    return {
-        "id": patch.id,
-        "step_reference": patch.step_reference,
-        "status": patch.status.value,
-        "diff": patch.diff,
-        "rationale": patch.rationale,
+        "id": patch["id"],
+        "step_index": patch.get("step_index", -1),
+        "step_reference": patch["step_reference"],
+        "status": patch["status"],
+        "diff": patch["diff"],
+        "rationale": patch["rationale"],
     }
 
 
 @mcp.tool()
 def approve_patch(task_id: str, patch_id: str) -> dict:
     """
-    Approve and apply a patch to the working tree.
+    Approve a patch (marks it as approved, but does NOT auto-apply to files).
 
-    This will modify files in the repository.
+    After approving all patches, the user can apply them manually or use sync_external_patch.
 
     Args:
         task_id: UUID of the task
@@ -621,18 +870,26 @@ def approve_patch(task_id: str, patch_id: str) -> dict:
         Confirmation and remaining patch count
     """
     orchestrator = get_orchestrator()
-    patch = orchestrator.approve_patch(task_id, patch_id)
+    task = orchestrator._get_task(task_id)
+    patches = task.metadata.get("patches", [])
+
+    # Update patch status
+    for p in patches:
+        if p["id"] == patch_id:
+            p["status"] = "APPROVED"
+            break
+
+    orchestrator.store.upsert_task(task)
 
     # Count remaining
-    patches = orchestrator.list_patches(task_id)
-    pending = [p for p in patches if p.status.value == "PENDING"]
+    pending = [p for p in patches if p["status"] == "PENDING"]
 
     return {
-        "patch_id": patch.id,
-        "status": "applied",
+        "patch_id": patch_id,
+        "status": "approved",
         "pending_count": len(pending),
-        "all_applied": len(pending) == 0,
-        "next_step": "approve_patch" if pending else "task_complete",
+        "all_approved": len(pending) == 0,
+        "next_step": "approve_patch" if pending else "Apply patches manually in your editor, then use sync_external_patch",
     }
 
 
@@ -641,7 +898,7 @@ def sync_external_patch(task_id: str, patch_id: str | None = None, client: str |
     """
     Sync/record code changes applied in an external editor (Cursor/Claude) back into spec-agent.
 
-    Use this after you apply the patch changes in your editor (instead of using approve_patch),
+    Use this after you apply the patch changes in your editor,
     so the task dashboard reflects the real diff + files touched.
 
     Args:
@@ -665,26 +922,37 @@ def sync_external_patch(task_id: str, patch_id: str | None = None, client: str |
 @mcp.tool()
 def reject_patch(task_id: str, patch_id: str) -> dict:
     """
-    Reject a patch and regenerate the plan.
+    Reject a patch.
 
-    This will discard the current patch queue and create a new plan
-    that accounts for the rejection.
+    This marks the patch as rejected. The user can then regenerate it
+    by invoking generate_patch_prompt again for the same step.
 
     Args:
         task_id: UUID of the task
         patch_id: UUID of the patch to reject
 
     Returns:
-        Confirmation that plan was regenerated
+        Confirmation
     """
     orchestrator = get_orchestrator()
-    orchestrator.reject_patch(task_id, patch_id)
+    task = orchestrator._get_task(task_id)
+    patches = task.metadata.get("patches", [])
+
+    # Update patch status
+    rejected_step_index = -1
+    for p in patches:
+        if p["id"] == patch_id:
+            p["status"] = "REJECTED"
+            rejected_step_index = p.get("step_index", -1)
+            break
+
+    orchestrator.store.upsert_task(task)
 
     return {
         "patch_id": patch_id,
         "status": "rejected",
-        "message": "Plan regenerated - review new patches",
-        "next_step": "list_patches",
+        "message": f"Patch rejected. Invoke generate_patch_prompt again with step_index={rejected_step_index} to regenerate",
+        "next_step": f"generate_patch_prompt(task_id='{task_id}', step_index={rejected_step_index})",
     }
 
 
@@ -710,37 +978,33 @@ def get_workflow_status(task_id: str) -> dict:
     task = orchestrator._get_task(task_id)
 
     # Gather status
-    clarifications = orchestrator.list_clarifications(task_id)
+    clarifications = task.metadata.get("clarifications", [])
     pending_clarifications = [c for c in clarifications if c.get("status") == "PENDING"]
 
-    specs = orchestrator.get_boundary_specs(task_id)
-    pending_specs = [s for s in specs if s.get("status") == "PENDING"]
+    plan_data = task.metadata.get("plan", {})
+    plan_approved = task.metadata.get("plan_approved", False)
 
-    patches = orchestrator.list_patches(task_id)
-    pending_patches = [p for p in patches if p.status.value == "PENDING"]
-    applied_patches = [p for p in patches if p.status.value == "APPLIED"]
+    patches = task.metadata.get("patches", [])
+    pending_patches = [p for p in patches if p["status"] == "PENDING"]
+    approved_patches = [p for p in patches if p["status"] == "APPROVED"]
 
     # Determine stage and next action
     if pending_clarifications:
         stage = "clarifying"
         next_action = "answer_clarification"
         hint = f"Answer {len(pending_clarifications)} clarification question(s)"
-    elif task.status == TaskStatus.CLARIFYING:
+    elif not plan_data:
         stage = "ready_to_plan"
-        next_action = "generate_plan"
-        hint = "Generate implementation plan"
-    elif pending_specs:
-        stage = "reviewing_specs"
-        next_action = "approve_spec"
-        hint = f"Review {len(pending_specs)} boundary spec(s)"
-    elif task.status == TaskStatus.PLANNING:
+        next_action = f"generate_plan_prompt(task_id='{task_id}')"
+        hint = "Invoke generate_plan_prompt to create implementation plan"
+    elif not plan_approved:
         stage = "ready_to_approve"
         next_action = "approve_plan"
-        hint = "Approve the plan to enable patch generation"
+        hint = "Review the plan and approve it"
     elif not patches:
         stage = "ready_to_generate"
-        next_action = "generate_patches"
-        hint = "Generate implementation patches"
+        next_action = f"generate_patch_prompt(task_id='{task_id}', step_index=0)"
+        hint = "Invoke generate_patch_prompt to start creating patches"
     elif pending_patches:
         stage = "reviewing_patches"
         next_action = "approve_patch"
@@ -748,7 +1012,7 @@ def get_workflow_status(task_id: str) -> dict:
     else:
         stage = "completed"
         next_action = None
-        hint = "All patches applied!"
+        hint = "All patches approved! Apply them in your editor."
 
     return {
         "task_id": task_id,
@@ -762,14 +1026,15 @@ def get_workflow_status(task_id: str) -> dict:
                 "total": len(clarifications),
                 "pending": len(pending_clarifications),
             },
-            "specs": {
-                "total": len(specs),
-                "pending": len(pending_specs),
+            "plan": {
+                "exists": bool(plan_data),
+                "approved": plan_approved,
+                "steps_count": len(plan_data.get("steps", [])),
             },
             "patches": {
                 "total": len(patches),
                 "pending": len(pending_patches),
-                "applied": len(applied_patches),
+                "approved": len(approved_patches),
             },
         },
     }
