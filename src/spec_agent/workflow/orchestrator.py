@@ -3026,6 +3026,57 @@ class TaskOrchestrator:
                 return patch
         return None
 
+    def add_patch_for_step(
+        self,
+        task_id: str,
+        step_index: int,
+        diff: str,
+        rationale: str,
+        *,
+        kind: PatchKind = PatchKind.IMPLEMENTATION,
+    ) -> Patch:
+        """
+        Append a patch to the queue for a specific plan step.
+
+        This is used by MCP flows where the LLM running in the client generates
+        a unified diff and rationale, and we want to keep the single source of
+        truth in the orchestrator's patch queue.
+        """
+        task = self._get_task(task_id)
+        plan_data = task.metadata.get("plan", {})
+        steps = plan_data.get("steps", [])
+
+        if step_index < 0 or step_index >= len(steps):
+            raise ValueError(f"Step index {step_index} out of range (plan has {len(steps)} steps)")
+
+        step = steps[step_index]
+        step_desc = step.get("description") if isinstance(step, dict) else str(step)
+
+        patches = self._load_patch_queue(task)
+        patch = Patch(
+            id=str(uuid4()),
+            task_id=task_id,
+            step_reference=step_desc,
+            diff=diff,
+            rationale=rationale,
+            alternatives=[],
+            status=PatchStatus.PENDING,
+            kind=kind,
+        )
+        patches.append(patch)
+        self._persist_patch_queue(task, patches)
+        self.logger.record(
+            task.id,
+            "PATCH_ADDED_EXTERNAL",
+            {
+                "patch_id": patch.id,
+                "step_index": step_index,
+                "step_reference": step_desc,
+                "kind": kind.value,
+            },
+        )
+        return patch
+
     def approve_patch(self, task_id: str, patch_id: str) -> Patch:
         task = self._get_task(task_id)
         patches = self._load_patch_queue(task)

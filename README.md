@@ -1,6 +1,8 @@
 # Spec Agent (Spec‑Driven Development Agent)
 
 Spec Agent is a **boundary-aware, spec-driven workflow** for making changes in large/legacy repositories. It indexes a repo, turns a change request into a plan + boundary specifications, and then generates **incremental, reviewable patches** you can approve or reject.
+# This tool enables spec-driven development workflows for large codebases
+# Spec Agent - Purpose
 
 ## What it does
 
@@ -143,7 +145,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 |----------|-------|
 | **Repository** | `index_repository`, `get_repository_summary` |
 | **Tasks** | `create_task`, `list_tasks`, `get_task_status` |
-| **Clarifications** | `get_clarifications`, `answer_clarification`, `skip_clarification` |
+| **Clarifications** | `get_clarifications`, `answer_clarification` |
 | **Planning** | `generate_plan`, `get_boundary_specs`, `approve_spec`, `approve_all_specs`, `skip_spec`, `approve_plan` |
 | **Patches** | `generate_patches`, `list_patches`, `get_patch_details`, `get_next_pending_patch`, `approve_patch`, `sync_external_patch`, `reject_patch` |
 | **Workflow** | `get_workflow_status` |

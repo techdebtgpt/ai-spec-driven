@@ -65,6 +65,11 @@ def _render_plan_markdown(task: Task) -> str:
     plan_preview = meta.get("plan_preview") or {}
     if not isinstance(plan_preview, dict):
         plan_preview = {}
+    plan_data = meta.get("plan") or {}
+    if not isinstance(plan_data, dict):
+        plan_data = {}
+    if not plan_preview.get("steps") and plan_data:
+        plan_preview = plan_data
 
     steps = plan_preview.get("steps") or []
     risks = plan_preview.get("risks") or []
@@ -529,7 +534,9 @@ def _infer_workflow(task: Task, logs: list[LogEntry]) -> list[Dict[str, Any]]:
             patches_generated_at = entry.timestamp
 
     pending_clarifications = _pending_clarifications(task)
-    has_plan = bool(task.metadata.get("plan_preview")) if isinstance(task.metadata, dict) else False
+    has_plan = False
+    if isinstance(task.metadata, dict):
+        has_plan = bool(task.metadata.get("plan_preview") or task.metadata.get("plan"))
     pending_specs = task.metadata.get("pending_specs") if isinstance(task.metadata, dict) else None
     pending_specs_count = len(pending_specs) if isinstance(pending_specs, list) else 0
     plan_approved = bool(task.metadata.get("plan_approved")) if isinstance(task.metadata, dict) else False
@@ -592,7 +599,7 @@ def _infer_workflow(task: Task, logs: list[LogEntry]) -> list[Dict[str, Any]]:
             done = True
             started_at, ended_at = spec_start, spec_end
         elif key == "CLARIFYING":
-            done = pending_clarifications == 0 and (plan_generated_at is not None or has_plan)
+            done = pending_clarifications == 0
             started_at, ended_at = clar_start, clar_end
             if pending_clarifications > 0:
                 chips.append({"kind": "warning", "text": f"{pending_clarifications} pending"})
@@ -774,7 +781,10 @@ def _plan_html(task_id: str) -> str:
       .then(r => r.ok ? r.json() : Promise.reject(new Error('task not found')))
       .then(data => {{
         const t = data.task || {{}};
-        const clientLabel = (t.client && String(t.client).trim()) ? t.client : 'CLI';
+        const rawClient = (t.client && String(t.client).trim()) || '';
+        const clientLabel = rawClient
+          ? (rawClient.toLowerCase() === 'cursor' ? 'Cursor' : rawClient)
+          : 'CLI';
         document.getElementById('planTitle').textContent = t.title ? t.title : 'Plan';
         document.getElementById('planSubtitle').textContent = `${{clientLabel}} · ${{t.repo_path || '—'}} · ${{t.branch || '—'}}`;
       }})
@@ -935,6 +945,8 @@ body{
 .taskCard:hover{border-color:rgba(59,130,246,.35)}
 .taskCard.selected{outline:2px solid rgba(59,130,246,.35)}
 .taskRow{display:flex; align-items:center; justify-content:space-between; gap:10px}
+.taskRow .taskTitle{flex:1; min-width:0}
+.taskRow .timeLabel{flex-shrink:0; color:#cbd5ff; font-size:12px}
 .timeLabel{color:#cbd5ff;font-size:12px}
 .taskTitle{
   font-size:13px;
@@ -1247,13 +1259,22 @@ let state = {
 
 const $ = (id) => document.getElementById(id);
 
+function clientLabelFrom(raw) {
+  const val = (raw && String(raw).trim()) || '';
+  if (!val) return 'CLI';
+  if (val.toLowerCase() === 'cursor') return 'Cursor';
+  return val;
+}
+
+// Match CLI dashboard: short title so "X ago" timestamp stays visible (28 chars like dashboard.py)
+const TASK_TITLE_MAX_LEN = 28;
 function resolveTaskTitle(task) {
   if (!task) return 'Untitled';
   const raw = (task.title && task.title.trim())
     || (task.summary && task.summary.trim())
     || ((task.description || '').split(/\n/)[0] || '').trim();
   if (!raw) return 'Untitled';
-  return raw.length > 42 ? raw.slice(0, 39) + '…' : raw;
+  return raw.length > TASK_TITLE_MAX_LEN ? raw.slice(0, TASK_TITLE_MAX_LEN - 1) + '…' : raw;
 }
 
 function fmtCount(value) {
@@ -1337,7 +1358,7 @@ function renderOverview(container, task, detail) {
   title.textContent = data.repo_path || task.repo_path || '—';
   const subtitle = document.createElement('div');
   subtitle.className = 'overviewSubtitle';
-  const clientLabel = (task.client && String(task.client).trim()) ? task.client : 'CLI';
+  const clientLabel = clientLabelFrom(task.client);
   subtitle.textContent = `${clientLabel} · ${data.branch || task.branch || '—'}`;
   hero.appendChild(title);
   hero.appendChild(subtitle);
@@ -1591,7 +1612,7 @@ function renderTasks() {
     dot.className = 'dot2 ' + statusDot(t);
     const title = document.createElement('div');
     title.className = 'taskTitle';
-    const clientLabel = (t.client && String(t.client).trim()) ? t.client : 'CLI';
+    const clientLabel = clientLabelFrom(t.client);
     const shortTitle = resolveTaskTitle(t);
     title.textContent = `${clientLabel} · ${shortTitle}`;
     left.appendChild(dot);
@@ -1621,7 +1642,7 @@ function renderTasks() {
 
 function renderWorkflow(task, workflow) {
   if (task) {
-    const clientLabel = (task.client && String(task.client).trim()) ? task.client : 'CLI';
+    const clientLabel = clientLabelFrom(task.client);
     $('workflowSubtitle').textContent = `${clientLabel} · ${task.title}`;
   } else {
     $('workflowSubtitle').textContent = 'Select a task';
@@ -1891,7 +1912,30 @@ function renderDetails(task, step, detail) {
         n.className = 'planN';
         n.textContent = String(idx + 1);
         const txt = document.createElement('span');
-        txt.textContent = (s.description || String(s)).trim();
+
+        // Be robust to different step payload shapes so we never show "[object Object]".
+        let label = "";
+        if (s && typeof s === "object") {
+          const candidate =
+            (typeof s.description === "string" && s.description) ||
+            (typeof s.title === "string" && s.title) ||
+            (typeof s.summary === "string" && s.summary) ||
+            (typeof s.text === "string" && s.text) ||
+            (typeof s.name === "string" && s.name);
+          if (candidate) {
+            label = candidate;
+          } else {
+            try {
+              label = JSON.stringify(s);
+            } catch {
+              label = String(s);
+            }
+          }
+        } else {
+          label = String(s ?? "");
+        }
+
+        txt.textContent = label.trim();
         li.appendChild(n);
         li.appendChild(txt);
         el.appendChild(li);
@@ -2052,7 +2096,30 @@ function renderDetails(task, step, detail) {
         n.className = 'planN';
         n.textContent = String(idx + 1);
         const txt = document.createElement('span');
-        txt.textContent = (s.description || String(s)).trim();
+
+        // Be robust to different step payload shapes so we never show "[object Object]".
+        let label = "";
+        if (s && typeof s === "object") {
+          const candidate =
+            (typeof s.description === "string" && s.description) ||
+            (typeof s.title === "string" && s.title) ||
+            (typeof s.summary === "string" && s.summary) ||
+            (typeof s.text === "string" && s.text) ||
+            (typeof s.name === "string" && s.name);
+          if (candidate) {
+            label = candidate;
+          } else {
+            try {
+              label = JSON.stringify(s);
+            } catch {
+              label = String(s);
+            }
+          }
+        } else {
+          label = String(s ?? "");
+        }
+
+        txt.textContent = label.trim();
         li.appendChild(n);
         li.appendChild(txt);
         el.appendChild(li);
@@ -2449,6 +2516,12 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
         priority = pr.strip()
 
     plan_preview = meta.get("plan_preview") or {}
+    if not isinstance(plan_preview, dict):
+        plan_preview = {}
+    if not plan_preview.get("steps"):
+        plan_fallback = meta.get("plan") if isinstance(meta, dict) else {}
+        if isinstance(plan_fallback, dict):
+            plan_preview = plan_fallback
     plan_steps = (plan_preview.get("steps") or []) if isinstance(plan_preview, dict) else []
     risks = (plan_preview.get("risks") or []) if isinstance(plan_preview, dict) else []
     refactors = (plan_preview.get("refactors") or []) if isinstance(plan_preview, dict) else []
