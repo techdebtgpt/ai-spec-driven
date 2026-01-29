@@ -76,7 +76,6 @@ The MCP server exposes these tools for spec-driven development:
 ### Clarifications
 - `get_clarifications` - Get clarifying questions
 - `answer_clarification` - Answer a question
-- `skip_clarification` - Skip a question
 
 ### Planning
 - `generate_plan` - Generate implementation plan
