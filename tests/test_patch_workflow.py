@@ -74,7 +74,7 @@ def test_approve_patch_applies_diff(mock_run: MagicMock, tmp_path: Path) -> None
         branch="main",
         description="desc",
         status=TaskStatus.PLANNING,
-        metadata={"patch_queue_state": [make_patch().to_dict()]},
+        metadata={"patch_queue_state": [make_patch().to_dict()], "plan_approved": True},
     )
     orch = TaskOrchestrator()
     orch.store.root = tmp_path / "state"
@@ -107,7 +107,7 @@ def test_task_status_completes_when_all_patches_applied(mock_run: MagicMock, tmp
         branch="main",
         description="desc",
         status=TaskStatus.IMPLEMENTING,
-        metadata={"patch_queue_state": [p.to_dict() for p in patches]},
+        metadata={"patch_queue_state": [p.to_dict() for p in patches], "plan_approved": True},
     )
 
     orch = TaskOrchestrator()
@@ -137,7 +137,7 @@ def test_list_patches_backfills_completed_status(tmp_path: Path) -> None:
         branch="main",
         description="desc",
         status=TaskStatus.IMPLEMENTING,
-        metadata={"patch_queue_state": [p.to_dict() for p in patches]},
+        metadata={"patch_queue_state": [p.to_dict() for p in patches], "plan_approved": True},
     )
 
     orch = TaskOrchestrator()
@@ -287,6 +287,7 @@ def test_sync_external_patch_without_queue_marks_task_complete(tmp_path: Path) -
         branch=branch,
         description="desc",
         status=TaskStatus.IMPLEMENTING,
+        metadata={"plan_approved": True},
     )
 
     orch = TaskOrchestrator()
@@ -330,7 +331,7 @@ def test_sync_external_patch_no_diff_marks_pending_patches_applied(tmp_path: Pat
         branch=branch,
         description="desc",
         status=TaskStatus.IMPLEMENTING,
-        metadata={"patch_queue_state": [patch.to_dict()]},
+        metadata={"patch_queue_state": [patch.to_dict()], "plan_approved": True},
     )
 
     orch = TaskOrchestrator()

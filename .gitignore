@@ -15,5 +15,6 @@ build/
 assets/
 .tmp/
 .vscode/
+docs/plans/
 
 

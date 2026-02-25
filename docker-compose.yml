@@ -1,0 +1,16 @@
+services:
+  spec-agent:
+    build: .
+    container_name: spec-agent
+    working_dir: /workspace
+    environment:
+      - SPEC_AGENT_STATE_DIR=/app/.spec_agent
+    volumes:
+      - .:/workspace:cached
+      - ${HOME}/.spec_agent:/app/.spec_agent
+    ports:
+      - "8844:8844"
+    command: ["/app/spec-agent", "web", "--host", "0.0.0.0", "--port", "8844", "--no-open"]
+
+volumes:
+  spec-agent-state:

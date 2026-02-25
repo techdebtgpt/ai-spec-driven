@@ -19,14 +19,15 @@ import json
 import logging
 import os
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
 
-from .domain.models import ClarificationStatus, TaskStatus, PatchStatus
+from .domain.models import ClarificationStatus, PatchStatus, TaskStatus, utcnow
 from .workflow.orchestrator import TaskOrchestrator
 
 LOG = logging.getLogger(__name__)
@@ -35,24 +36,29 @@ LOG = logging.getLogger(__name__)
 mcp = FastMCP(
     "spec-agent",
     instructions=(
-        "Spec-driven development agent using prompt-based architecture. "
-        "For a quick overview of the repository in MCP chat, prefer calling quick_repo_summary first. "
-        "Use index_repository only when you are about to start the full spec workflow (create_task, planning, patches), "
-        "since it performs a slower semantic index pass. "
-        "After indexing, create_task binds a ticket to repo/branch. For LLM-based generation, invoke the "
-        "appropriate prompts (generate_clarifications_prompt, answer_clarifications_prompt, generate_plan_prompt, etc.), then "
-        "submit results using submit_* tools. "
-        "IMPORTANT: After submit_clarifications, you MUST call answer_clarifications_prompt then "
-        "answer_all_clarifications with answers for EVERY question (one JSON with all answers). "
+        "Spec-Agent: AI-Driven Development Lifecycle engine. "
+        "This system implements a rigorous, pillar-based workflow that transforms requirements into production-ready code. "
+        "THE SIX PILLARS: "
+        "1) DISCOVERY — index_repository + create_task + answer_clarifications: Understand the codebase and requirements. "
+        "2) ARCHITECTURE — generate_plan_prompt + submit_plan + approve_plan: Design a concrete implementation plan. "
+        "3) QUALITY GATE — generate_test_suggestions_prompt + submit_test_suggestions: Define test coverage BEFORE writing code. "
+        "4) IMPLEMENTATION — generate_patch_prompt + submit_patch (for each step): Generate focused, incremental patches. "
+        "5) VERIFICATION — approve_patch + sync_external_patch: Review changes and sync applied diffs. "
+        "6) DELIVERY — complete_task: Finalize and close. "
+        "IMPORTANT: Follow the pillars in order. Do not skip ahead. "
+        "After submit_clarifications, you MUST call answer_clarifications_prompt then answer_all_clarifications with answers for EVERY question. "
         "Do not plan or write code until all clarifications are answered. "
-        "After patches are generated and approve_patch has been called, the user applies those patches "
-        "in their editor, then the client MUST call sync_external_patch(task_id='<task-id>', patch_id='<patch-id>', client='cursor') "
-        "to sync the applied diff back so the web dashboard and task status stay in sync."
+        "After applying ALL changes in your editor, call sync_external_patch(task_id) "
+        "WITHOUT patch_id to mark all patches as applied at once."
     ),
 )
 
 # Lazy-loaded orchestrator (created on first use)
 _orchestrator: TaskOrchestrator | None = None
+
+# In-memory cache for quick_repo_summary (keyed by repo_path string)
+_quick_summary_cache: Dict[str, Tuple[float, dict]] = {}
+_QUICK_SUMMARY_TTL = 300  # seconds
 
 
 def get_orchestrator() -> TaskOrchestrator:
@@ -86,6 +92,59 @@ def _infer_repo_and_branch(
         current_branch = "main"
 
     return repo, current_branch
+
+
+def _infer_step_scenario(description: str, notes: Optional[str] = None, *, has_tests: bool = True) -> list[str]:
+    """
+    Create a small, human-readable Given/When/Then scenario for a plan step.
+
+    This mirrors the CLI/web scenario heuristic so test prompts align with
+    plan scenarios.
+    """
+    desc = (description or "").strip()
+    if not desc:
+        return []
+
+    desc_l = desc.lower()
+    notes_clean = (notes or "").strip()
+
+    given = "Given the codebase is indexed and the current behavior is understood"
+
+    if desc_l.startswith("implement"):
+        when = f"When we {desc_l}"
+        then = "Then the new component exists and is ready to be integrated"
+    elif desc_l.startswith("update") or desc_l.startswith("refactor"):
+        when = f"When we {desc_l}"
+        then = "Then the existing flow uses the updated configuration path"
+    elif "test" in desc_l and has_tests:
+        when = f"When we {desc_l}"
+        then = "Then automated tests validate both happy-path and failure cases"
+    elif desc_l.startswith("document"):
+        when = f"When we {desc_l}"
+        then = "Then the team can maintain the setup confidently without tribal knowledge"
+    else:
+        when = f"When we {desc_l}"
+        then = "Then the change is implemented with clear acceptance criteria"
+
+    lines = [
+        f"Given: {given}",
+        f"When:  {when}",
+        f"Then:  {then}",
+    ]
+    if notes_clean:
+        lines.append(f"And:   {notes_clean}")
+    return lines
+
+
+def _test_system_prompt() -> str:
+    return (
+        "You are executing the Quality Gate pillar of the AI-Driven Development Lifecycle. "
+        "Design comprehensive automated tests that achieve full coverage of changed and impacted code paths. "
+        "Map tests directly to plan scenarios as acceptance criteria. Cover happy paths, edge cases, "
+        "negative cases, and error handling. Match the repository's existing test framework and conventions. "
+        "If coverage gaps remain (external dependencies, nondeterminism, missing harness), call them out "
+        "explicitly with proposed mitigations."
+    )
 
 
 # =============================================================================
@@ -304,24 +363,23 @@ def generate_plan_prompt(task_id: str):
     except ValueError:
         repo_context = ""
 
-    prompt_content = f"""You are a senior software architect creating a detailed implementation plan.
+    prompt_content = f"""You are an expert software architect executing the Architecture pillar of the AI-Driven Development Lifecycle.
 
 {repo_context}
 
-Task Details:
-Title: {task.title or "N/A"}
+Task: {task.title or "N/A"}
 Description: {task.description}
 
 Clarifications:
 {clarifications_text or "None provided"}
 
-Your job is to create a step-by-step implementation plan that:
-1. Breaks the task into logical, incremental steps
-2. Identifies which files need to be modified for each step
-3. Considers dependencies between steps
-4. Identifies potential risks
+Produce a precise implementation plan:
+1. Break the task into 3-7 logical, incremental steps
+2. For each step, identify the exact files to modify
+3. Order steps by dependency — earlier steps should not depend on later ones
+4. Identify risks and external dependencies
 
-Each step should be implementable independently and testable.
+Each step MUST be independently implementable and verifiable.
 
 Return your response as a JSON object:
 {{
@@ -344,6 +402,136 @@ submit_plan(task_id="{task_id}", plan_json=<your_json>)
 """
 
     return [{"role": "user", "content": prompt_content}]
+
+
+@mcp.prompt()
+def generate_test_suggestions_prompt(task_id: str):
+    """
+    Generate test suggestions based on the plan steps and scenarios.
+
+    This prompt guides client LLM to propose tests that map to plan scenarios
+    and aim for full coverage.
+    """
+    orchestrator = get_orchestrator()
+    task = orchestrator._get_task(task_id)
+    plan_data = task.metadata.get("plan", {}) if isinstance(task.metadata, dict) else {}
+    steps = plan_data.get("steps", []) if isinstance(plan_data, dict) else []
+
+    if not steps:
+        return [
+            {
+                "role": "user",
+                "content": "No plan found. Generate and submit a plan first (generate_plan_prompt + submit_plan).",
+            }
+        ]
+
+    repo_summary = task.metadata.get("repository_summary", {}) if isinstance(task.metadata, dict) else {}
+    has_tests = bool(repo_summary.get("has_tests", False)) if isinstance(repo_summary, dict) else False
+    languages = repo_summary.get("top_languages", []) if isinstance(repo_summary, dict) else []
+    test_paths = repo_summary.get("test_paths_sample", []) if isinstance(repo_summary, dict) else []
+
+    def _lang_list(raw) -> list[str]:
+        langs: list[str] = []
+        for item in raw or []:
+            if isinstance(item, dict) and item.get("language"):
+                langs.append(str(item.get("language")))
+            else:
+                langs.append(str(item))
+        return langs
+
+    step_lines: list[str] = []
+    scenario_lines: list[str] = []
+    for idx, step in enumerate(steps, start=1):
+        if isinstance(step, dict):
+            desc = (step.get("description") or "").strip() or "(missing step description)"
+            targets = step.get("target_files") or []
+            notes = step.get("notes")
+        else:
+            desc = str(step).strip() or "(missing step description)"
+            targets = []
+            notes = None
+
+        step_lines.append(f"{idx}. {desc}")
+        if targets:
+            step_lines.append(f"   Targets: {', '.join(str(t) for t in targets)}")
+        if notes:
+            step_lines.append(f"   Notes: {notes}")
+
+        scenario = _infer_step_scenario(desc, notes, has_tests=has_tests)
+        if scenario:
+            if scenario_lines:
+                scenario_lines.append("")  # spacer
+            scenario_lines.append(f"Step {idx}: {desc}")
+            scenario_lines.extend([f"- {line}" for line in scenario])
+
+    clarifications = task.metadata.get("clarifications") if isinstance(task.metadata, dict) else None
+    clarifications_text = ""
+    if isinstance(clarifications, list) and clarifications:
+        clarifications_text = "\n".join(
+            [
+                f"Q: {c.get('question')}\nA: {c.get('answer', c.get('default_answer', 'N/A'))}"
+                for c in clarifications
+            ]
+        )
+
+    repo_context = f"""Repository Context:
+- Primary languages: {', '.join(_lang_list(languages)[:3]) or 'unknown'}
+- Has tests: {has_tests}
+- Sample test files: {', '.join(str(p) for p in test_paths[:5]) or 'none detected'}
+"""
+
+    prompt_content = f"""Generate test suggestions that map 1:1 to the plan steps and scenarios.
+
+Task Details:
+Title: {task.title or "N/A"}
+Description: {task.description}
+
+{repo_context}
+
+Plan Steps:
+{chr(10).join(step_lines)}
+
+Scenarios (Given / When / Then):
+{chr(10).join(scenario_lines) if scenario_lines else "None"}
+
+Clarifications:
+{clarifications_text or "None provided"}
+
+Requirements:
+- Use the scenarios above as acceptance criteria.
+- Aim for 100% code coverage of changed and impacted code paths.
+- Include happy-path, edge-case, and negative tests per scenario.
+- Identify existing test files to update when applicable.
+- Provide skeleton code matching the repo's test framework.
+
+Return a JSON object:
+{{
+  "tests": [
+    {{
+      "step_index": 1,
+      "description": "Test scenario description",
+      "expected_behavior": "What should be verified",
+      "test_type": "UNIT or INTEGRATION",
+      "related_files": ["file1.py", "file2.py"],
+      "existing_tests_to_update": ["tests/test_file.py"],
+      "skeleton_code": "Complete test skeleton code"
+    }}
+  ],
+  "coverage_gaps": [
+    "Describe any gaps that prevent full coverage and how to mitigate them"
+  ]
+}}
+
+IMPORTANT: Return ONLY valid JSON (no markdown code blocks).
+
+After generating the tests, call:
+submit_test_suggestions(task_id="{task_id}", suggestions_json=<your_json>)
+"""
+
+    return [
+        {"role": "system", "content": _test_system_prompt()},
+        {"role": "user", "content": prompt_content},
+    ]
 
 
 @mcp.prompt()
@@ -370,42 +558,41 @@ def generate_patch_prompt(task_id: str, step_index: int):
         return [{"role": "user", "content": f"Error: Step index {step_index} out of range (plan has {len(steps)} steps)"}]
 
     step = steps[step_index]
+
+    # Skip codegen steps (e.g. test steps on repos with no test framework)
+    if isinstance(step, dict) and step.get("skip_codegen"):
+        reason = step.get("skip_codegen_reason", "step does not require code generation")
+        return [{"role": "user", "content": (
+            f"Step #{step_index + 1} is marked as skip_codegen ({reason}). "
+            f"No patch is needed. Proceed to the next step: "
+            f"generate_patch_prompt(task_id='{task_id}', step_index={step_index + 1})"
+        )}]
+
     step_desc = step.get("description") if isinstance(step, dict) else str(step)
     target_files = step.get("target_files", []) if isinstance(step, dict) else []
     reasoning = step.get("reasoning", "") if isinstance(step, dict) else ""
 
-    prompt_content = f"""You are an expert software engineer implementing a specific code change.
+    prompt_content = f"""You are executing the Implementation pillar of the AI-Driven Development Lifecycle.
 
 Task: {task.title or "N/A"}
 
 Plan Step #{step_index + 1}:
 Description: {step_desc}
-Target Files: {', '.join(target_files) if target_files else 'Not specified - infer from description'}
+Target Files: {', '.join(target_files) if target_files else 'Infer from description'}
 Reasoning: {reasoning}
 
-Your job is to:
-1. Read the target files (or infer them from the description)
-2. Implement the changes needed for this step
-3. Create a unified diff patch showing the changes
-4. Explain the rationale for your implementation choices
+Implement this step precisely:
+1. Read the target files
+2. Make the minimum changes needed for this step
+3. Produce a unified diff
+4. Write a rationale explaining your decisions
 
-Guidelines:
-- Follow the existing code style and patterns
-- Add appropriate error handling
-- Consider edge cases mentioned in clarifications
-- Keep changes minimal and focused on this step only
-- Include comments where logic isn't self-evident
+Rules:
+- Follow existing code style and patterns exactly
+- Keep changes minimal and focused on THIS step only
+- Do not add unnecessary comments, docstrings, or formatting changes
 
-After implementing the changes:
-1. Generate a unified diff (use `git diff` or create manually)
-2. Write a rationale explaining:
-   - What you changed and why
-   - Design decisions made
-   - Trade-offs considered
-   - How this addresses the step requirements
-
-Then call:
-submit_patch(task_id="{task_id}", step_index={step_index}, diff="<unified_diff>", rationale="<explanation>")
+Then call: submit_patch(task_id="{task_id}", step_index={step_index}, diff="<unified_diff>", rationale="<explanation>")
 """
 
     return [{"role": "user", "content": prompt_content}]
@@ -473,16 +660,28 @@ def quick_repo_summary(repo_path: Optional[str] = None, branch: Optional[str] = 
     orchestrator = get_orchestrator()
     repo, resolved_branch = _infer_repo_and_branch(repo_path, branch)
 
-    # Use the ContextIndexer directly so we avoid the slower semantic index pass.
+    cache_key = str(repo)
+    now = time.monotonic()
+
+    # Check in-memory cache (TTL-based)
+    if cache_key in _quick_summary_cache:
+        cached_at, cached_result = _quick_summary_cache[cache_key]
+        if now - cached_at < _QUICK_SUMMARY_TTL:
+            # Update branch in case it changed between calls
+            cached_result["branch"] = resolved_branch
+            return cached_result
+
+    # Use the ContextIndexer directly with quick=True to skip Serena + import graph.
     summary = orchestrator.context_indexer.summarize_repository(
         repo_path=repo,
         include_serena_semantic_tree=False,
+        quick=True,
     )
 
     if not isinstance(summary, dict):
         summary = {}
 
-    return {
+    result = {
         "repo_name": repo.name,
         "repo_path": str(repo),
         "branch": resolved_branch,
@@ -495,6 +694,11 @@ def quick_repo_summary(repo_path: Optional[str] = None, branch: Optional[str] = 
         "test_paths_sample": summary.get("test_paths_sample", [])[:10],
         "hotspots": summary.get("hotspots", [])[:10],
     }
+
+    # Store in cache
+    _quick_summary_cache[cache_key] = (now, result)
+
+    return result
 
 
 @mcp.tool()
@@ -1113,6 +1317,14 @@ def get_plan_overview(task_id: str) -> dict:
 
 
 @mcp.tool()
+def get_test_system_prompt() -> dict:
+    """
+    Return the raw system prompt used for test suggestions.
+    """
+    return {"system_prompt": _test_system_prompt()}
+
+
+@mcp.tool()
 def approve_plan(task_id: str) -> dict:
     """
     Approve the implementation plan.
@@ -1149,6 +1361,25 @@ def approve_plan(task_id: str) -> dict:
     task.metadata["plan_approved_at"] = task.updated_at.isoformat()
     orchestrator.store.upsert_task(task)
 
+    # Auto-apply patches for skip_codegen steps (e.g. test steps on repos with no test framework)
+    steps = plan_data.get("steps", [])
+    for idx, step in enumerate(steps):
+        if isinstance(step, dict) and step.get("skip_codegen"):
+            patch = orchestrator.add_patch_for_step(
+                task_id=task_id,
+                step_index=idx,
+                diff="",
+                rationale=f"Auto-passed: {step.get('skip_codegen_reason', 'step does not require code generation')}",
+            )
+            # Mark immediately as APPLIED
+            patches = orchestrator._load_patch_queue(task)
+            for p in patches:
+                if p.id == patch.id:
+                    p.status = PatchStatus.APPLIED
+                    p.applied_via = "auto-skip"
+                    p.applied_at = utcnow()
+            orchestrator._persist_patch_queue(task, patches)
+
     plan_markdown_path: str | None = None
     try:
         exported = orchestrator.export_approved_plan_markdown(task_id)
@@ -1167,7 +1398,12 @@ def approve_plan(task_id: str) -> dict:
         "task_id": task_id,
         "steps_count": steps_count,
         "plan_markdown_path": plan_markdown_path,
-        "next_step": f"Invoke generate_patch_prompt with task_id='{task_id}' and step_index=0 to start implementing",
+        "next_step": (
+            f"RECOMMENDED: Invoke generate_test_suggestions_prompt(task_id='{task_id}') to generate test cases "
+            f"based on the plan BEFORE writing patches. Then call submit_test_suggestions with the generated JSON. "
+            f"After tests are defined, invoke generate_patch_prompt(task_id='{task_id}', step_index=0) to start implementing."
+        ),
+        "alternative_next_step": f"Or skip tests and go directly to generate_patch_prompt(task_id='{task_id}', step_index=0)",
     }
 
 
@@ -1194,6 +1430,18 @@ def submit_patch(task_id: str, step_index: int, diff: str, rationale: str) -> di
     """
     orchestrator = get_orchestrator()
 
+    # Check if this step is marked as skip_codegen (already auto-applied)
+    task = orchestrator._get_task(task_id)
+    plan_data = task.metadata.get("plan", {})
+    steps = plan_data.get("steps", [])
+    step = steps[step_index] if step_index < len(steps) else None
+    if isinstance(step, dict) and step.get("skip_codegen"):
+        return {
+            "status": "skipped",
+            "reason": step.get("skip_codegen_reason", "step does not require code generation"),
+            "next_step": "Proceed to next step or approve patches",
+        }
+
     # Append the patch into the orchestrator's patch queue so CLI and MCP stay aligned.
     try:
         patch = orchestrator.add_patch_for_step(
@@ -1206,7 +1454,6 @@ def submit_patch(task_id: str, step_index: int, diff: str, rationale: str) -> di
         return {"error": str(exc)}
 
     # Check if there are more steps remaining in the plan
-    task = orchestrator._get_task(task_id)
     plan_data = task.metadata.get("plan", {})
     steps = plan_data.get("steps", [])
     next_step_index = step_index + 1
@@ -1222,6 +1469,108 @@ def submit_patch(task_id: str, step_index: int, diff: str, rationale: str) -> di
         "step_index": step_index,
         "task_id": task_id,
         "next_step": next_step_msg,
+    }
+
+
+@mcp.tool()
+def submit_test_suggestions(task_id: str, suggestions_json: str) -> dict:
+    """
+    Submit generated test suggestions for a task.
+
+    Stores the full suggestions payload and a compact description list.
+    """
+    orchestrator = get_orchestrator()
+    task = orchestrator._get_task(task_id)
+
+    try:
+        data = json.loads(suggestions_json)
+    except json.JSONDecodeError as exc:
+        return {"error": f"Invalid JSON: {exc}"}
+
+    tests = data.get("tests") or data.get("suggestions") or []
+    if not isinstance(tests, list) or not tests:
+        return {"error": "No tests provided in JSON (expected tests array)."}
+
+    descriptions: list[str] = []
+    for test in tests:
+        if isinstance(test, dict) and test.get("description"):
+            descriptions.append(str(test.get("description")))
+        else:
+            descriptions.append(str(test))
+
+    if not isinstance(task.metadata, dict):
+        task.metadata = {}
+
+    task.metadata["test_suggestions_raw"] = tests
+    task.metadata["test_suggestions"] = descriptions
+    task.metadata["test_suggestions_coverage_gaps"] = data.get("coverage_gaps", [])
+    task.touch()
+    orchestrator.store.upsert_task(task)
+
+    return {
+        "status": "test_suggestions_stored",
+        "task_id": task_id,
+        "test_count": len(descriptions),
+        "coverage_gaps": data.get("coverage_gaps", []),
+        "next_step": f"Tests stored! Use get_test_suggestions(task_id='{task_id}') to review, then proceed to generate_patch_prompt for implementation.",
+    }
+
+
+@mcp.tool()
+def get_test_suggestions(task_id: str) -> dict:
+    """
+    Get the test suggestions for a task.
+
+    Returns the full test suggestions including skeleton code, coverage gaps,
+    and mapping to plan steps. Use this after generate_test_suggestions_prompt
+    and submit_test_suggestions to review the proposed tests.
+
+    Args:
+        task_id: UUID of the task
+
+    Returns:
+        Test suggestions with descriptions, skeleton code, and coverage gaps
+    """
+    orchestrator = get_orchestrator()
+    task = orchestrator._get_task(task_id)
+
+    if not isinstance(task.metadata, dict):
+        return {"error": "No metadata found for task", "task_id": task_id}
+
+    raw_tests = task.metadata.get("test_suggestions_raw", [])
+    descriptions = task.metadata.get("test_suggestions", [])
+    coverage_gaps = task.metadata.get("test_suggestions_coverage_gaps", [])
+
+    if not raw_tests and not descriptions:
+        return {
+            "error": "No test suggestions found for this task",
+            "task_id": task_id,
+            "hint": f"Generate tests first by invoking generate_test_suggestions_prompt(task_id='{task_id}'), then call submit_test_suggestions with the generated JSON.",
+        }
+
+    # Get plan context for cross-reference
+    plan_data = task.metadata.get("plan", {}) if isinstance(task.metadata, dict) else {}
+    plan_steps = plan_data.get("steps", []) if isinstance(plan_data, dict) else []
+
+    return {
+        "task_id": task_id,
+        "test_count": len(raw_tests) if raw_tests else len(descriptions),
+        "tests": [
+            {
+                "index": i + 1,
+                "step_index": t.get("step_index") if isinstance(t, dict) else None,
+                "description": t.get("description") if isinstance(t, dict) else str(t),
+                "expected_behavior": t.get("expected_behavior") if isinstance(t, dict) else None,
+                "test_type": t.get("test_type") if isinstance(t, dict) else None,
+                "related_files": t.get("related_files", []) if isinstance(t, dict) else [],
+                "existing_tests_to_update": t.get("existing_tests_to_update", []) if isinstance(t, dict) else [],
+                "skeleton_code": t.get("skeleton_code") if isinstance(t, dict) else None,
+            }
+            for i, t in enumerate(raw_tests if raw_tests else descriptions)
+        ],
+        "coverage_gaps": coverage_gaps,
+        "plan_steps_count": len(plan_steps),
+        "next_step": f"Review the test suggestions above, then proceed to generate_patch_prompt(task_id='{task_id}', step_index=0) to implement the changes.",
     }
 
 
@@ -1310,8 +1659,8 @@ def approve_patch(task_id: str, patch_id: str) -> dict:
     else:
         # All patches approved - need to apply and sync
         next_step = (
-            f"IMPORTANT: Apply the approved patch(es) in your editor, then call sync_external_patch "
-            f"(task_id='{task_id}', patch_id='{patch_id}') to sync changes back to the web dashboard. "
+            f"IMPORTANT: Apply the approved patch(es) in your editor, then call "
+            f"sync_external_patch(task_id='{task_id}') to sync all changes. "
             f"The web UI will not show applied changes until you call sync_external_patch."
         )
 
@@ -1324,7 +1673,7 @@ def approve_patch(task_id: str, patch_id: str) -> dict:
         "applied_via": getattr(patch, "applied_via", None),
         "sync_required": len(pending) == 0,
         "sync_instruction": (
-            f"After applying changes in your editor, call: sync_external_patch(task_id='{task_id}', patch_id='{patch_id}')"
+            f"After applying changes in your editor, call: sync_external_patch(task_id='{task_id}')"
             if len(pending) == 0
             else None
         ),
@@ -1338,6 +1687,8 @@ def sync_external_patch(task_id: str, patch_id: str | None = None, client: str |
 
     Use this after you apply the patch changes in your editor,
     so the task dashboard reflects the real diff + files touched.
+
+    When all patches are synced, the task is automatically marked as COMPLETED.
 
     Args:
         task_id: UUID of the task
@@ -1355,9 +1706,29 @@ def sync_external_patch(task_id: str, patch_id: str | None = None, client: str |
         client=client,
         include_staged=include_staged,
     )
-    
+
+    # Reload task to get current status (may have been auto-completed)
+    task = orchestrator._get_task(task_id)
+    result["task_status"] = task.status.value
+    result["task_completed"] = task.status == TaskStatus.COMPLETED
+
+    # Check remaining patches
+    try:
+        patches = orchestrator.list_patches(task_id)
+        pending_patches = [p for p in patches if p.status == PatchStatus.PENDING]
+        result["pending_patches_count"] = len(pending_patches)
+    except Exception:
+        pending_patches = []
+        result["pending_patches_count"] = 0
+
     # Enhance the response with clearer messaging
-    if result.get("has_diff"):
+    if result.get("task_completed"):
+        result["message"] = (
+            f"Task completed! All patches have been synced and applied. "
+            f"The web dashboard now shows the task as COMPLETED."
+        )
+        result["next_step"] = "Task is complete! You can view the final state in the web dashboard."
+    elif result.get("has_diff"):
         if patch_id:
             result["message"] = (
                 f"Successfully synced changes! Patch {patch_id[:8]} marked as APPLIED. "
@@ -1367,17 +1738,18 @@ def sync_external_patch(task_id: str, patch_id: str | None = None, client: str |
             result["message"] = (
                 f"Successfully synced changes! The web dashboard will now show the actual diff and files touched."
             )
+        if pending_patches:
+            result["next_step"] = (
+                f"{len(pending_patches)} patch(es) remaining. Apply the next patch and call sync_external_patch again."
+            )
+        else:
+            result["next_step"] = "All patches synced! Check the web dashboard for final status."
     else:
         result["message"] = (
             "No changes detected in git diff. If you applied changes, make sure they are saved and visible in git status."
         )
-    
-    result["next_step"] = (
-        "Changes synced! Check the web dashboard to see the updated patch status and diff."
-        if result.get("has_diff")
-        else "No changes detected. Make sure you've saved your file changes and they appear in git diff."
-    )
-    
+        result["next_step"] = "No changes detected. Make sure you've saved your file changes and they appear in git diff."
+
     return result
 
 
@@ -1414,6 +1786,71 @@ def reject_patch(task_id: str, patch_id: str) -> dict:
     }
 
 
+@mcp.tool()
+def complete_task(task_id: str, sync_changes: bool = True, force: bool = False) -> dict:
+    """
+    Mark a task as completed.
+
+    Use this after all changes have been applied and synced. This explicitly
+    marks the task as COMPLETED in the web dashboard.
+
+    The plan must be approved before a task can be completed. Use force=True
+    to override this check (not recommended).
+
+    If sync_changes is True (default), this will first capture any uncommitted
+    git changes before marking the task complete.
+
+    Args:
+        task_id: UUID of the task
+        sync_changes: If True, capture current git diff before completing
+        force: If True, complete even if plan is not approved (not recommended)
+
+    Returns:
+        Confirmation that the task is marked as COMPLETED
+    """
+    orchestrator = get_orchestrator()
+    task = orchestrator._get_task(task_id)
+
+    # Check if plan is approved
+    plan_approved = task.metadata.get("plan_approved", False) if isinstance(task.metadata, dict) else False
+    if not plan_approved and not force:
+        return {
+            "error": "Cannot complete task: plan is not approved",
+            "task_id": task_id,
+            "plan_approved": False,
+            "hint": f"Approve the plan first using approve_plan(task_id='{task_id}'), or use force=True to override.",
+        }
+
+    # Optionally sync any remaining changes first
+    sync_result = None
+    if sync_changes:
+        try:
+            sync_result = orchestrator.sync_external_patch(
+                task_id,
+                patch_id=None,
+                client=task.client or "mcp",
+                include_staged=True,
+            )
+        except Exception as exc:
+            LOG.warning("Could not sync changes before completing task %s: %s", task_id, exc)
+
+    # Mark task as completed
+    task.status = TaskStatus.COMPLETED
+    task.touch()
+    orchestrator.store.upsert_task(task)
+
+    return {
+        "task_id": task_id,
+        "status": "COMPLETED",
+        "message": "Task marked as COMPLETED. The web dashboard now shows the task as finished.",
+        "plan_approved": plan_approved,
+        "sync_result": {
+            "has_diff": sync_result.get("has_diff") if sync_result else False,
+            "files": sync_result.get("files", []) if sync_result else [],
+        } if sync_changes else None,
+    }
+
+
 # =============================================================================
 # Workflow Helpers
 # =============================================================================
@@ -1441,6 +1878,12 @@ def get_workflow_status(task_id: str) -> dict:
 
     plan_data = task.metadata.get("plan", {})
     plan_approved = task.metadata.get("plan_approved", False)
+
+    # Test suggestions state
+    test_suggestions = task.metadata.get("test_suggestions", [])
+    test_suggestions_raw = task.metadata.get("test_suggestions_raw", [])
+    has_tests = bool(test_suggestions or test_suggestions_raw)
+    test_count = len(test_suggestions_raw) if test_suggestions_raw else len(test_suggestions)
 
     # Prefer the orchestrator's patch queue so CLI and MCP stay in sync
     try:
@@ -1470,10 +1913,19 @@ def get_workflow_status(task_id: str) -> dict:
         stage = "ready_to_approve"
         next_action = "approve_plan"
         hint = "Review the plan and approve it"
+    elif plan_approved and not has_tests and not patch_queue:
+        # Plan approved but no tests generated yet - recommend test generation
+        stage = "ready_to_test"
+        next_action = f"generate_test_suggestions_prompt(task_id='{task_id}')"
+        hint = (
+            "RECOMMENDED: Generate test cases before implementing. "
+            f"Invoke generate_test_suggestions_prompt(task_id='{task_id}'), then submit_test_suggestions. "
+            "Or skip tests and go directly to generate_patch_prompt."
+        )
     elif not patch_queue:
         stage = "ready_to_generate"
         next_action = f"generate_patch_prompt(task_id='{task_id}', step_index=0)"
-        hint = "Invoke generate_patch_prompt to start creating patches"
+        hint = f"Invoke generate_patch_prompt to start creating patches{' (tests already generated)' if has_tests else ''}"
     elif pending_patches:
         stage = "reviewing_patches"
         next_action = "approve_patch"
@@ -1482,6 +1934,10 @@ def get_workflow_status(task_id: str) -> dict:
         stage = "syncing_patches"
         next_action = f"sync_external_patch(task_id='{task_id}', patch_id='{approved_unsynced[0].id}')"
         hint = f"IMPORTANT: {len(approved_unsynced)} approved patch(es) need syncing. Apply changes in your editor, then call sync_external_patch to update the web dashboard."
+    elif task.status == TaskStatus.COMPLETED:
+        stage = "completed"
+        next_action = None
+        hint = "Task COMPLETED! All patches have been applied and synced. The web dashboard shows the final state."
     else:
         stage = "completed"
         next_action = None
@@ -1492,6 +1948,7 @@ def get_workflow_status(task_id: str) -> dict:
         "title": task.title,
         "stage": stage,
         "status": task.status.value,
+        "task_completed": task.status == TaskStatus.COMPLETED,
         "next_action": next_action,
         "hint": hint,
         "progress": {
@@ -1504,10 +1961,15 @@ def get_workflow_status(task_id: str) -> dict:
                 "approved": plan_approved,
                 "steps_count": len(plan_data.get("steps", [])),
             },
+            "tests": {
+                "generated": has_tests,
+                "count": test_count,
+            },
             "patches": {
                 "total": len(patch_queue),
                 "pending": len(pending_patches),
                 "approved": len(approved_patches),
+                "unsynced": len(approved_unsynced),
             },
         },
     }

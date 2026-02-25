@@ -165,6 +165,69 @@ The AI will automatically call the MCP tools to:
 
 See `mcp-config-examples/` for more configuration examples.
 
+## Docker usage
+
+Build an image with Spec Agent pre-installed:
+
+```bash
+docker build -t spec-agent .
+```
+
+Run the CLI (defaults to `--help`):
+
+```bash
+docker run --rm -it spec-agent
+```
+
+Mount a repository and work from it (replace `/path/to/repo`):
+
+```bash
+docker run --rm -it \
+  -v /path/to/repo:/workspace \
+  -w /workspace \
+  spec-agent ./spec-agent index . --branch main
+```
+
+Persist Spec Agent state between runs:
+
+```bash
+docker run --rm -it \
+  -v /path/to/repo:/workspace \
+  -v /path/to/state:/app/.spec_agent \
+  -w /workspace \
+  spec-agent ./spec-agent chat
+```
+
+Expose the web dashboard (if you start it inside the container):
+
+```bash
+docker run --rm -it -p 8844:8844 spec-agent ./spec-agent web
+```
+
+### docker compose
+
+Use the included `docker-compose.yml` to keep Spec Agent running in the background:
+
+```bash
+# Build image and start the web dashboard (port 8844) in the background
+docker compose up -d
+
+# Exec into the container (repo mounted at /workspace by default)
+docker compose exec spec-agent /bin/bash
+
+# Stop when done
+docker compose down
+```
+
+If you need a different repo mounted, override the volume mapping on the command line, e.g.:
+
+```bash
+docker compose run --rm -v /path/to/repo:/workspace spec-agent ./spec-agent index . --branch main
+```
+
+The default compose command now starts the web dashboard at `http://localhost:8844` (binding `0.0.0.0`).
+Internally it uses the image’s built venv (`/app/.venv`) via `/app/spec-agent`, so your host `.venv` is not required inside the container.
+
 ## Demo: apply patches in Cursor/Claude, then sync back to the dashboard
 
 By default, Spec Agent can apply patches itself via `approve_patch`. For demos where you want

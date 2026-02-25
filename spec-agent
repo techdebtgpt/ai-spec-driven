@@ -6,7 +6,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
 INIT_SCRIPT="$SCRIPT_DIR/init.py"
-STATE_DIR="${HOME}/.spec_agent"
+STATE_DIR="${SPEC_AGENT_STATE_DIR:-${HOME}/.spec_agent}"
+STATE_DIR="${STATE_DIR/#\~/${HOME}}"
 ENV_FILE="${STATE_DIR}/env"
 
 if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
