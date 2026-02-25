@@ -563,7 +563,7 @@ def handle_clarifications(
             console.print(f"[dim]Already resolved: {existing}[/]")
             continue
 
-        answer = typer.prompt("Your answer (leave blank to skip)", default="").strip()
+        answer = typer.prompt("Your answer", default="").strip()
         if answer:
             updated = orchestrator.update_clarification(
                 task_id,
@@ -582,15 +582,7 @@ def handle_clarifications(
                 )
             handled = True
         else:
-            if typer.confirm("Override/skip this question?", default=True):
-                orchestrator.update_clarification(
-                    task_id,
-                    item.get("id"),
-                    answer="",
-                    status=ClarificationStatus.OVERRIDDEN,
-                )
-                console.print("[yellow]Question overridden.[/]")
-                handled = True
+            console.print("[yellow]Please provide an answer (required).[/]")
 
     if handled:
         console.print("\n[bold green]All clarifications processed![/]")

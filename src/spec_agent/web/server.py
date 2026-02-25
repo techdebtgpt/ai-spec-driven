@@ -65,6 +65,11 @@ def _render_plan_markdown(task: Task) -> str:
     plan_preview = meta.get("plan_preview") or {}
     if not isinstance(plan_preview, dict):
         plan_preview = {}
+    plan_data = meta.get("plan") or {}
+    if not isinstance(plan_data, dict):
+        plan_data = {}
+    if not plan_preview.get("steps") and plan_data:
+        plan_preview = plan_data
 
     steps = plan_preview.get("steps") or []
     risks = plan_preview.get("risks") or []
@@ -529,7 +534,9 @@ def _infer_workflow(task: Task, logs: list[LogEntry]) -> list[Dict[str, Any]]:
             patches_generated_at = entry.timestamp
 
     pending_clarifications = _pending_clarifications(task)
-    has_plan = bool(task.metadata.get("plan_preview")) if isinstance(task.metadata, dict) else False
+    has_plan = False
+    if isinstance(task.metadata, dict):
+        has_plan = bool(task.metadata.get("plan_preview") or task.metadata.get("plan"))
     pending_specs = task.metadata.get("pending_specs") if isinstance(task.metadata, dict) else None
     pending_specs_count = len(pending_specs) if isinstance(pending_specs, list) else 0
     plan_approved = bool(task.metadata.get("plan_approved")) if isinstance(task.metadata, dict) else False
@@ -592,7 +599,7 @@ def _infer_workflow(task: Task, logs: list[LogEntry]) -> list[Dict[str, Any]]:
             done = True
             started_at, ended_at = spec_start, spec_end
         elif key == "CLARIFYING":
-            done = pending_clarifications == 0 and (plan_generated_at is not None or has_plan)
+            done = pending_clarifications == 0
             started_at, ended_at = clar_start, clar_end
             if pending_clarifications > 0:
                 chips.append({"kind": "warning", "text": f"{pending_clarifications} pending"})
@@ -774,7 +781,10 @@ def _plan_html(task_id: str) -> str:
       .then(r => r.ok ? r.json() : Promise.reject(new Error('task not found')))
       .then(data => {{
         const t = data.task || {{}};
-        const clientLabel = (t.client && String(t.client).trim()) ? t.client : 'CLI';
+        const rawClient = (t.client && String(t.client).trim()) || '';
+        const clientLabel = rawClient
+          ? (rawClient.toLowerCase() === 'cursor' ? 'Cursor' : rawClient)
+          : 'CLI';
         document.getElementById('planTitle').textContent = t.title ? t.title : 'Plan';
         document.getElementById('planSubtitle').textContent = `${{clientLabel}} · ${{t.repo_path || '—'}} · ${{t.branch || '—'}}`;
       }})
@@ -807,6 +817,7 @@ _STYLES_CSS = """
   --accent:#3b82f6;
   --good:#22c55e;
   --warn:#f59e0b;
+  --info:#38bdf8;
   --bad:#ef4444;
   --chip:#111a2f;
 }
@@ -935,6 +946,8 @@ body{
 .taskCard:hover{border-color:rgba(59,130,246,.35)}
 .taskCard.selected{outline:2px solid rgba(59,130,246,.35)}
 .taskRow{display:flex; align-items:center; justify-content:space-between; gap:10px}
+.taskRow .taskTitle{flex:1; min-width:0}
+.taskRow .timeLabel{flex-shrink:0; color:#cbd5ff; font-size:12px}
 .timeLabel{color:#cbd5ff;font-size:12px}
 .taskTitle{
   font-size:13px;
@@ -954,13 +967,14 @@ body{
 }
 .chip.purple{border-color:rgba(124,58,237,.35); color:#e9d5ff; background:rgba(124,58,237,.12)}
 .chip.green{border-color:rgba(34,197,94,.35); color:#bbf7d0; background:rgba(34,197,94,.10)}
-.chip.yellow{border-color:rgba(245,158,11,.35); color:#fde68a; background:rgba(245,158,11,.10)}
+.chip.yellow{border-color:rgba(245,158,11,.35); color:#fde68a; background:rgba(245,158,11,.12)}
+.chip.blue{border-color:rgba(56,189,248,.40); color:#e0f2fe; background:rgba(56,189,248,.14)}
 .chip.red{border-color:rgba(239,68,68,.35); color:#fecaca; background:rgba(239,68,68,.10)}
 .dot2{width:10px;height:10px;border-radius:999px; background:var(--muted)}
 .dot2.good{background:var(--good)}
 .dot2.warn{background:var(--warn)}
 .dot2.bad{background:var(--bad)}
-.dot2.blue{background:var(--accent)}
+.dot2.blue{background:var(--info)}
 
 .steps{padding:12px; overflow:auto; height:calc(100% - 58px)}
 .step{
@@ -1247,13 +1261,22 @@ let state = {
 
 const $ = (id) => document.getElementById(id);
 
+function clientLabelFrom(raw) {
+  const val = (raw && String(raw).trim()) || '';
+  if (!val) return 'CLI';
+  if (val.toLowerCase() === 'cursor') return 'Cursor';
+  return val;
+}
+
+// Match CLI dashboard: short title so "X ago" timestamp stays visible (28 chars like dashboard.py)
+const TASK_TITLE_MAX_LEN = 28;
 function resolveTaskTitle(task) {
   if (!task) return 'Untitled';
   const raw = (task.title && task.title.trim())
     || (task.summary && task.summary.trim())
     || ((task.description || '').split(/\n/)[0] || '').trim();
   if (!raw) return 'Untitled';
-  return raw.length > 42 ? raw.slice(0, 39) + '…' : raw;
+  return raw.length > TASK_TITLE_MAX_LEN ? raw.slice(0, TASK_TITLE_MAX_LEN - 1) + '…' : raw;
 }
 
 function fmtCount(value) {
@@ -1261,6 +1284,56 @@ function fmtCount(value) {
     return value.toLocaleString();
   }
   return '—';
+}
+
+function normalizeRisk(raw) {
+  const cleanStr = (v) => (typeof v === 'string' ? v.trim() : '');
+
+  const asFields = (obj) => {
+    const title = cleanStr(obj.id) || cleanStr(obj.name) || cleanStr(obj.title) || 'Risk';
+    const description = cleanStr(obj.description) || cleanStr(obj.desc) || cleanStr(obj.summary) || '';
+    const mitigation =
+      cleanStr(obj.mitigation) ||
+      cleanStr(obj.mitigation_strategy) ||
+      cleanStr(obj.mitigationStrategy) ||
+      '';
+    return { title: title || 'Risk', description, mitigation };
+  };
+
+  if (!raw) return { title: 'Risk', description: '', mitigation: '' };
+
+  if (typeof raw === 'object') {
+    return asFields(raw);
+  }
+
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+
+    // Try JSON parsing (both proper JSON and common single-quote dict strings)
+    const attempts = [trimmed, trimmed.replace(/'/g, '"')];
+    for (const candidate of attempts) {
+      try {
+        const parsed = JSON.parse(candidate);
+        if (parsed && typeof parsed === 'object') {
+          return asFields(parsed);
+        }
+      } catch (e) {
+        /* ignore */
+      }
+    }
+
+    const idMatch = trimmed.match(/['"]?id['"]?\s*:\s*['"]([^'"}]+)['"]/i);
+    const descMatch = trimmed.match(/['"]?description['"]?\s*:\s*['"]([^'"}]+)['"]/i);
+    const mitMatch = trimmed.match(/['"]?mitigation['"]?\s*:\s*['"]([^'"}]+)['"]/i);
+
+    return {
+      title: (idMatch && idMatch[1].trim()) || 'Risk',
+      description: (descMatch && descMatch[1].trim()) || trimmed,
+      mitigation: (mitMatch && mitMatch[1].trim()) || '',
+    };
+  }
+
+  return { title: 'Risk', description: String(raw), mitigation: '' };
 }
 
 /**
@@ -1337,7 +1410,7 @@ function renderOverview(container, task, detail) {
   title.textContent = data.repo_path || task.repo_path || '—';
   const subtitle = document.createElement('div');
   subtitle.className = 'overviewSubtitle';
-  const clientLabel = (task.client && String(task.client).trim()) ? task.client : 'CLI';
+  const clientLabel = clientLabelFrom(task.client);
   subtitle.textContent = `${clientLabel} · ${data.branch || task.branch || '—'}`;
   hero.appendChild(title);
   hero.appendChild(subtitle);
@@ -1527,7 +1600,8 @@ function fmtAgo(iso, nowIso) {
 function statusDot(task) {
   // Map bucket/status into dot color similar to mock
   if (task.bucket === 'failed') return 'bad';
-  if (task.status === 'IMPLEMENTING' || task.status === 'VERIFYING') return 'good';
+  if (task.status === 'COMPLETED') return 'good';
+  if (task.status === 'IMPLEMENTING' || task.status === 'VERIFYING') return 'info';
   if (task.status === 'CLARIFYING' || task.status === 'SPEC_PENDING') return 'warn';
   return 'blue';
 }
@@ -1539,7 +1613,12 @@ function chipForTask(task) {
     chips.push({ cls: 'purple', text: `${task.patch_counts.total} patches` });
   }
   // Show status as chip
-  chips.push({ cls: 'chip', text: task.status });
+  let cls = 'chip';
+  if (task.status === 'COMPLETED') cls = 'chip green';
+  else if (task.status === 'IMPLEMENTING' || task.status === 'VERIFYING') cls = 'chip blue';
+  else if (task.status === 'CLARIFYING' || task.status === 'SPEC_PENDING') cls = 'chip yellow';
+  else if (task.bucket === 'failed') cls = 'chip red';
+  chips.push({ cls, text: task.status });
   return chips;
 }
 
@@ -1591,7 +1670,7 @@ function renderTasks() {
     dot.className = 'dot2 ' + statusDot(t);
     const title = document.createElement('div');
     title.className = 'taskTitle';
-    const clientLabel = (t.client && String(t.client).trim()) ? t.client : 'CLI';
+    const clientLabel = clientLabelFrom(t.client);
     const shortTitle = resolveTaskTitle(t);
     title.textContent = `${clientLabel} · ${shortTitle}`;
     left.appendChild(dot);
@@ -1621,7 +1700,7 @@ function renderTasks() {
 
 function renderWorkflow(task, workflow) {
   if (task) {
-    const clientLabel = (task.client && String(task.client).trim()) ? task.client : 'CLI';
+    const clientLabel = clientLabelFrom(task.client);
     $('workflowSubtitle').textContent = `${clientLabel} · ${task.title}`;
   } else {
     $('workflowSubtitle').textContent = 'Select a task';
@@ -1891,7 +1970,30 @@ function renderDetails(task, step, detail) {
         n.className = 'planN';
         n.textContent = String(idx + 1);
         const txt = document.createElement('span');
-        txt.textContent = (s.description || String(s)).trim();
+
+        // Be robust to different step payload shapes so we never show "[object Object]".
+        let label = "";
+        if (s && typeof s === "object") {
+          const candidate =
+            (typeof s.description === "string" && s.description) ||
+            (typeof s.title === "string" && s.title) ||
+            (typeof s.summary === "string" && s.summary) ||
+            (typeof s.text === "string" && s.text) ||
+            (typeof s.name === "string" && s.name);
+          if (candidate) {
+            label = candidate;
+          } else {
+            try {
+              label = JSON.stringify(s);
+            } catch {
+              label = String(s);
+            }
+          }
+        } else {
+          label = String(s ?? "");
+        }
+
+        txt.textContent = label.trim();
         li.appendChild(n);
         li.appendChild(txt);
         el.appendChild(li);
@@ -2052,7 +2154,30 @@ function renderDetails(task, step, detail) {
         n.className = 'planN';
         n.textContent = String(idx + 1);
         const txt = document.createElement('span');
-        txt.textContent = (s.description || String(s)).trim();
+
+        // Be robust to different step payload shapes so we never show "[object Object]".
+        let label = "";
+        if (s && typeof s === "object") {
+          const candidate =
+            (typeof s.description === "string" && s.description) ||
+            (typeof s.title === "string" && s.title) ||
+            (typeof s.summary === "string" && s.summary) ||
+            (typeof s.text === "string" && s.text) ||
+            (typeof s.name === "string" && s.name);
+          if (candidate) {
+            label = candidate;
+          } else {
+            try {
+              label = JSON.stringify(s);
+            } catch {
+              label = String(s);
+            }
+          }
+        } else {
+          label = String(s ?? "");
+        }
+
+        txt.textContent = label.trim();
         li.appendChild(n);
         li.appendChild(txt);
         el.appendChild(li);
@@ -2091,10 +2216,35 @@ function renderDetails(task, step, detail) {
       sec4.textContent = 'Risks';
       el.appendChild(sec4);
       risks.slice(0, 20).forEach(r => {
-        const row = document.createElement('div');
-        row.className = 'fileRow';
-        row.textContent = r;
-        el.appendChild(row);
+        const card = document.createElement('div');
+        card.className = 'qcard';
+
+        const info = normalizeRisk(r);
+        const title = info.title || 'Risk';
+        const desc = info.description || '';
+        const mitigation = info.mitigation || '';
+
+        const h = document.createElement('div');
+        h.className = 'qhead';
+        h.textContent = title || 'Risk';
+
+        const body = document.createElement('div');
+        body.className = 'small';
+        body.style.marginTop = '6px';
+        body.textContent = desc || '—';
+
+        card.appendChild(h);
+        card.appendChild(body);
+
+        if (mitigation) {
+          const mit = document.createElement('div');
+          mit.className = 'small muted';
+          mit.style.marginTop = '6px';
+          mit.textContent = `Mitigation: ${mitigation}`;
+          card.appendChild(mit);
+        }
+
+        el.appendChild(card);
       });
     }
 
@@ -2449,6 +2599,12 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
         priority = pr.strip()
 
     plan_preview = meta.get("plan_preview") or {}
+    if not isinstance(plan_preview, dict):
+        plan_preview = {}
+    if not plan_preview.get("steps"):
+        plan_fallback = meta.get("plan") if isinstance(meta, dict) else {}
+        if isinstance(plan_fallback, dict):
+            plan_preview = plan_fallback
     plan_steps = (plan_preview.get("steps") or []) if isinstance(plan_preview, dict) else []
     risks = (plan_preview.get("risks") or []) if isinstance(plan_preview, dict) else []
     refactors = (plan_preview.get("refactors") or []) if isinstance(plan_preview, dict) else []
@@ -2688,12 +2844,16 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     server_version = "SpecAgentDashboard/0.1"
 
     def _send(self, code: int, body: bytes, *, content_type: str) -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # Client disconnected before we finished writing the response; safe to ignore.
+            return
 
     def _send_json(self, code: int, payload: Dict[str, Any]) -> None:
         body = json.dumps(payload, indent=2, default=str).encode("utf-8")

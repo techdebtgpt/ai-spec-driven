@@ -204,6 +204,149 @@ def test_approve_patch_requires_external_sync(tmp_path: Path) -> None:
     assert "sync-external" in str(exc.value)
 
 
+def test_sync_external_patch_captures_untracked_files(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+
+    (repo / "tracked.txt").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    branch = (
+        subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        or "main"
+    )
+
+    patch = make_patch()
+    task = Task(
+        id="task-1",
+        repo_path=repo,
+        branch=branch,
+        description="desc",
+        status=TaskStatus.PLANNING,
+        metadata={"patch_queue_state": [patch.to_dict()]},
+    )
+
+    orch = TaskOrchestrator()
+    orch.store.root = tmp_path / "state"
+    orch.store.root.mkdir(exist_ok=True)
+    orch.store.upsert_task(task)
+
+    (repo / "tracked.txt").write_text("hello\nupdated\n", encoding="utf-8")
+    (repo / "new_file.txt").write_text("created\n", encoding="utf-8")
+
+    result = orch.sync_external_patch(task.id, patch_id=patch.id)
+
+    assert result["has_diff"]
+    synced_patch = orch.list_patches(task.id)[0]
+    assert synced_patch.status == PatchStatus.APPLIED
+    assert synced_patch.applied_diff is not None
+    assert "new_file.txt" in synced_patch.applied_diff
+    assert "tracked.txt" in synced_patch.applied_diff
+    assert "new_file.txt" in synced_patch.files_touched
+
+
+def test_sync_external_patch_without_queue_marks_task_complete(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+
+    (repo / "file.txt").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "file.txt").write_text("hello updated\n", encoding="utf-8")
+
+    branch = (
+        subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        or "main"
+    )
+
+    task = Task(
+        id="task-1",
+        repo_path=repo,
+        branch=branch,
+        description="desc",
+        status=TaskStatus.IMPLEMENTING,
+    )
+
+    orch = TaskOrchestrator()
+    orch.store.root = tmp_path / "state"
+    orch.store.root.mkdir(exist_ok=True)
+    orch.store.upsert_task(task)
+
+    result = orch.sync_external_patch(task.id)
+
+    assert result["has_diff"]
+    assert orch._get_task(task.id).status == TaskStatus.COMPLETED
+
+
+def test_sync_external_patch_no_diff_marks_pending_patches_applied(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+
+    (repo / "file.txt").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    branch = (
+        subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        or "main"
+    )
+
+    patch = make_patch()
+    task = Task(
+        id="task-1",
+        repo_path=repo,
+        branch=branch,
+        description="desc",
+        status=TaskStatus.IMPLEMENTING,
+        metadata={"patch_queue_state": [patch.to_dict()]},
+    )
+
+    orch = TaskOrchestrator()
+    orch.store.root = tmp_path / "state"
+    orch.store.root.mkdir(exist_ok=True)
+    orch.store.upsert_task(task)
+
+    # No working tree changes; sync should auto-apply pending patch.
+    result = orch.sync_external_patch(task.id)
+
+    assert result["has_diff"] is False
+    synced = orch.list_patches(task.id)
+    assert all(p.status == PatchStatus.APPLIED for p in synced)
+    assert orch._get_task(task.id).status == TaskStatus.COMPLETED
+
+
 def test_restart_clarifications_preserves_manual_bounded_context(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

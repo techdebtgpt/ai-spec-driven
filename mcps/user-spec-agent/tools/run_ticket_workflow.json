@@ -1,0 +1,48 @@
+{
+  "name": "run_ticket_workflow",
+  "description": "End-to-end spec-agent ticket handler.\n\nGiven a natural-language ticket description, this tool:\n- Indexes the current working tree (if needed)\n- Creates a task bound to the repo/branch\n- Generates a plan (and boundary specs)\n- Optionally generates patches\n\nIt returns the task id, status, and 'next step' hints for the caller.\n",
+  "arguments": {
+    "type": "object",
+    "properties": {
+      "description": {
+        "title": "Description",
+        "type": "string",
+        "description": "Ticket text / what you want changed."
+      },
+      "title": {
+        "title": "Title",
+        "type": "string",
+        "description": "Optional short title.",
+        "default": null
+      },
+      "client": {
+        "title": "Client",
+        "type": "string",
+        "description": "Editor/chat client name (e.g. cursor, claude, copilot).",
+        "default": "cursor"
+      },
+      "repo_path": {
+        "title": "Repo Path",
+        "type": "string",
+        "description": "Absolute repo path. Defaults to current working directory.",
+        "default": null
+      },
+      "branch": {
+        "title": "Branch",
+        "type": "string",
+        "description": "Branch name. Defaults to current git branch.",
+        "default": null
+      },
+      "generate_patches": {
+        "title": "Generate Patches",
+        "type": "boolean",
+        "description": "If true, run plan + specs + approve-plan + generate-patches (non-interactive defaults).",
+        "default": true
+      }
+    },
+    "required": [
+      "description"
+    ],
+    "title": "run_ticket_workflowArguments"
+  }
+}

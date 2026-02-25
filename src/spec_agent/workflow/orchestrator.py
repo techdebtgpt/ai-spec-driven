@@ -3026,6 +3026,57 @@ class TaskOrchestrator:
                 return patch
         return None
 
+    def add_patch_for_step(
+        self,
+        task_id: str,
+        step_index: int,
+        diff: str,
+        rationale: str,
+        *,
+        kind: PatchKind = PatchKind.IMPLEMENTATION,
+    ) -> Patch:
+        """
+        Append a patch to the queue for a specific plan step.
+
+        This is used by MCP flows where the LLM running in the client generates
+        a unified diff and rationale, and we want to keep the single source of
+        truth in the orchestrator's patch queue.
+        """
+        task = self._get_task(task_id)
+        plan_data = task.metadata.get("plan", {})
+        steps = plan_data.get("steps", [])
+
+        if step_index < 0 or step_index >= len(steps):
+            raise ValueError(f"Step index {step_index} out of range (plan has {len(steps)} steps)")
+
+        step = steps[step_index]
+        step_desc = step.get("description") if isinstance(step, dict) else str(step)
+
+        patches = self._load_patch_queue(task)
+        patch = Patch(
+            id=str(uuid4()),
+            task_id=task_id,
+            step_reference=step_desc,
+            diff=diff,
+            rationale=rationale,
+            alternatives=[],
+            status=PatchStatus.PENDING,
+            kind=kind,
+        )
+        patches.append(patch)
+        self._persist_patch_queue(task, patches)
+        self.logger.record(
+            task.id,
+            "PATCH_ADDED_EXTERNAL",
+            {
+                "patch_id": patch.id,
+                "step_index": step_index,
+                "step_reference": step_desc,
+                "kind": kind.value,
+            },
+        )
+        return patch
+
     def approve_patch(self, task_id: str, patch_id: str) -> Patch:
         task = self._get_task(task_id)
         patches = self._load_patch_queue(task)
@@ -3072,6 +3123,8 @@ class TaskOrchestrator:
         task = self._get_task(task_id)
         repo = task.repo_path
 
+        status = self._get_git_status(repo)
+
         # Capture diffs
         diff_parts: list[str] = []
         try:
@@ -3104,9 +3157,45 @@ class TaskOrchestrator:
                     diff_parts.append("\n")
                 diff_parts.append(staged.rstrip() + "\n")
 
-        combined = "".join(diff_parts).strip()
+        # Include untracked files so the web dashboard reflects new additions.
+        untracked: list[str] = []
+        if status:
+            for line in status.splitlines():
+                line = line.strip()
+                if line.startswith("?? "):
+                    rel = line[3:].strip()
+                    if rel:
+                        untracked.append(rel)
 
-        status = self._get_git_status(repo)
+        if untracked:
+            expanded: list[str] = []
+            for rel in untracked:
+                full_path = repo / rel
+                if full_path.is_dir():
+                    expanded.extend(
+                        str(child.relative_to(repo))
+                        for child in full_path.rglob("*")
+                        if child.is_file()
+                    )
+                elif full_path.exists():
+                    expanded.append(rel)
+
+            for rel_file in sorted({p for p in expanded if p}):
+                diff_proc = subprocess.run(
+                    ["git", "diff", "--no-index", "--text", "/dev/null", rel_file],
+                    capture_output=True,
+                    text=True,
+                    cwd=repo,
+                )
+                if diff_proc.returncode not in (0, 1):
+                    continue
+                diff_text = diff_proc.stdout
+                if (diff_text or "").strip():
+                    if diff_parts and not diff_parts[-1].endswith("\n"):
+                        diff_parts.append("\n")
+                    diff_parts.append(diff_text.rstrip() + "\n")
+
+        combined = "".join(diff_parts).strip()
         files: list[str] = []
         try:
             if combined:
@@ -3145,8 +3234,13 @@ class TaskOrchestrator:
 
         # If patch_id provided, mark that patch as applied and store the actual diff.
         applied_patch: Patch | None = None
-        if patch_id:
+        patches: list[Patch] = []
+        try:
             patches = self._load_patch_queue(task)
+        except Exception:
+            patches = []
+
+        if patch_id:
             patch = self._require_patch(patches, patch_id)
             if patch.status == PatchStatus.PENDING:
                 patch.status = PatchStatus.APPLIED
@@ -3157,6 +3251,31 @@ class TaskOrchestrator:
             self._persist_patch_queue(task, patches)
             applied_patch = patch
         else:
+            # If there are pending patches but no diff (user may have already applied/committed),
+            # mark them as applied so the task can auto-complete.
+            pending_patches = [p for p in patches if p.status == PatchStatus.PENDING]
+            if not combined and pending_patches:
+                applied_via = (client or task.client or "external").strip() or "external"
+                now = utcnow()
+                for p in pending_patches:
+                    p.status = PatchStatus.APPLIED
+                    p.applied_via = applied_via
+                    p.applied_at = now
+                    p.applied_diff = None
+                    p.files_touched = files
+                self._persist_patch_queue(task, patches)
+            else:
+                task.touch()
+                self.store.upsert_task(task)
+
+        # If there are no patches in the queue, treat this sync as the completion signal.
+        try:
+            patches = self._load_patch_queue(task)
+        except Exception:
+            patches = []
+
+        if not patches and task.status not in {TaskStatus.COMPLETED, TaskStatus.CANCELLED}:
+            task.status = TaskStatus.COMPLETED
             task.touch()
             self.store.upsert_task(task)
 
