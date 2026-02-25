@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from ...domain.models import Plan, PlanStep
@@ -68,19 +68,21 @@ class PlanBuilder:
         """
         Define the LLM's role and output format.
         """
-        return """You are a software architect helping senior engineers plan code changes in legacy codebases.
+        return """You are an expert software architect. You produce precise, actionable implementation plans.
 
-Your task is to analyze a change request and generate a high-level implementation plan.
+Analyze the change request and generate a high-level implementation plan with absolute clarity.
 
-The plan should include:
-1. **Steps**: 3-7 high-level implementation steps, each identifying affected files/modules
-2. **Risks**: Potential issues or concerns (technical debt, breaking changes, performance, etc.)
-3. **Refactorings**: Opportunities to improve code quality while making changes
+The plan MUST include:
+1. **Steps**: 3-7 concrete implementation steps. Each step identifies exact files/modules to modify and what to change.
+2. **Risks**: Technical risks, breaking-change potential, and performance concerns.
+3. **Refactorings**: Opportunities to improve code quality alongside the change.
 
-IMPORTANT: When a "Scoped Files" list is provided, you MUST use those exact file paths as targets.
-Only target files from the scoped list - do not add files outside the scope.
-If the repository has no existing tests (or no test harness is detected) and the change request
-does not explicitly require adding tests, do NOT add plan steps about creating tests.
+Rules:
+- When a "Scoped Files" list is provided, target ONLY those files. Do not add files outside the scope.
+- If the repository has no existing test harness and the request does not explicitly require tests, include test steps but mark them with "skip_codegen": true and "skip_codegen_reason": "no test framework detected".
+- Every step must be independently implementable.
+- Be specific — name exact functions, classes, and files.
+
 Return ONLY valid JSON in this exact format:
 
 {
@@ -160,7 +162,7 @@ Repository Context:
 {scoped_hint}{scoped_files_list}
 
 Guidance:
-- If tests are not detected and the change request does not explicitly ask to add tests, omit test-related steps and suggestions.
+- If tests are not detected and the change request does not explicitly ask to add tests, include test steps but mark them with "skip_codegen": true and "skip_codegen_reason": "no test framework detected".
 - If a Scoped Files list is provided, ONLY use those files as target_modules in your plan.
 
 Generate a high-level implementation plan for this change request."""
@@ -253,5 +255,30 @@ Generate a high-level implementation plan for this change request."""
             risks=risks,
             refactor_suggestions=["Extract helper modules when a patch grows beyond the LOC budget."],
         )
+
+    def validate_plan_targets(self, plan: Plan, allowed_files: list[str]) -> Dict[str, Any]:
+        """Classify plan target files as valid (MODIFY) or new (CREATE)."""
+        allowed_set = set(allowed_files or [])
+        valid: list[str] = []
+        new: list[str] = []
+        empty_steps: list[int] = []
+        all_files: list[str] = []
+        seen: set[str] = set()
+        for idx, step in enumerate(plan.steps):
+            if not step.target_files:
+                empty_steps.append(idx)
+                continue
+            for tf in step.target_files:
+                if tf in seen:
+                    continue
+                seen.add(tf)
+                all_files.append(tf)
+                (valid if tf in allowed_set else new).append(tf)
+        return {
+            "valid_targets": valid,
+            "new_targets": new,
+            "empty_steps": empty_steps,
+            "all_plan_files": all_files,
+        }
 
 

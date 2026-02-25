@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 import time
 from dataclasses import asdict
@@ -51,6 +52,39 @@ def _task_summary(task: Task) -> str:
     return desc.splitlines()[0].strip() if desc else ""
 
 
+def _detect_test_runner(
+    files: list[str], existing_tool: str | None = None
+) -> tuple[str, list[str]]:
+    """Return ``(command, base_args)`` for running tests against *files*."""
+    if existing_tool:
+        tool = existing_tool.strip().lower()
+        if tool in ("jest", "npx jest"):
+            return ("npx", ["jest"])
+        if tool == "pytest":
+            return ("pytest", [])
+        if tool in ("dotnet", "dotnet test"):
+            return ("dotnet", ["test"])
+    ext_map: dict[str, tuple[str, list[str]]] = {
+        ".cs": ("dotnet", ["test"]),
+        ".py": ("pytest", []),
+        ".ts": ("npx", ["jest"]),
+        ".tsx": ("npx", ["jest"]),
+        ".js": ("npx", ["jest"]),
+        ".jsx": ("npx", ["jest"]),
+    }
+    for f in files:
+        suffix = Path(f).suffix.lower()
+        if suffix in ext_map:
+            return ext_map[suffix]
+    return ("pytest", [])
+
+
+def _filter_test_files(files: list[str]) -> list[str]:
+    """Keep only paths that look like test files."""
+    indicators = ("test", "tests", "spec", "_test.", ".test.", ".spec.")
+    return [f for f in files if any(ind in f.lower() for ind in indicators)]
+
+
 def _render_plan_markdown(task: Task) -> str:
     """
     Render a demo-friendly markdown view of the approved plan using task metadata.
@@ -65,6 +99,11 @@ def _render_plan_markdown(task: Task) -> str:
     plan_preview = meta.get("plan_preview") or {}
     if not isinstance(plan_preview, dict):
         plan_preview = {}
+    plan_data = meta.get("plan") or {}
+    if not isinstance(plan_data, dict):
+        plan_data = {}
+    if not plan_preview.get("steps") and plan_data:
+        plan_preview = plan_data
 
     steps = plan_preview.get("steps") or []
     risks = plan_preview.get("risks") or []
@@ -498,12 +537,14 @@ def _task_bucket(status: TaskStatus) -> str:
     return "running"
 
 
+_MAX_DIFF_DISPLAY_BYTES = 50_000
+
 _WORKFLOW_ORDER: list[Tuple[str, str]] = [
-    ("TASK_SPECIFICATION", "Task specification"),
-    ("CLARIFYING", "Clarifying questions"),
-    ("PLANNING", "Context analysis & plan"),
-    ("APPROVAL", "User approval"),
-    ("CODEGEN", "Code generation"),
+    ("TASK_SPECIFICATION", "Task Specification"),
+    ("CLARIFYING", "Clarifying Questions"),
+    ("PLANNING", "Context Analysis & Preplan"),
+    ("CODEGEN", "Code Generation"),
+    ("RUN_TESTS", "Run Tests"),
 ]
 
 
@@ -529,7 +570,9 @@ def _infer_workflow(task: Task, logs: list[LogEntry]) -> list[Dict[str, Any]]:
             patches_generated_at = entry.timestamp
 
     pending_clarifications = _pending_clarifications(task)
-    has_plan = bool(task.metadata.get("plan_preview")) if isinstance(task.metadata, dict) else False
+    has_plan = False
+    if isinstance(task.metadata, dict):
+        has_plan = bool(task.metadata.get("plan_preview") or task.metadata.get("plan"))
     pending_specs = task.metadata.get("pending_specs") if isinstance(task.metadata, dict) else None
     pending_specs_count = len(pending_specs) if isinstance(pending_specs, list) else 0
     plan_approved = bool(task.metadata.get("plan_approved")) if isinstance(task.metadata, dict) else False
@@ -572,14 +615,14 @@ def _infer_workflow(task: Task, logs: list[LogEntry]) -> list[Dict[str, Any]]:
     active_key = "TASK_SPECIFICATION"
     if pending_clarifications > 0:
         active_key = "CLARIFYING"
-    elif has_plan and (pending_specs_count > 0) and not plan_approved:
-        active_key = "PLANNING"
     elif has_plan and not plan_approved:
-        active_key = "APPROVAL"
+        active_key = "PLANNING"
     elif plan_approved and (patches.get("total", 0) == 0):
         active_key = "CODEGEN"
     elif plan_approved and (patches.get("pending", 0) > 0):
         active_key = "CODEGEN"
+
+    _wf_meta = task.metadata if isinstance(task.metadata, dict) else {}
 
     steps: list[Dict[str, Any]] = []
     for key, label in _WORKFLOW_ORDER:
@@ -592,19 +635,16 @@ def _infer_workflow(task: Task, logs: list[LogEntry]) -> list[Dict[str, Any]]:
             done = True
             started_at, ended_at = spec_start, spec_end
         elif key == "CLARIFYING":
-            done = pending_clarifications == 0 and (plan_generated_at is not None or has_plan)
+            done = pending_clarifications == 0
             started_at, ended_at = clar_start, clar_end
             if pending_clarifications > 0:
                 chips.append({"kind": "warning", "text": f"{pending_clarifications} pending"})
         elif key == "PLANNING":
-            done = has_plan
+            done = has_plan and plan_approved
             started_at = plan_generated_at
-            ended_at = plan_generated_at
+            ended_at = plan_approved_at if plan_approved else plan_generated_at
             if pending_specs_count > 0:
                 chips.append({"kind": "warning", "text": f"{pending_specs_count} specs pending"})
-        elif key == "APPROVAL":
-            done = plan_approved
-            started_at, ended_at = approve_start, approve_end
             if plan_approved:
                 chips.append({"kind": "success", "text": "user approved"})
         elif key == "CODEGEN":
@@ -614,6 +654,18 @@ def _infer_workflow(task: Task, logs: list[LogEntry]) -> list[Dict[str, Any]]:
                 chips.append({"kind": "neutral", "text": f"{patches['total']} patches"})
             if external_patch_pending:
                 chips.append({"kind": "warning", "text": "External edit required"})
+        elif key == "RUN_TESTS":
+            test_exit = _wf_meta.get("test_exit_code")
+            has_test_output = bool(_wf_meta.get("test_output"))
+            done = task.status in {TaskStatus.COMPLETED} or (task.status == TaskStatus.VERIFYING and has_test_output)
+            started_at = patches_generated_at
+            ended_at = None
+            if task.status == TaskStatus.VERIFYING and not has_test_output:
+                active_key = "RUN_TESTS"
+            elif task.status == TaskStatus.VERIFYING and has_test_output:
+                ended_at = task.updated_at
+            elif task.status == TaskStatus.COMPLETED:
+                ended_at = task.updated_at
 
         status = "pending"
         if done:
@@ -621,8 +673,7 @@ def _infer_workflow(task: Task, logs: list[LogEntry]) -> list[Dict[str, Any]]:
         elif key == active_key:
             status = "active"
 
-        steps.append(
-            {
+        step_entry: Dict[str, Any] = {
                 "key": key,
                 "label": label,
                 "status": status,
@@ -630,14 +681,23 @@ def _infer_workflow(task: Task, logs: list[LogEntry]) -> list[Dict[str, Any]]:
                 "ended_at": _iso(ended_at) if ended_at else None,
                 "duration_seconds": _dur(started_at, ended_at),
                 "chips": chips,
-            }
-        )
+        }
+        if key == "RUN_TESTS" and isinstance(_wf_meta.get("test_exit_code"), int) and _wf_meta.get("test_exit_code") != 0:
+            step_entry["test_failed"] = True
+        steps.append(step_entry)
 
     return steps
 
 
 def _serialize_task(task: Task, latest_log: LogEntry | None) -> Dict[str, Any]:
     patches = _patch_counts(task)
+    duration_seconds: float | None = None
+    try:
+        delta = (task.updated_at - task.created_at).total_seconds()
+        if delta > 0:
+            duration_seconds = round(delta, 1)
+    except Exception:
+        pass
     return {
         "id": task.id,
         "client": (task.client or "").strip() or None,
@@ -645,7 +705,11 @@ def _serialize_task(task: Task, latest_log: LogEntry | None) -> Dict[str, Any]:
         "summary": _task_summary(task),
         "description": task.description,
         "status": task.status.value,
-        "bucket": _task_bucket(task.status),
+        "bucket": "failed" if (
+            isinstance(task.metadata, dict)
+            and isinstance(task.metadata.get("test_exit_code"), int)
+            and task.metadata["test_exit_code"] != 0
+        ) else _task_bucket(task.status),
         "created_at": _iso(task.created_at),
         "updated_at": _iso(task.updated_at),
         "repo_path": str(task.repo_path),
@@ -654,6 +718,7 @@ def _serialize_task(task: Task, latest_log: LogEntry | None) -> Dict[str, Any]:
         "last_event_at": _iso(latest_log.timestamp) if latest_log else None,
         "patch_counts": patches,
         "plan_approved": bool(task.metadata.get("plan_approved")) if isinstance(task.metadata, dict) else False,
+        "duration_seconds": duration_seconds,
     }
 
 
@@ -715,8 +780,13 @@ _INDEX_HTML = """<!doctype html>
     </main>
 
     <section class="panel details">
-      <div class="panelHeader">
+      <div class="panelHeader" style="display:flex;align-items:center;gap:10px">
         <div class="panelTitle">Evidence &amp; Details</div>
+        <div class="detailActions">
+          <button class="iconBtn" id="btnRefresh" title="Refresh">&#x21bb;</button>
+          <button class="iconBtn" id="btnPin" title="Pin"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 1v4L3 7v1h4v6l1 1 1-1V8h4V7l-2-2V1"/></svg></button>
+          <button class="iconBtn" id="btnTag" title="Tag"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 1h6l7 7-6 6-7-7V1z"/><circle cx="4.5" cy="4.5" r="1" fill="currentColor"/></svg></button>
+        </div>
       </div>
       <div id="detailsBody" class="detailsBody">
         <div class="empty">Select a step to view details</div>
@@ -774,7 +844,10 @@ def _plan_html(task_id: str) -> str:
       .then(r => r.ok ? r.json() : Promise.reject(new Error('task not found')))
       .then(data => {{
         const t = data.task || {{}};
-        const clientLabel = (t.client && String(t.client).trim()) ? t.client : 'CLI';
+        const rawClient = (t.client && String(t.client).trim()) || '';
+        const clientLabel = rawClient
+          ? (rawClient.toLowerCase() === 'cursor' ? 'Cursor' : rawClient.toLowerCase() === 'claude' ? 'Claude' : rawClient)
+          : 'CLI';
         document.getElementById('planTitle').textContent = t.title ? t.title : 'Plan';
         document.getElementById('planSubtitle').textContent = `${{clientLabel}} · ${{t.repo_path || '—'}} · ${{t.branch || '—'}}`;
       }})
@@ -807,6 +880,7 @@ _STYLES_CSS = """
   --accent:#3b82f6;
   --good:#22c55e;
   --warn:#f59e0b;
+  --info:#38bdf8;
   --bad:#ef4444;
   --chip:#111a2f;
 }
@@ -935,6 +1009,8 @@ body{
 .taskCard:hover{border-color:rgba(59,130,246,.35)}
 .taskCard.selected{outline:2px solid rgba(59,130,246,.35)}
 .taskRow{display:flex; align-items:center; justify-content:space-between; gap:10px}
+.taskRow .taskTitle{flex:1; min-width:0}
+.taskRow .timeLabel{flex-shrink:0; color:#cbd5ff; font-size:12px}
 .timeLabel{color:#cbd5ff;font-size:12px}
 .taskTitle{
   font-size:13px;
@@ -954,13 +1030,18 @@ body{
 }
 .chip.purple{border-color:rgba(124,58,237,.35); color:#e9d5ff; background:rgba(124,58,237,.12)}
 .chip.green{border-color:rgba(34,197,94,.35); color:#bbf7d0; background:rgba(34,197,94,.10)}
-.chip.yellow{border-color:rgba(245,158,11,.35); color:#fde68a; background:rgba(245,158,11,.10)}
+.chip.yellow{border-color:rgba(245,158,11,.35); color:#fde68a; background:rgba(245,158,11,.12)}
+.chip.blue{border-color:rgba(56,189,248,.40); color:#e0f2fe; background:rgba(56,189,248,.14)}
 .chip.red{border-color:rgba(239,68,68,.35); color:#fecaca; background:rgba(239,68,68,.10)}
+.stepDot{width:12px;height:12px;border-radius:999px;border:2px solid var(--muted);flex-shrink:0;margin-left:auto}
+.stepDot.good{border-color:var(--good);background:var(--good)}
+.stepDot.bad{border-color:var(--bad);background:var(--bad)}
+.stepDot.active{border-color:var(--accent);background:transparent}
 .dot2{width:10px;height:10px;border-radius:999px; background:var(--muted)}
 .dot2.good{background:var(--good)}
 .dot2.warn{background:var(--warn)}
 .dot2.bad{background:var(--bad)}
-.dot2.blue{background:var(--accent)}
+.dot2.blue{background:var(--info)}
 
 .steps{padding:12px; overflow:auto; height:calc(100% - 58px)}
 .step{
@@ -982,11 +1063,30 @@ body{
 .rail .fill{position:absolute; left:0; top:0; width:100%; height:100%; background:rgba(34,197,94,.65)}
 .rail .fill.active{background:rgba(59,130,246,.75)}
 .stepBody{flex:1}
+.stepLabelRow{display:flex;align-items:center;gap:8px}
+.stepIcon{width:18px;height:18px;color:var(--muted);flex-shrink:0}
+.stepIcon svg{width:18px;height:18px}
+.detailHeaderRow{display:flex;align-items:center;gap:8px}
+.detailHeaderIcon{width:18px;height:18px;color:var(--muted);flex-shrink:0}
+.detailHeaderIcon svg{width:18px;height:18px}
 .stepLabel{font-size:13px; font-weight:650}
 .stepChips{margin-top:8px; display:flex; gap:8px; flex-wrap:wrap}
 .small{font-size:12px; color:var(--muted); margin-top:6px}
 .detailsBody{padding:16px}
 .details{overflow:auto}
+.detailActions{display:flex;gap:6px;margin-left:auto}
+.iconBtn{
+  width:28px;height:28px;border-radius:6px;
+  border:1px solid var(--border);
+  background:transparent;
+  color:var(--muted);
+  cursor:pointer;
+  display:grid;place-items:center;
+  font-size:14px;
+  padding:0;
+}
+.iconBtn:hover{background:rgba(148,163,184,.1);color:#e2e8f0}
+.iconBtn svg{width:14px;height:14px}
 .card{
   border:1px solid var(--border);
   background:rgba(10,16,32,.55);
@@ -1069,6 +1169,22 @@ body{
   font-size:12px;
   cursor:pointer;
 }
+.actionBar{display:flex;gap:8px;margin-top:14px;padding-top:10px;border-top:1px solid var(--border)}
+.actionBtn{
+  padding:6px 14px;
+  border-radius:8px;
+  border:1px solid rgba(124,58,237,.6);
+  background:rgba(124,58,237,.18);
+  color:#e5e7eb;
+  font-size:12px;
+  cursor:pointer;
+  display:inline-flex;align-items:center;gap:6px;
+  transition:background .15s,border-color .15s;
+}
+.actionBtn:hover{background:rgba(124,58,237,.35);border-color:rgba(124,58,237,.8)}
+.actionBtn:disabled{opacity:.55;cursor:default}
+.actionBtn.success{border-color:rgba(34,197,94,.5);background:rgba(34,197,94,.12);color:#86efac}
+.actionBtn.fail{border-color:rgba(239,68,68,.5);background:rgba(239,68,68,.12);color:#fca5a5}
 .prio{
   font-size:11px;
   font-weight:800;
@@ -1141,9 +1257,9 @@ body{
   gap:6px;
 }
 .treeDir::before{
-  content:"▸";
-  font-size:11px;
-  opacity:0.65;
+  content:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 16 16' fill='none' stroke='%2394a3b8' stroke-width='1.5'%3E%3Cpath d='M2 4h4l2 2h6v7H2z' rx='1'/%3E%3C/svg%3E");
+  font-size:0;
+  vertical-align:middle;
 }
 .treeFile{
   font-size:12px;
@@ -1153,14 +1269,38 @@ body{
   text-overflow:ellipsis;
   white-space:nowrap;
   position:relative;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
 }
 .treeFile::before{
-  content:"•";
+  content:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 16 16' fill='none' stroke='%2394a3b8' stroke-width='1.5'%3E%3Cpath d='M4 2h5l3 3v9H4z'/%3E%3Cline x1='9' y1='2' x2='9' y2='5'/%3E%3Cline x1='9' y1='5' x2='12' y2='5'/%3E%3C/svg%3E");
   position:absolute;
   left:0;
   top:2px;
-  font-size:11px;
-  opacity:0.75;
+  font-size:0;
+}
+.badge-modify{
+  font-size:10px;
+  font-weight:700;
+  color:#fde68a;
+  background:rgba(245,158,11,.15);
+  border:1px solid rgba(245,158,11,.35);
+  border-radius:999px;
+  padding:1px 7px;
+  flex-shrink:0;
+  margin-left:8px;
+}
+.badge-create{
+  font-size:10px;
+  font-weight:700;
+  color:#bbf7d0;
+  background:rgba(34,197,94,.15);
+  border:1px solid rgba(34,197,94,.35);
+  border-radius:999px;
+  padding:1px 7px;
+  flex-shrink:0;
+  margin-left:8px;
 }
 .planItem{
   border:1px solid var(--border);
@@ -1226,6 +1366,11 @@ body{
   line-height:1.4;
   color:#e5e7eb;
 }
+.diff-file-header{color:#94a3b8}
+.diff-hunk{color:#fbbf24}
+.diff-add{color:#4ade80}
+.diff-del{color:#f87171}
+.diff-context{color:#e5e7eb}
 .kv{display:grid; grid-template-columns: 140px 1fr; row-gap:10px; column-gap:12px}
 .k{color:var(--muted); font-size:12px}
 .v{font-size:12px; color:#e2e8f0; word-break:break-word}
@@ -1247,13 +1392,53 @@ let state = {
 
 const $ = (id) => document.getElementById(id);
 
+const STEP_ICONS = {
+  TASK_SPECIFICATION: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="2" width="10" height="12" rx="1.5"/><line x1="5.5" y1="5" x2="10.5" y2="5"/><line x1="5.5" y1="8" x2="10.5" y2="8"/><line x1="5.5" y1="11" x2="8.5" y2="11"/></svg>',
+  CLARIFYING: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3h12v8H5l-3 3V3z" rx="1.5"/><circle cx="5" cy="7" r="0.5" fill="currentColor"/><circle cx="8" cy="7" r="0.5" fill="currentColor"/><circle cx="11" cy="7" r="0.5" fill="currentColor"/></svg>',
+  PLANNING: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="12" height="12" rx="1.5"/><line x1="5" y1="5" x2="11" y2="5"/><line x1="5" y1="8" x2="11" y2="8"/><line x1="5" y1="11" x2="9" y2="11"/></svg>',
+  CODEGEN: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="5,4 2,8 5,12"/><polyline points="11,4 14,8 11,12"/><line x1="9" y1="3" x2="7" y2="13"/></svg>',
+  RUN_TESTS: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 2l1 5h6l1-5"/><path d="M5 7v5a3 3 0 006 0V7"/><line x1="3" y1="2" x2="13" y2="2"/></svg>',
+};
+
+function renderHighlightedDiff(pre, text) {
+  pre.innerHTML = '';
+  const lines = (text || '').split('\n');
+  lines.forEach((line, i) => {
+    const span = document.createElement('span');
+    if (line.startsWith('+++') || line.startsWith('---')) {
+      span.className = 'diff-file-header';
+    } else if (line.startsWith('@@')) {
+      span.className = 'diff-hunk';
+    } else if (line.startsWith('+')) {
+      span.className = 'diff-add';
+    } else if (line.startsWith('-')) {
+      span.className = 'diff-del';
+    } else {
+      span.className = 'diff-context';
+    }
+    span.textContent = line;
+    pre.appendChild(span);
+    if (i < lines.length - 1) pre.appendChild(document.createTextNode('\n'));
+  });
+}
+
+function clientLabelFrom(raw) {
+  const val = (raw && String(raw).trim()) || '';
+  if (!val) return 'CLI';
+  if (val.toLowerCase() === 'cursor') return 'Cursor';
+  if (val.toLowerCase() === 'claude') return 'Claude';
+  return val;
+}
+
+// Match CLI dashboard: short title so "X ago" timestamp stays visible (28 chars like dashboard.py)
+const TASK_TITLE_MAX_LEN = 28;
 function resolveTaskTitle(task) {
   if (!task) return 'Untitled';
   const raw = (task.title && task.title.trim())
     || (task.summary && task.summary.trim())
     || ((task.description || '').split(/\n/)[0] || '').trim();
   if (!raw) return 'Untitled';
-  return raw.length > 42 ? raw.slice(0, 39) + '…' : raw;
+  return raw.length > TASK_TITLE_MAX_LEN ? raw.slice(0, TASK_TITLE_MAX_LEN - 1) + '…' : raw;
 }
 
 function fmtCount(value) {
@@ -1263,6 +1448,56 @@ function fmtCount(value) {
   return '—';
 }
 
+function normalizeRisk(raw) {
+  const cleanStr = (v) => (typeof v === 'string' ? v.trim() : '');
+
+  const asFields = (obj) => {
+    const title = cleanStr(obj.id) || cleanStr(obj.name) || cleanStr(obj.title) || 'Risk';
+    const description = cleanStr(obj.description) || cleanStr(obj.desc) || cleanStr(obj.summary) || '';
+    const mitigation =
+      cleanStr(obj.mitigation) ||
+      cleanStr(obj.mitigation_strategy) ||
+      cleanStr(obj.mitigationStrategy) ||
+      '';
+    return { title: title || 'Risk', description, mitigation };
+  };
+
+  if (!raw) return { title: 'Risk', description: '', mitigation: '' };
+
+  if (typeof raw === 'object') {
+    return asFields(raw);
+  }
+
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+
+    // Try JSON parsing (both proper JSON and common single-quote dict strings)
+    const attempts = [trimmed, trimmed.replace(/'/g, '"')];
+    for (const candidate of attempts) {
+      try {
+        const parsed = JSON.parse(candidate);
+        if (parsed && typeof parsed === 'object') {
+          return asFields(parsed);
+        }
+      } catch (e) {
+        /* ignore */
+      }
+    }
+
+    const idMatch = trimmed.match(/['"]?id['"]?\s*:\s*['"]([^'"}]+)['"]/i);
+    const descMatch = trimmed.match(/['"]?description['"]?\s*:\s*['"]([^'"}]+)['"]/i);
+    const mitMatch = trimmed.match(/['"]?mitigation['"]?\s*:\s*['"]([^'"}]+)['"]/i);
+
+    return {
+      title: (idMatch && idMatch[1].trim()) || 'Risk',
+      description: (descMatch && descMatch[1].trim()) || trimmed,
+      mitigation: (mitMatch && mitMatch[1].trim()) || '',
+    };
+  }
+
+  return { title: 'Risk', description: String(raw), mitigation: '' };
+}
+
 /**
  * Render a compact "bounded context tree" grouped by directory.
  *
@@ -1270,7 +1505,7 @@ function fmtCount(value) {
  * immediate directory and list a small sample of files under each,
  * using the existing `.tree`, `.treeDir`, `.treeFile` styles.
  */
-function renderPathTree(container, paths, maxDirs = 8, maxFilesPerDir = 6) {
+function renderPathTree(container, paths, maxDirs = 8, maxFilesPerDir = 6, fileBadges = null) {
   const clean = (paths || []).filter(p => typeof p === 'string' && p.trim());
   if (!clean.length) return;
 
@@ -1318,7 +1553,19 @@ function renderPathTree(container, paths, maxDirs = 8, maxFilesPerDir = 6) {
     byDir[dir].slice(0, maxFilesPerDir).forEach(file => {
       const fileEl = document.createElement('div');
       fileEl.className = 'treeFile';
-      fileEl.textContent = file;
+      const nameSpan = document.createElement('span');
+      nameSpan.textContent = file;
+      nameSpan.style.overflow = 'hidden';
+      nameSpan.style.textOverflow = 'ellipsis';
+      nameSpan.style.whiteSpace = 'nowrap';
+      fileEl.appendChild(nameSpan);
+      const fullPath = dir === '(root)' ? file : dir + '/' + file;
+      if (fileBadges && fileBadges[fullPath]) {
+        const badge = document.createElement('span');
+        badge.className = fileBadges[fullPath] === 'CREATE' ? 'badge-create' : 'badge-modify';
+        badge.textContent = fileBadges[fullPath] === 'CREATE' ? '+ CREATE' : 'MODIFY';
+        fileEl.appendChild(badge);
+      }
       tree.appendChild(fileEl);
     });
   });
@@ -1337,7 +1584,7 @@ function renderOverview(container, task, detail) {
   title.textContent = data.repo_path || task.repo_path || '—';
   const subtitle = document.createElement('div');
   subtitle.className = 'overviewSubtitle';
-  const clientLabel = (task.client && String(task.client).trim()) ? task.client : 'CLI';
+  const clientLabel = clientLabelFrom(task.client);
   subtitle.textContent = `${clientLabel} · ${data.branch || task.branch || '—'}`;
   hero.appendChild(title);
   hero.appendChild(subtitle);
@@ -1416,7 +1663,7 @@ function renderOverview(container, task, detail) {
   const scopeMeta = document.createElement('div');
   scopeMeta.className = 'small';
   const scopeCount = typeof data.scope_file_count === 'number' ? data.scope_file_count : (data.files_sample || []).length;
-  scopeMeta.textContent = `${scopeCount || 0} file(s) in scope`;
+  scopeMeta.textContent = `${scopeCount || 0} files affected`;
   container.appendChild(scopeMeta);
   const scopeList = data.scoped_directories && data.scoped_directories.length ? data.scoped_directories : (data.files_sample || []);
   scopeList.slice(0, 12).forEach(item => {
@@ -1527,19 +1774,29 @@ function fmtAgo(iso, nowIso) {
 function statusDot(task) {
   // Map bucket/status into dot color similar to mock
   if (task.bucket === 'failed') return 'bad';
-  if (task.status === 'IMPLEMENTING' || task.status === 'VERIFYING') return 'good';
+  if (task.status === 'COMPLETED') return 'good';
+  if (task.status === 'IMPLEMENTING' || task.status === 'VERIFYING') return 'info';
   if (task.status === 'CLARIFYING' || task.status === 'SPEC_PENDING') return 'warn';
   return 'blue';
 }
 
 function chipForTask(task) {
   const chips = [];
+  // Show duration if available
+  if (task.duration_seconds && task.duration_seconds > 0) {
+    chips.push({ cls: 'chip', text: `${task.duration_seconds}s` });
+  }
   // Show patch counts if any
   if (task.patch_counts && task.patch_counts.total > 0) {
     chips.push({ cls: 'purple', text: `${task.patch_counts.total} patches` });
   }
   // Show status as chip
-  chips.push({ cls: 'chip', text: task.status });
+  let cls = 'chip';
+  if (task.status === 'COMPLETED') cls = 'chip green';
+  else if (task.status === 'IMPLEMENTING' || task.status === 'VERIFYING') cls = 'chip blue';
+  else if (task.status === 'CLARIFYING' || task.status === 'SPEC_PENDING') cls = 'chip yellow';
+  else if (task.bucket === 'failed') cls = 'chip red';
+  chips.push({ cls, text: task.status });
   return chips;
 }
 
@@ -1591,7 +1848,7 @@ function renderTasks() {
     dot.className = 'dot2 ' + statusDot(t);
     const title = document.createElement('div');
     title.className = 'taskTitle';
-    const clientLabel = (t.client && String(t.client).trim()) ? t.client : 'CLI';
+    const clientLabel = clientLabelFrom(t.client);
     const shortTitle = resolveTaskTitle(t);
     title.textContent = `${clientLabel} · ${shortTitle}`;
     left.appendChild(dot);
@@ -1621,7 +1878,7 @@ function renderTasks() {
 
 function renderWorkflow(task, workflow) {
   if (task) {
-    const clientLabel = (task.client && String(task.client).trim()) ? task.client : 'CLI';
+    const clientLabel = clientLabelFrom(task.client);
     $('workflowSubtitle').textContent = `${clientLabel} · ${task.title}`;
   } else {
     $('workflowSubtitle').textContent = 'Select a task';
@@ -1658,9 +1915,19 @@ function renderWorkflow(task, workflow) {
 
     const body = document.createElement('div');
     body.className = 'stepBody';
+    const labelRow = document.createElement('div');
+    labelRow.className = 'stepLabelRow';
+    const iconSvg = STEP_ICONS[step.key];
+    if (iconSvg) {
+      const iconWrap = document.createElement('span');
+      iconWrap.className = 'stepIcon';
+      iconWrap.innerHTML = iconSvg;
+      labelRow.appendChild(iconWrap);
+    }
     const label = document.createElement('div');
     label.className = 'stepLabel';
     label.textContent = step.label;
+    labelRow.appendChild(label);
 
     const chips = document.createElement('div');
     chips.className = 'stepChips';
@@ -1687,7 +1954,16 @@ function renderWorkflow(task, workflow) {
       chips.appendChild(ch);
     });
 
-    body.appendChild(label);
+    // Step completion dot
+    const stepDot = document.createElement('span');
+    let dotCls = 'stepDot';
+    if (step.test_failed) dotCls += ' bad';
+    else if (step.status === 'done') dotCls += ' good';
+    else if (step.status === 'active') dotCls += ' active';
+    stepDot.className = dotCls;
+    labelRow.appendChild(stepDot);
+
+    body.appendChild(labelRow);
     body.appendChild(chips);
 
     el.appendChild(rail);
@@ -1727,15 +2003,32 @@ function renderDetails(task, step, detail) {
   // Header
   const head = document.createElement('div');
   head.style.marginBottom = '14px';
-  const h1 = document.createElement('div');
-  h1.style.fontWeight = '700';
-  h1.style.fontSize = '14px';
-  h1.textContent = currentStep.label;
+  const h1Row = document.createElement('div');
+  h1Row.className = 'detailHeaderRow';
+  const hIcon = STEP_ICONS[currentStep.key];
+  if (hIcon) {
+    const hIconWrap = document.createElement('span');
+    hIconWrap.className = 'detailHeaderIcon';
+    hIconWrap.innerHTML = hIcon;
+    h1Row.appendChild(hIconWrap);
+  }
+  const h1Label = document.createElement('span');
+  h1Label.style.fontWeight = '700';
+  h1Label.style.fontSize = '14px';
+  h1Label.textContent = currentStep.label;
+  h1Row.appendChild(h1Label);
+  const hDot = document.createElement('span');
+  let hDotCls = 'dot2';
+  if (currentStep.test_failed) hDotCls += ' bad';
+  else if (currentStep.status === 'done') hDotCls += ' good';
+  else if (currentStep.status === 'active') hDotCls += ' blue';
+  hDot.className = hDotCls;
+  h1Row.appendChild(hDot);
   const h2 = document.createElement('div');
   h2.className = 'small';
   const dur = typeof currentStep.duration_seconds === 'number' ? `${Math.round(currentStep.duration_seconds * 10) / 10}s` : '—';
-  h2.textContent = `${dur} · ${currentStep.status.toUpperCase()}`;
-  head.appendChild(h1);
+  h2.textContent = dur;
+  head.appendChild(h1Row);
   head.appendChild(h2);
   el.appendChild(head);
 
@@ -1839,78 +2132,24 @@ function renderDetails(task, step, detail) {
   }
 
   if (currentStep.key === 'PLANNING') {
+    // Approval banner
     if (d.plan_approved) {
       const banner = document.createElement('div');
       banner.className = 'banner';
       banner.textContent = 'User approved this plan';
       el.appendChild(banner);
+    } else {
+      const banner = document.createElement('div');
+      banner.className = 'banner warn';
+      banner.textContent = 'Plan not approved yet';
+      el.appendChild(banner);
     }
 
-    // Impacted scope (prefer explicit targets; fall back to a small file sample)
-    const bc = d.bounded_context || {};
-    const targets = (bc.targets || []);
-    const files = (bc.files_sample || []);
-    const total = (typeof bc.file_count === 'number') ? bc.file_count : files.length;
-    const list = targets.length ? targets : files;
-    if (list.length) {
-      const sec = document.createElement('div');
-      sec.className = 'sectionTitle';
-      sec.textContent = targets.length ? 'Bounded context tree' : 'Impacted files (sample)';
-      el.appendChild(sec);
-
-      const meta = document.createElement('div');
-      meta.className = 'small';
-      meta.textContent = `${total} file(s) in scope`;
-      el.appendChild(meta);
-
-      // If we have explicit targets, show a compact tree grouped by directory.
-      if (targets.length) {
-        renderPathTree(el, list, 12, 8);
-      } else {
-        // Fallback to a flat sample list (same style as Code generation "Files touched").
-        list.slice(0, 25).forEach(p => {
-          const row = document.createElement('div');
-          row.className = 'fileRow';
-          row.textContent = p;
-          el.appendChild(row);
-        });
-      }
-    }
-
-    // Execution plan
-    const steps = d.plan_steps || [];
-    if (steps.length) {
-      const sec2 = document.createElement('div');
-      sec2.className = 'sectionTitle';
-      sec2.textContent = 'Execution plan';
-      el.appendChild(sec2);
-      steps.forEach((s, idx) => {
-        const li = document.createElement('div');
-        li.className = 'planItem';
-        const n = document.createElement('span');
-        n.className = 'planN';
-        n.textContent = String(idx + 1);
-        const txt = document.createElement('span');
-        txt.textContent = (s.description || String(s)).trim();
-        li.appendChild(n);
-        li.appendChild(txt);
-        el.appendChild(li);
-      });
-    }
-    return;
-  }
-
-  if (currentStep.key === 'APPROVAL') {
-    const banner = document.createElement('div');
-    banner.className = d.plan_approved ? 'banner' : 'banner warn';
-    banner.textContent = d.plan_approved ? 'Plan approved' : 'Plan not approved yet';
-    el.appendChild(banner);
-
-    // Show plan in a structured UI (same style as planning), and keep markdown as an optional link.
+    // Plan markdown link (if available)
     if (d.plan_markdown_path) {
       const sec = document.createElement('div');
       sec.className = 'sectionTitle';
-      sec.textContent = 'Final plan document';
+      sec.textContent = 'Plan document';
       el.appendChild(sec);
 
       const card = document.createElement('div');
@@ -1942,16 +2181,94 @@ function renderDetails(task, step, detail) {
 
       card.appendChild(small);
       card.appendChild(actions);
-
       el.appendChild(card);
-    } else {
-      const hint = document.createElement('div');
-      hint.className = 'small';
-      hint.textContent = 'No exported plan document found yet.';
-      el.appendChild(hint);
     }
 
-    // Boundary specs (summary + details)
+    // Impacted scope: prefer plan_target_files (with MODIFY/CREATE badges),
+    // fall back to directory-level targets, then file sample.
+    const bc = d.bounded_context || {};
+    const planTargetFiles = (bc.plan_target_files || []);
+    const bcAllowed = bc.allowed_files || [];
+    const targets = (bc.targets || []);
+    const files = (bc.files_sample || []);
+    const total = (typeof bc.file_count === 'number') ? bc.file_count : files.length;
+    const list = planTargetFiles.length ? planTargetFiles : (targets.length ? targets : files);
+    if (list.length) {
+      const sec = document.createElement('div');
+      sec.className = 'sectionTitle';
+      sec.textContent = planTargetFiles.length ? 'Bounded context tree' : (targets.length ? 'Bounded context tree' : 'Impacted files (sample)');
+      el.appendChild(sec);
+
+      const meta = document.createElement('div');
+      meta.className = 'small';
+      meta.textContent = planTargetFiles.length ? `${planTargetFiles.length} files affected` : `${total} files affected`;
+      el.appendChild(meta);
+
+      if (planTargetFiles.length) {
+        // Build MODIFY/CREATE badges using same logic as CODEGEN
+        const allowedSet = new Set(bcAllowed);
+        const badges = {};
+        if (allowedSet.size) {
+          planTargetFiles.forEach(f => { badges[f] = allowedSet.has(f) ? 'MODIFY' : 'CREATE'; });
+        }
+        renderPathTree(el, planTargetFiles, 12, 8, Object.keys(badges).length ? badges : null);
+      } else if (targets.length) {
+        renderPathTree(el, list, 12, 8);
+      } else {
+        list.slice(0, 25).forEach(p => {
+          const row = document.createElement('div');
+          row.className = 'fileRow';
+          row.textContent = p;
+          el.appendChild(row);
+        });
+      }
+    }
+
+    // Execution plan
+    const steps = d.plan_steps || [];
+    if (steps.length) {
+      const sec2 = document.createElement('div');
+      sec2.className = 'sectionTitle';
+      sec2.textContent = 'Execution plan';
+      el.appendChild(sec2);
+      steps.forEach((s, idx) => {
+        const li = document.createElement('div');
+        li.className = 'planItem';
+        const n = document.createElement('span');
+        n.className = 'planN';
+        n.textContent = String(idx + 1);
+        const txt = document.createElement('span');
+
+        // Be robust to different step payload shapes so we never show "[object Object]".
+        let label = "";
+        if (s && typeof s === "object") {
+          const candidate =
+            (typeof s.description === "string" && s.description) ||
+            (typeof s.title === "string" && s.title) ||
+            (typeof s.summary === "string" && s.summary) ||
+            (typeof s.text === "string" && s.text) ||
+            (typeof s.name === "string" && s.name);
+          if (candidate) {
+            label = candidate;
+          } else {
+            try {
+              label = JSON.stringify(s);
+            } catch {
+              label = String(s);
+            }
+          }
+        } else {
+          label = String(s ?? "");
+        }
+
+        txt.textContent = label.trim();
+        li.appendChild(n);
+        li.appendChild(txt);
+        el.appendChild(li);
+      });
+    }
+
+    // Boundary specs
     const specs = d.boundary_specs || [];
     if (specs.length) {
       const sec = document.createElement('div');
@@ -2009,57 +2326,7 @@ function renderDetails(task, step, detail) {
       });
     }
 
-    // Impacted scope (prefer explicit targets; fall back to small file sample)
-    const bc = d.bounded_context || {};
-    const targets = (bc.targets || []);
-    const files = (bc.files_sample || []);
-    const total = (typeof bc.file_count === 'number') ? bc.file_count : files.length;
-    const list = targets.length ? targets : files;
-    if (list.length) {
-      const sec = document.createElement('div');
-      sec.className = 'sectionTitle';
-      sec.textContent = targets.length ? 'Bounded context tree' : 'Impacted files (sample)';
-      el.appendChild(sec);
-
-      const meta = document.createElement('div');
-      meta.className = 'small';
-      meta.textContent = `${total} file(s) in scope`;
-      el.appendChild(meta);
-
-      if (targets.length) {
-        renderPathTree(el, list, 12, 8);
-      } else {
-        list.slice(0, 25).forEach(p => {
-          const row = document.createElement('div');
-          row.className = 'fileRow';
-          row.textContent = p;
-          el.appendChild(row);
-        });
-      }
-    }
-
-    // Execution plan (same visual style as planning)
-    const steps = d.plan_steps || [];
-    if (steps.length) {
-      const sec2 = document.createElement('div');
-      sec2.className = 'sectionTitle';
-      sec2.textContent = 'Execution plan';
-      el.appendChild(sec2);
-      steps.forEach((s, idx) => {
-        const li = document.createElement('div');
-        li.className = 'planItem';
-        const n = document.createElement('span');
-        n.className = 'planN';
-        n.textContent = String(idx + 1);
-        const txt = document.createElement('span');
-        txt.textContent = (s.description || String(s)).trim();
-        li.appendChild(n);
-        li.appendChild(txt);
-        el.appendChild(li);
-      });
-    }
-
-    // Scenarios (compact, no long scrolling markdown)
+    // Scenarios
     const scenarios = d.scenarios || [];
     if (scenarios.length) {
       const sec3 = document.createElement('div');
@@ -2083,7 +2350,7 @@ function renderDetails(task, step, detail) {
       });
     }
 
-    // Risks + refactor suggestions (from plan preview / markdown)
+    // Risks
     const risks = d.risks || [];
     if (risks.length) {
       const sec4 = document.createElement('div');
@@ -2091,13 +2358,39 @@ function renderDetails(task, step, detail) {
       sec4.textContent = 'Risks';
       el.appendChild(sec4);
       risks.slice(0, 20).forEach(r => {
-        const row = document.createElement('div');
-        row.className = 'fileRow';
-        row.textContent = r;
-        el.appendChild(row);
+        const card = document.createElement('div');
+        card.className = 'qcard';
+
+        const info = normalizeRisk(r);
+        const title = info.title || 'Risk';
+        const desc = info.description || '';
+        const mitigation = info.mitigation || '';
+
+        const h = document.createElement('div');
+        h.className = 'qhead';
+        h.textContent = title || 'Risk';
+
+        const body = document.createElement('div');
+        body.className = 'small';
+        body.style.marginTop = '6px';
+        body.textContent = desc || '—';
+
+        card.appendChild(h);
+        card.appendChild(body);
+
+        if (mitigation) {
+          const mit = document.createElement('div');
+          mit.className = 'small muted';
+          mit.style.marginTop = '6px';
+          mit.textContent = `Mitigation: ${mitigation}`;
+          card.appendChild(mit);
+        }
+
+        el.appendChild(card);
       });
     }
 
+    // Refactor suggestions
     const ref = d.refactors || [];
     if (ref.length) {
       const sec5 = document.createElement('div');
@@ -2119,22 +2412,22 @@ function renderDetails(task, step, detail) {
     const pending = (patches || []).filter(p => p.status === 'PENDING');
     const banner = document.createElement('div');
     banner.className = pending.length ? 'banner warn' : 'banner';
-    banner.textContent = pending.length ? 'Not applied' : 'Applied / no pending patches';
+    banner.textContent = pending.length ? '\u2298 Not applied' : '\u2714 Applied / no pending patches';
     el.appendChild(banner);
 
-    // Files touched (from diffs)
+    // Files touched (from diffs) with MODIFY/CREATE badges
     const files = d.files_touched || [];
     if (files.length) {
       const sec = document.createElement('div');
       sec.className = 'sectionTitle';
       sec.textContent = `Files touched (${files.length})`;
       el.appendChild(sec);
-      files.slice(0, 30).forEach(f => {
-        const row = document.createElement('div');
-        row.className = 'fileRow';
-        row.textContent = f;
-        el.appendChild(row);
-      });
+      const allowedSet = new Set(d.allowed_files || []);
+      const badges = {};
+      if (allowedSet.size) {
+        files.forEach(f => { badges[f] = allowedSet.has(f) ? 'MODIFY' : 'CREATE'; });
+      }
+      renderPathTree(el, files, 12, 30, Object.keys(badges).length ? badges : null);
     }
 
     // Patch list + diff preview
@@ -2154,9 +2447,9 @@ function renderDetails(task, step, detail) {
         row.className = 'patchRow' + (p.id === state.selectedPatchId ? ' selected' : '');
         const via = (p.applied_via && String(p.applied_via).trim()) ? ` · ${p.applied_via}` : '';
         row.textContent = `${p.id.slice(0,8)} · ${p.status}${via} · ${p.step_reference}`;
-        row.onclick = () => {
+      row.onclick = () => {
           state.selectedPatchId = p.id;
-          renderDetails(task, step, detail);
+          renderDetails(task, step, d);
         };
         list.appendChild(row);
       });
@@ -2187,8 +2480,145 @@ function renderDetails(task, step, detail) {
 
       const pre = document.createElement('pre');
       pre.className = 'diff';
-      pre.textContent = (chosen && chosen.diff) ? chosen.diff : '—';
+      if (chosen && chosen.diff) {
+        renderHighlightedDiff(pre, chosen.diff);
+      } else {
+        pre.textContent = '—';
+      }
       el.appendChild(pre);
+    }
+
+    // Action bar with Re-run tests / Re-run from here
+    {
+      const bar = document.createElement('div');
+      bar.className = 'actionBar';
+      const testFiles = d.test_files || [];
+      if (testFiles.length) {
+        const btn = document.createElement('button');
+        btn.className = 'actionBtn';
+        btn.innerHTML = '\u25b6 Re-run tests';
+        btn.onclick = async () => {
+          btn.disabled = true;
+          btn.textContent = 'Running tests\u2026';
+          try {
+            const res = await fetch(`/api/task/${encodeURIComponent(task.id)}/run-tests`, {method:'POST'});
+            const result = await res.json();
+            if (result.exit_code === 0) {
+              btn.className = 'actionBtn success';
+              btn.textContent = '\u2714 Tests passed';
+            } else {
+              btn.className = 'actionBtn fail';
+              btn.textContent = '\u2718 Tests failed';
+            }
+          } catch(e) {
+            btn.className = 'actionBtn fail';
+            btn.textContent = 'Error running tests';
+          }
+          setTimeout(() => { btn.className='actionBtn'; btn.innerHTML='\u25b6 Re-run tests'; btn.disabled=false; }, 4000);
+          setTimeout(tick, 500);
+        };
+        bar.appendChild(btn);
+      }
+      el.appendChild(bar);
+    }
+    return;
+  }
+
+  if (currentStep.key === 'RUN_TESTS') {
+    // Run / Re-run tests button
+    {
+      const bar = document.createElement('div');
+      bar.style.marginBottom = '12px';
+      const hasResults = !!(d.tool_name || d.output || typeof d.exit_code === 'number');
+      const testFiles = d.test_files || [];
+      const btn = document.createElement('button');
+      btn.className = 'actionBtn';
+      btn.innerHTML = hasResults ? '\u25b6 Re-run tests' : '\u25b6 Run tests';
+      if (!testFiles.length && !hasResults) {
+        btn.disabled = true;
+        btn.title = 'No test files detected in patches';
+      }
+      btn.onclick = async () => {
+        btn.disabled = true;
+        btn.textContent = 'Running tests\u2026';
+        try {
+          const res = await fetch(`/api/task/${encodeURIComponent(task.id)}/run-tests`, {method:'POST'});
+          const result = await res.json();
+          if (result.exit_code === 0) {
+            btn.className = 'actionBtn success';
+            btn.textContent = '\u2714 Tests passed';
+          } else {
+            btn.className = 'actionBtn fail';
+            btn.textContent = '\u2718 Tests failed';
+          }
+        } catch(e) {
+          btn.className = 'actionBtn fail';
+          btn.textContent = 'Error running tests';
+        }
+        setTimeout(() => { btn.className='actionBtn'; btn.innerHTML=hasResults?'\u25b6 Re-run tests':'\u25b6 Run tests'; btn.disabled=false; }, 4000);
+        setTimeout(tick, 500);
+      };
+      bar.appendChild(btn);
+      el.appendChild(bar);
+    }
+
+    if (d.tool_name) {
+      const toolSec = document.createElement('div');
+      toolSec.className = 'sectionTitle';
+      toolSec.textContent = 'Tool';
+      el.appendChild(toolSec);
+      const toolCard = document.createElement('div');
+      toolCard.className = 'card';
+      const toolLabel = d.tool_version ? `${d.tool_name} ${d.tool_version}` : d.tool_name;
+      toolCard.textContent = toolLabel;
+      el.appendChild(toolCard);
+    }
+    if (d.arguments) {
+      const argSec = document.createElement('div');
+      argSec.className = 'sectionTitle';
+      argSec.textContent = 'Arguments';
+      el.appendChild(argSec);
+      const argPre = document.createElement('pre');
+      argPre.className = 'diff';
+      argPre.textContent = typeof d.arguments === 'string' ? d.arguments : JSON.stringify(d.arguments, null, 2);
+      el.appendChild(argPre);
+    }
+    if (d.output) {
+      const outSec = document.createElement('div');
+      outSec.className = 'sectionTitle';
+      outSec.textContent = 'Output';
+      el.appendChild(outSec);
+      const outPre = document.createElement('pre');
+      outPre.className = 'diff';
+      outPre.textContent = d.output;
+      outPre.style.maxHeight = '400px';
+      el.appendChild(outPre);
+    }
+    if (typeof d.exit_code === 'number') {
+      const exitSec = document.createElement('div');
+      exitSec.className = 'sectionTitle';
+      exitSec.textContent = 'Exit code';
+      el.appendChild(exitSec);
+      const exitEl = document.createElement('div');
+      exitEl.className = 'card';
+      exitEl.style.display = 'flex';
+      exitEl.style.alignItems = 'center';
+      exitEl.style.gap = '8px';
+      const exitDot = document.createElement('span');
+      exitDot.className = 'dot2 ' + (d.exit_code === 0 ? 'good' : 'bad');
+      exitEl.appendChild(exitDot);
+      const exitText = document.createElement('span');
+      exitText.style.color = d.exit_code === 0 ? 'var(--good)' : 'var(--bad)';
+      exitText.style.fontWeight = '700';
+      exitText.textContent = `Exit code: ${d.exit_code}`;
+      exitEl.appendChild(exitText);
+      el.appendChild(exitEl);
+    }
+    if (!d.tool_name && !d.arguments && !d.output && typeof d.exit_code !== 'number') {
+      const hint = document.createElement('div');
+      hint.className = 'small';
+      hint.textContent = 'No test execution data available yet.';
+      el.appendChild(hint);
     }
     return;
   }
@@ -2255,19 +2685,39 @@ function wireUI() {
   });
 }
 
+let _tickRunning = false;
+let _lastStateFP = '';
+let _lastDetailFP = '';
+
+function _fp(data) {
+  const t = data.tasks || [];
+  return t.length + ':' + (t.length ? t[0].updated_at || '' : '') + ':' + (data.now || '');
+}
+function _dfp(d) {
+  if (!d || !d.task) return '';
+  const t = d.task;
+  return t.id + ':' + (t.updated_at || '') + ':' + (t.last_event_at || '');
+}
+
 async function tick() {
+  if (_tickRunning) return;
+  _tickRunning = true;
   try {
     const data = await fetchState();
     state.lastNow = data.now;
     state.tasks = data.tasks || [];
-    renderTasks();
+    const fp = _fp(data);
+    if (fp !== _lastStateFP) { _lastStateFP = fp; renderTasks(); }
 
-    // Keep selected task view fresh
-      if (state.selectedTaskId) {
-        const res = await fetch(`/api/task/${encodeURIComponent(state.selectedTaskId)}`, { cache: 'no-store' });
-        if (res.ok) {
-          const tdata = await res.json();
-          state.selectedTaskData = tdata;
+    if (state.selectedTaskId) {
+      const res = await fetch(`/api/task/${encodeURIComponent(state.selectedTaskId)}`, { cache: 'no-store' });
+      if (res.ok) {
+        const tdata = await res.json();
+        const dfp = _dfp(tdata);
+        const changed = dfp !== _lastDetailFP;
+        _lastDetailFP = dfp;
+        state.selectedTaskData = tdata;
+        if (changed) {
           renderWorkflow(tdata.task, tdata.workflow);
           if (state.selectedStepKey) {
             const step = (tdata.workflow || []).find(s => s.key === state.selectedStepKey);
@@ -2281,15 +2731,16 @@ async function tick() {
           }
         }
       }
-  } catch (e) {
-    // If state dir missing, etc.
-    console.warn(e);
-  }
+    }
+  } catch (e) { console.warn(e); }
+  finally { _tickRunning = false; }
 }
 
 wireUI();
+const btnRefresh = $('btnRefresh');
+if (btnRefresh) btnRefresh.addEventListener('click', () => tick());
 tick();
-setInterval(tick, 1200);
+setInterval(tick, 5000);
 """
 
 
@@ -2297,10 +2748,30 @@ class _DashboardApi:
     def __init__(self) -> None:
         settings = get_settings()
         self.store = JsonStore(settings.state_dir)
+        self._cache: tuple[list[Task], list[LogEntry]] | None = None
+        self._cache_time: float = 0.0
+        self._cache_tasks_mtime: float = 0
+        self._cache_logs_mtime: float = 0
 
     def _load(self) -> tuple[list[Task], list[LogEntry]]:
+        now = time.monotonic()
+        tasks_path = self.store.tasks_file
+        logs_path = self.store.logs_file
+        tasks_mtime = tasks_path.stat().st_mtime if tasks_path.exists() else 0
+        logs_mtime = logs_path.stat().st_mtime if logs_path.exists() else 0
+
+        if (self._cache is not None
+                and (now - self._cache_time) < 5.0
+                and tasks_mtime == self._cache_tasks_mtime
+                and logs_mtime == self._cache_logs_mtime):
+            return self._cache
+
         tasks = self.store.load_tasks()
         logs = self.store.load_logs()
+        self._cache = (tasks, logs)
+        self._cache_time = now
+        self._cache_tasks_mtime = tasks_mtime
+        self._cache_logs_mtime = logs_mtime
         return tasks, logs
 
     def state(self, *, minutes: int, filter_bucket: str) -> Dict[str, Any]:
@@ -2328,8 +2799,12 @@ class _DashboardApi:
             if not prev or ts > prev.timestamp:
                 latest_by_task[entry.task_id] = entry
 
-        # Keep payload light.
-        data_tasks = [_serialize_task(t, latest_by_task.get(t.id)) for t in filtered_tasks]
+        # Keep payload light – strip description (only needed in detail endpoint).
+        data_tasks = []
+        for t in filtered_tasks:
+            td = _serialize_task(t, latest_by_task.get(t.id))
+            td.pop("description", None)
+            data_tasks.append(td)
 
         # Provide a small recent activity list (global).
         recent = _latest_logs(logs, limit=20)
@@ -2393,6 +2868,100 @@ class _DashboardApi:
             content = content[:200_000] + "\n\n… (truncated)\n"
         return {"path": path_str or None, "content": content}
 
+    def run_tests(self, task_id: str) -> Dict[str, Any]:
+        """Execute tests for the given task and persist results."""
+        tasks, _ = self._load()
+        task = next((t for t in tasks if t.id == task_id), None)
+        if not task:
+            raise KeyError("task not found")
+
+        meta = task.metadata if isinstance(task.metadata, dict) else {}
+        repo_path = str(task.repo_path or "").strip()
+        if not repo_path or not Path(repo_path).is_dir():
+            return {"error": "Repository path not found", "exit_code": -1}
+
+        # Collect files_touched from patches
+        files_touched: list[str] = []
+        patches_raw = meta.get("patch_queue_state") or []
+        if isinstance(patches_raw, list):
+            for p in patches_raw:
+                if not isinstance(p, dict):
+                    continue
+                applied_diff = p.get("applied_diff")
+                raw_diff = str(p.get("diff") or "")
+                diff = str(applied_diff or raw_diff)
+                for f in _extract_files_from_diff(diff):
+                    if f not in files_touched:
+                        files_touched.append(f)
+
+        test_files = _filter_test_files(files_touched)
+        if not test_files:
+            return {"error": "No test files found in patches", "exit_code": -1}
+
+        existing_tool = meta.get("test_tool")
+        command, base_args = _detect_test_runner(test_files, existing_tool)
+
+        # Build command based on runner
+        if command == "dotnet":
+            # dotnet test --filter "FullyQualifiedName~Class1|FullyQualifiedName~Class2"
+            class_names = []
+            for tf in test_files:
+                stem = Path(tf).stem
+                class_names.append(f"FullyQualifiedName~{stem}")
+            filter_expr = "|".join(class_names)
+            cmd = [command] + base_args + ["--filter", filter_expr]
+        elif command == "pytest":
+            cmd = [command] + base_args + test_files
+        else:
+            # jest / npx jest
+            cmd = [command] + base_args + test_files
+
+        tool_name = base_args[0] if base_args else command
+        arguments = " ".join(cmd[len([command] + base_args):]) if cmd else ""
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=repo_path,
+                timeout=300,
+            )
+            output = result.stdout
+            if result.stderr:
+                output = output + "\n" + result.stderr if output else result.stderr
+            exit_code = result.returncode
+        except subprocess.TimeoutExpired:
+            output = "Test execution timed out after 300 seconds."
+            exit_code = -1
+        except FileNotFoundError:
+            output = f"Test runner '{command}' not found. Make sure it is installed."
+            exit_code = -1
+        except Exception as exc:
+            output = f"Error running tests: {exc}"
+            exit_code = -1
+
+        # Truncate very long output
+        if len(output) > 100_000:
+            output = output[:100_000] + "\n\n... (output truncated)"
+
+        # Persist results
+        if not isinstance(task.metadata, dict):
+            task.metadata = {}
+        task.metadata["test_tool"] = tool_name
+        task.metadata["test_output"] = output
+        task.metadata["test_exit_code"] = exit_code
+        task.metadata["test_arguments"] = arguments
+        self.store.upsert_task(task)
+        self._cache = None
+
+        return {
+            "tool": tool_name,
+            "arguments": arguments,
+            "output": output,
+            "exit_code": exit_code,
+        }
+
 
 def _extract_files_from_diff(diff: str) -> list[str]:
     """
@@ -2449,6 +3018,12 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
         priority = pr.strip()
 
     plan_preview = meta.get("plan_preview") or {}
+    if not isinstance(plan_preview, dict):
+        plan_preview = {}
+    if not plan_preview.get("steps"):
+        plan_fallback = meta.get("plan") if isinstance(meta, dict) else {}
+        if isinstance(plan_fallback, dict):
+            plan_preview = plan_fallback
     plan_steps = (plan_preview.get("steps") or []) if isinstance(plan_preview, dict) else []
     risks = (plan_preview.get("risks") or []) if isinstance(plan_preview, dict) else []
     refactors = (plan_preview.get("refactors") or []) if isinstance(plan_preview, dict) else []
@@ -2456,6 +3031,18 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
         risks = []
     if not isinstance(refactors, list):
         refactors = []
+
+    # Extract union of target_files across all plan steps for bounded context tree
+    plan_target_files: list[str] = []
+    if isinstance(plan_steps, list):
+        seen_tf: set[str] = set()
+        for step in plan_steps:
+            if not isinstance(step, dict):
+                continue
+            for tf in (step.get("target_files") or []):
+                if isinstance(tf, str) and tf.strip() and tf not in seen_tf:
+                    plan_target_files.append(tf)
+                    seen_tf.add(tf)
 
     acceptance_criteria = _derive_acceptance_criteria(task, clarifications, plan_steps if isinstance(plan_steps, list) else [])
     scenarios = _derive_scenarios(task, plan_steps if isinstance(plan_steps, list) else [])
@@ -2560,7 +3147,8 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
                     "status": str(p.get("status") or ""),
                     "kind": str(p.get("kind") or ""),
                     "step_reference": step_reference,
-                    "diff": diff,
+                    "diff": (diff[:_MAX_DIFF_DISPLAY_BYTES] + "\n\n... (diff truncated)")
+                           if len(diff) > _MAX_DIFF_DISPLAY_BYTES else diff,
                     "rationale": str(p.get("rationale") or ""),
                     "applied_via": str(p.get("applied_via") or ""),
                     "applied_at": p.get("applied_at"),
@@ -2656,31 +3244,30 @@ def _build_step_details(task: Task, logs: list[LogEntry]) -> Dict[str, Any]:
         "PLANNING": {
             "plan_steps": plan_steps if isinstance(plan_steps, list) else [],
             "plan_approved": plan_approved,
-            "bounded_context": {
-                "file_count": len(allowed_files),
-                "targets": targets_clean[:25],
-                "files_sample": files_sample_clean[:25],
-            },
-            "boundary_specs": spec_summary,
-        },
-        "APPROVAL": {
-            "plan_approved": plan_approved,
             "approved_at": meta.get("plan_approved_at"),
             "plan_markdown_path": plan_md_path or None,
             "plan_markdown_preview": plan_md_preview,
-            # Render approval in the same structured UI as planning (no giant markdown scroll).
-            "plan_steps": plan_steps if isinstance(plan_steps, list) else [],
             "bounded_context": {
-                "file_count": len(allowed_files),
+                "file_count": len(plan_target_files) if plan_target_files else len(allowed_files),
                 "targets": targets_clean[:25],
                 "files_sample": files_sample_clean[:25],
+                "plan_target_files": plan_target_files,
+                "allowed_files": allowed_files[:200],
             },
+            "boundary_specs": spec_summary,
             "scenarios": scenarios,
             "risks": [str(r).strip() for r in risks if str(r).strip()][:20],
             "refactors": [str(r).strip() for r in refactors if str(r).strip()][:20],
-            "boundary_specs": spec_summary,
         },
-        "CODEGEN": {"patches": patches, "files_touched": files_touched},
+        "CODEGEN": {"patches": patches, "files_touched": files_touched, "allowed_files": allowed_files[:50], "test_files": _filter_test_files(files_touched)},
+        "RUN_TESTS": {
+            "tool_name": meta.get("test_tool") or None,
+            "arguments": meta.get("test_arguments") or None,
+            "output": meta.get("test_output") or None,
+            "exit_code": meta.get("test_exit_code") if isinstance(meta.get("test_exit_code"), int) else None,
+            "tool_version": meta.get("test_tool_version") or None,
+            "test_files": _filter_test_files(files_touched),
+        },
     }
 
 
@@ -2688,15 +3275,19 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     server_version = "SpecAgentDashboard/0.1"
 
     def _send(self, code: int, body: bytes, *, content_type: str) -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # Client disconnected before we finished writing the response; safe to ignore.
+            return
 
     def _send_json(self, code: int, payload: Dict[str, Any]) -> None:
-        body = json.dumps(payload, indent=2, default=str).encode("utf-8")
+        body = json.dumps(payload, default=str, separators=(",", ":")).encode("utf-8")
         self._send(code, body, content_type="application/json; charset=utf-8")
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib signature
@@ -2753,6 +3344,26 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
 
         self._send(404, b"Not Found", content_type="text/plain; charset=utf-8")
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib signature
+        parsed = urlparse(self.path)
+        path = parsed.path or "/"
+
+        # POST /api/task/{task_id}/run-tests
+        if path.startswith("/api/task/") and path.endswith("/run-tests"):
+            parts = path.split("/")
+            # /api/task/{id}/run-tests → parts: ['', 'api', 'task', '{id}', 'run-tests']
+            task_id = parts[3] if len(parts) >= 5 else ""
+            try:
+                payload = self.server.api.run_tests(task_id)  # type: ignore[attr-defined]
+                self._send_json(200, payload)
+            except KeyError:
+                self._send_json(404, {"error": "task not found"})
+            except Exception as exc:
+                self._send_json(500, {"error": str(exc)})
+            return
+
+        self._send_json(404, {"error": "not found"})
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A003 - stdlib signature
         # Keep server quiet by default.

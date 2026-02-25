@@ -20,7 +20,8 @@ def _upsert_env_entries(entries: Dict[str, str]) -> Optional[Path]:
     if not entries:
         return None
 
-    state_dir = Path.home() / ".spec_agent"
+    state_dir_env = os.getenv("SPEC_AGENT_STATE_DIR")
+    state_dir = Path(state_dir_env).expanduser() if state_dir_env else (Path.home() / ".spec_agent")
     state_dir.mkdir(parents=True, exist_ok=True)
     env_path = state_dir / "env"
 
@@ -249,4 +250,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

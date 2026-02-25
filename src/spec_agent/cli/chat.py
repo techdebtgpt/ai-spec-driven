@@ -992,24 +992,20 @@ class ChatSession:
 
             while True:
                 answer = Prompt.ask(
-                    "Your answer (type 'skip' to move on)",
+                    "Your answer",
                     default=None,
                     show_default=False,
                 )
 
                 normalized = (answer or "").strip()
 
-                if normalized.lower() == "skip":
-                    console.print("[yellow]Skipped[/]")
-                    item["status"] = "OVERRIDDEN"
-                    break
                 if normalized:
                     item["answer"] = normalized
                     item["status"] = "ANSWERED"
                     console.print("[green]✓[/] Got it!")
                     break
 
-                console.print("[yellow]Please provide an answer or type 'skip' to continue.[/]")
+                console.print("[yellow]Please provide an answer to continue.[/]")
 
         # Update task with answers
         self.current_task.metadata["clarifications"] = clarifications
@@ -1374,27 +1370,34 @@ class ChatSession:
                             task_id = self.current_task.id
                             patch_id = example_patch.id
 
-                            def _git_status_short() -> str:
-                                try:
-                                    r = subprocess.run(
-                                        ["git", "status", "--short"],
-                                        capture_output=True,
-                                        text=True,
-                                        check=True,
-                                        cwd=repo_path,
-                                    )
-                                    return (r.stdout or "").strip()
-                                except Exception:
-                                    return ""
+                            def _git_snapshot() -> str:
+                                def _run(cmd: list[str]) -> str:
+                                    try:
+                                        r = subprocess.run(
+                                            cmd,
+                                            capture_output=True,
+                                            text=True,
+                                            check=True,
+                                            cwd=repo_path,
+                                        )
+                                        return r.stdout or ""
+                                    except Exception:
+                                        return ""
 
-                            baseline = _git_status_short()
+                                status = _run(["git", "status", "--short"]).strip()
+                                unstaged = _run(["git", "diff"]).strip()
+                                staged = _run(["git", "diff", "--cached"]).strip()
+                                parts = [p for p in [status, unstaged, staged] if p]
+                                return "\n".join(parts)
+
+                            baseline = _git_snapshot()
 
                             def _watch_and_sync():
                                 # Wait up to 20 minutes for Cursor edits (demo-friendly).
                                 deadline = time.time() + 20 * 60
                                 while time.time() < deadline:
-                                    current = _git_status_short()
-                                    if current != baseline and current.strip():
+                                    current = _git_snapshot()
+                                    if current != baseline:
                                         # Capture and persist the real diff on the patch/task.
                                         return self.orchestrator.sync_external_patch(
                                             task_id,

@@ -43,12 +43,16 @@ class ContextIndexer:
         except OSError:
             return None
 
-    def summarize_repository(self, repo_path: Path, include_serena_semantic_tree: bool = False) -> Dict[str, any]:
+    def summarize_repository(self, repo_path: Path, include_serena_semantic_tree: bool = False, quick: bool = False) -> Dict[str, any]:
         if not repo_path.exists():
             raise FileNotFoundError(f"Repository not found: {repo_path}")
 
-        # Try to enhance language and module detection with Serena if available
-        serena_info = self._detect_languages_with_serena(repo_path)
+        # In quick mode, skip the expensive Serena subprocess call entirely
+        if quick:
+            serena_info = None
+        else:
+            # Try to enhance language and module detection with Serena if available
+            serena_info = self._detect_languages_with_serena(repo_path)
         serena_languages = serena_info.get("languages", []) if serena_info else []
         serena_modules = serena_info.get("modules", []) if serena_info else []
         serena_namespaces = serena_info.get("namespaces", []) if serena_info else []
@@ -173,7 +177,7 @@ class ContextIndexer:
                         {"path": str(relative_path), "reason": f"{line_count} LOC", "lines": line_count}
                     )
 
-            if language in {"python", "typescript"}:
+            if not quick and language in {"python", "typescript"}:
                 imports = self._extract_imports(path)
                 if imports:
                     import_edges[str(relative_path)].extend(imports)
@@ -182,26 +186,35 @@ class ContextIndexer:
         # without re-scanning the repo during planning.
         directory_structure = self._build_directory_structure(repo_path, gitignore_spec, max_depth=3)
 
-        graph = self._build_graph(import_edges)
-        top_modules = [
-            f"{node} (fan-in={graph.in_degree(node)})"
-            for node, _ in sorted(
-                graph.in_degree(), key=lambda pair: pair[1], reverse=True
-            )[: self.settings.top_module_count]
-        ]
-        
-        dependency_graph_summary = {
-            "node_count": graph.number_of_nodes(),
-            "edge_count": graph.number_of_edges(),
-            "top_fan_in": [
-                {"module": node, "references": graph.in_degree(node)}
-                for node, _ in sorted(graph.in_degree(), key=lambda pair: pair[1], reverse=True)[:10]
-            ],
-            "top_fan_out": [
-                {"module": node, "references": graph.out_degree(node)}
-                for node, _ in sorted(graph.out_degree(), key=lambda pair: pair[1], reverse=True)[:10]
-            ],
-        }
+        if quick:
+            top_modules: List[str] = []
+            dependency_graph_summary: Dict[str, any] = {
+                "node_count": 0,
+                "edge_count": 0,
+                "top_fan_in": [],
+                "top_fan_out": [],
+            }
+        else:
+            graph = self._build_graph(import_edges)
+            top_modules = [
+                f"{node} (fan-in={graph.in_degree(node)})"
+                for node, _ in sorted(
+                    graph.in_degree(), key=lambda pair: pair[1], reverse=True
+                )[: self.settings.top_module_count]
+            ]
+
+            dependency_graph_summary = {
+                "node_count": graph.number_of_nodes(),
+                "edge_count": graph.number_of_edges(),
+                "top_fan_in": [
+                    {"module": node, "references": graph.in_degree(node)}
+                    for node, _ in sorted(graph.in_degree(), key=lambda pair: pair[1], reverse=True)[:10]
+                ],
+                "top_fan_out": [
+                    {"module": node, "references": graph.out_degree(node)}
+                    for node, _ in sorted(graph.out_degree(), key=lambda pair: pair[1], reverse=True)[:10]
+                ],
+            }
 
         # Enhance modules with Serena-detected modules/namespaces/directories
         if not top_modules or (len(top_modules) < self.settings.top_module_count):

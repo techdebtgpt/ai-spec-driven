@@ -101,13 +101,19 @@ class PlanStep:
     description: str
     target_files: List[str] = field(default_factory=list)
     notes: Optional[str] = None
+    skip_codegen: bool = False
+    skip_codegen_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "description": self.description,
             "target_files": list(self.target_files),
             "notes": self.notes,
         }
+        if self.skip_codegen:
+            d["skip_codegen"] = True
+            d["skip_codegen_reason"] = self.skip_codegen_reason
+        return d
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "PlanStep":
@@ -115,6 +121,8 @@ class PlanStep:
             description=raw.get("description", ""),
             target_files=list(raw.get("target_files", [])),
             notes=raw.get("notes"),
+            skip_codegen=bool(raw.get("skip_codegen", False)),
+            skip_codegen_reason=raw.get("skip_codegen_reason"),
         )
 
 

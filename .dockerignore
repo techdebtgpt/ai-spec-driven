@@ -1,0 +1,16 @@
+.git
+.venv
+__pycache__
+.pytest_cache
+.mypy_cache
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+node_modules
+dist
+build
+*.egg-info
+*.log
+mcps
+pr-agent
